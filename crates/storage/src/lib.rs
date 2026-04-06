@@ -6,3 +6,7 @@ pub mod heap;
 pub mod btree;
 pub mod wal;
 pub mod buffer;
+pub mod tx;
+pub mod mvcc;
+pub mod table;
+pub mod catalog;
