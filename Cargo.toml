@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+thiserror = "2"
+bytes = "1"
+crc32fast = "1"

@@ -1,0 +1,8 @@
+[package]
+name = "batadb-query"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+batadb-storage = { path = "../storage" }
+thiserror.workspace = true

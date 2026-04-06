@@ -1,0 +1,9 @@
+[package]
+name = "batadb-storage"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+bytes.workspace = true
+crc32fast.workspace = true
