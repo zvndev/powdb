@@ -50,7 +50,7 @@ impl HeapFile {
             }
         }
         // Allocate a new page
-        let page_id = self.disk.allocate_page();
+        let page_id = self.disk.allocate_page()?;
         let mut page = Page::new(page_id, PageType::Data);
         let slot = page.insert(row_data)
             .expect("row too large for empty page");
@@ -69,17 +69,16 @@ impl HeapFile {
     }
 
     /// Delete a row by marking its slot as deleted.
-    pub fn delete(&mut self, rid: RowId) {
-        if let Ok(buf) = self.disk.read_page(rid.page_id) {
-            if let Some(mut page) = Page::from_bytes(&buf) {
-                page.delete(rid.slot_index);
-                self.disk.write_page(rid.page_id, page.as_bytes()).ok();
-                // Page now has more free space
-                if !self.pages_with_space.contains(&rid.page_id) {
-                    self.pages_with_space.push(rid.page_id);
-                }
-            }
+    pub fn delete(&mut self, rid: RowId) -> io::Result<()> {
+        let buf = self.disk.read_page(rid.page_id)?;
+        let mut page = Page::from_bytes(&buf)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "corrupt page"))?;
+        page.delete(rid.slot_index);
+        self.disk.write_page(rid.page_id, page.as_bytes())?;
+        if !self.pages_with_space.contains(&rid.page_id) {
+            self.pages_with_space.push(rid.page_id);
         }
+        Ok(())
     }
 
     /// Update a row. Returns new RowId (may change if row moves).
@@ -93,7 +92,7 @@ impl HeapFile {
             }
         }
         // Doesn't fit in place — delete old, insert new
-        self.delete(rid);
+        self.delete(rid)?;
         self.insert(row_data)
     }
 
@@ -174,7 +173,7 @@ mod tests {
         let schema = user_schema();
         let r1 = heap.insert(&encode_row(&schema, &vec![Value::Str("A".into()), Value::Int(1)])).unwrap();
         let r2 = heap.insert(&encode_row(&schema, &vec![Value::Str("B".into()), Value::Int(2)])).unwrap();
-        heap.delete(r1);
+        heap.delete(r1).unwrap();
         assert!(heap.get(r1).is_none());
         assert!(heap.get(r2).is_some());
         assert_eq!(heap.scan().count(), 1);

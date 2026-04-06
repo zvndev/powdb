@@ -28,15 +28,14 @@ impl DiskManager {
     }
 
     /// Allocate a new page and extend the file. Returns the new page_id.
-    pub fn allocate_page(&mut self) -> u32 {
+    pub fn allocate_page(&mut self) -> io::Result<u32> {
         let id = self.num_pages;
-        self.num_pages += 1;
-        // Extend file with zeros
         let zeros = [0u8; PAGE_SIZE];
         let offset = id as u64 * PAGE_SIZE as u64;
-        self.file.seek(SeekFrom::Start(offset)).ok();
-        self.file.write_all(&zeros).ok();
-        id
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_all(&zeros)?;
+        self.num_pages += 1;
+        Ok(id)
     }
 
     pub fn write_page(&mut self, page_id: u32, data: &[u8]) -> io::Result<()> {
@@ -80,7 +79,7 @@ mod tests {
     fn test_create_and_read_page() {
         let path = temp_path("disk_basic");
         let mut dm = DiskManager::create(&path).unwrap();
-        let page_id = dm.allocate_page();
+        let page_id = dm.allocate_page().unwrap();
         assert_eq!(page_id, 0);
 
         let mut page = Page::new(page_id, PageType::Data);
@@ -99,9 +98,9 @@ mod tests {
     fn test_allocate_multiple_pages() {
         let path = temp_path("disk_multi");
         let mut dm = DiskManager::create(&path).unwrap();
-        let p0 = dm.allocate_page();
-        let p1 = dm.allocate_page();
-        let p2 = dm.allocate_page();
+        let p0 = dm.allocate_page().unwrap();
+        let p1 = dm.allocate_page().unwrap();
+        let p2 = dm.allocate_page().unwrap();
         assert_eq!(p0, 0);
         assert_eq!(p1, 1);
         assert_eq!(p2, 2);
@@ -116,7 +115,7 @@ mod tests {
         let path = temp_path("disk_reopen");
         {
             let mut dm = DiskManager::create(&path).unwrap();
-            let id = dm.allocate_page();
+            let id = dm.allocate_page().unwrap();
             let mut page = Page::new(id, PageType::Data);
             page.insert(b"persistent");
             dm.write_page(id, page.as_bytes()).unwrap();

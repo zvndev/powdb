@@ -43,7 +43,7 @@ impl BufferPool {
 
     /// Allocate a new page on disk and load it into the buffer pool.
     pub fn new_page(&mut self, page_type: PageType) -> io::Result<u32> {
-        let page_id = self.disk.allocate_page();
+        let page_id = self.disk.allocate_page()?;
         let page = Page::new(page_id, page_type);
         let frame_idx = self.find_or_evict_frame()?;
         self.page_table.insert(page_id, frame_idx);

@@ -52,8 +52,7 @@ impl Table {
                 }
             }
         }
-        self.heap.delete(rid);
-        Ok(())
+        self.heap.delete(rid)
     }
 
     pub fn update(&mut self, rid: RowId, values: &Row) -> io::Result<RowId> {

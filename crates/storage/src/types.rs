@@ -64,7 +64,7 @@ impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Int(a), Value::Int(b))           => a == b,
-            (Value::Float(a), Value::Float(b))       => a.to_bits() == b.to_bits(),
+            (Value::Float(a), Value::Float(b))       => a.total_cmp(b) == Ordering::Equal,
             (Value::Bool(a), Value::Bool(b))         => a == b,
             (Value::Str(a), Value::Str(b))           => a == b,
             (Value::DateTime(a), Value::DateTime(b)) => a == b,
