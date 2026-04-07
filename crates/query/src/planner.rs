@@ -29,9 +29,24 @@ pub fn plan_statement(stmt: Statement) -> Result<PlanNode, PlanError> {
 }
 
 fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
-    let mut node = PlanNode::SeqScan { table: q.source.clone() };
+    // Try to fold `filter .col = literal` into an IndexScan. The executor
+    // decides at run time whether the column actually has an index — if not,
+    // it transparently falls back to a sequential scan with the same predicate,
+    // so this rewrite is always safe.
+    //
+    // We only rewrite the *simple* eq case: `filter .col = literal`. Conjunctions
+    // like `filter .col = 1 and .other > 5` fall through to SeqScan + Filter.
+    // Extending this to split conjunctions is a future optimization.
+    let (source, filter) = match q.filter {
+        Some(pred) => match try_extract_eq_index_key(&q.source, &pred) {
+            Some(index_scan) => (index_scan, None),
+            None => (PlanNode::SeqScan { table: q.source.clone() }, Some(pred)),
+        },
+        None => (PlanNode::SeqScan { table: q.source.clone() }, None),
+    };
+    let mut node = source;
 
-    if let Some(pred) = q.filter {
+    if let Some(pred) = filter {
         node = PlanNode::Filter { input: Box::new(node), predicate: pred };
     }
 
@@ -105,6 +120,35 @@ fn plan_create_type(ct: CreateTypeExpr) -> Result<PlanNode, PlanError> {
     Ok(PlanNode::CreateTable { name: ct.name, fields })
 }
 
+/// If the predicate is a simple `.field = literal` (or `literal = .field`),
+/// return a corresponding IndexScan plan node. Otherwise return None so the
+/// caller can fall through to SeqScan + Filter.
+///
+/// The executor decides at run time whether the named column actually has a
+/// B-tree index — if not, IndexScan transparently falls back to a scan +
+/// equality filter on that column. That means this rewrite is always safe
+/// regardless of schema/index state; it just unlocks the fast path when an
+/// index happens to exist.
+fn try_extract_eq_index_key(table: &str, pred: &Expr) -> Option<PlanNode> {
+    let (lhs, op, rhs) = match pred {
+        Expr::BinaryOp(lhs, op, rhs) => (lhs.as_ref(), *op, rhs.as_ref()),
+        _ => return None,
+    };
+    if op != BinOp::Eq {
+        return None;
+    }
+    let (column, key) = match (lhs, rhs) {
+        (Expr::Field(name), Expr::Literal(_)) => (name.clone(), rhs.clone()),
+        (Expr::Literal(_), Expr::Field(name)) => (name.clone(), lhs.clone()),
+        _ => return None,
+    };
+    Some(PlanNode::IndexScan {
+        table: table.to_string(),
+        column,
+        key,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +193,51 @@ mod tests {
     fn test_plan_count() {
         let plan = plan("count(User)").unwrap();
         assert!(matches!(plan, PlanNode::Aggregate { .. }));
+    }
+
+    #[test]
+    fn test_plan_eq_becomes_index_scan() {
+        // `filter .col = literal` should fold into an IndexScan — the executor
+        // falls back to a scan if the column happens to lack an index.
+        let plan = plan("User filter .id = 42").unwrap();
+        match plan {
+            PlanNode::IndexScan { table, column, key } => {
+                assert_eq!(table, "User");
+                assert_eq!(column, "id");
+                assert!(matches!(key, Expr::Literal(Literal::Int(42))));
+            }
+            other => panic!("expected IndexScan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_plan_eq_reversed_becomes_index_scan() {
+        // Literal-on-the-left form should fold the same way.
+        let plan = plan(r#"User filter "NYC" = .city"#).unwrap();
+        assert!(matches!(plan, PlanNode::IndexScan { .. }));
+    }
+
+    #[test]
+    fn test_plan_non_eq_stays_filter() {
+        // `>` isn't index-eligible under this simple rewrite. Stays SeqScan+Filter.
+        let plan = plan("User filter .age > 30").unwrap();
+        match plan {
+            PlanNode::Filter { input, .. } => {
+                assert!(matches!(*input, PlanNode::SeqScan { .. }));
+            }
+            other => panic!("expected Filter(SeqScan), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_plan_index_scan_with_projection() {
+        // Projection on top of an IndexScan should layer correctly.
+        let plan = plan("User filter .id = 1 { .name }").unwrap();
+        match plan {
+            PlanNode::Project { input, .. } => {
+                assert!(matches!(*input, PlanNode::IndexScan { .. }));
+            }
+            other => panic!("expected Project(IndexScan), got {other:?}"),
+        }
     }
 }
