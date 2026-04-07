@@ -260,7 +260,7 @@ fn type_id_from_u8(v: u8) -> io::Result<TypeId> {
 mod tests {
     use super::*;
     fn temp_catalog(name: &str) -> Catalog {
-        let dir = std::env::temp_dir().join(format!("batadb_cat_{name}_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("powdb_cat_{name}_{}", std::process::id()));
         Catalog::create(&dir).unwrap()
     }
 
@@ -370,7 +370,7 @@ mod tests {
 
     #[test]
     fn test_persist_and_reopen() {
-        let dir = std::env::temp_dir().join(format!("batadb_cat_persist_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("powdb_cat_persist_{}", std::process::id()));
         // Fresh dir
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -403,7 +403,7 @@ mod tests {
 
     #[test]
     fn test_open_missing_dir_errors() {
-        let dir = std::env::temp_dir().join(format!("batadb_cat_missing_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("powdb_cat_missing_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // No catalog.bin yet

@@ -206,7 +206,7 @@ mod tests {
     use crate::page::PageType;
 
     fn temp_pool(name: &str, capacity: usize) -> (BufferPool, std::path::PathBuf) {
-        let path = std::env::temp_dir().join(format!("batadb_bp_{name}_{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("powdb_bp_{name}_{}", std::process::id()));
         let pool = BufferPool::new(&path, capacity).unwrap();
         (pool, path)
     }

@@ -47,7 +47,7 @@ async fn test_full_lifecycle() {
     // Use a unique port and temp dir to avoid conflicts with parallel tests
     let test_id = std::process::id();
     let port = 15433 + (test_id % 1000) as u16;
-    let data_dir = std::env::temp_dir().join(format!("batadb_integ_{test_id}"));
+    let data_dir = std::env::temp_dir().join(format!("powdb_integ_{test_id}"));
     std::fs::create_dir_all(&data_dir).unwrap();
     let data_dir_str = data_dir.to_str().unwrap().to_string();
 
@@ -56,7 +56,7 @@ async fn test_full_lifecycle() {
 
     // Start server in background
     let handle = tokio::spawn(async move {
-        let engine = batadb_query::executor::Engine::new(std::path::Path::new(&data_dir_str)).unwrap();
+        let engine = powdb_query::executor::Engine::new(std::path::Path::new(&data_dir_str)).unwrap();
         let engine = std::sync::Arc::new(std::sync::Mutex::new(engine));
         let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
 
@@ -64,7 +64,7 @@ async fn test_full_lifecycle() {
             let (stream, _) = listener.accept().await.unwrap();
             let eng = engine.clone();
             tokio::spawn(async move {
-                batadb_server::handler::handle_connection(stream, eng, None).await;
+                powdb_server::handler::handle_connection(stream, eng, None).await;
             });
         }
     });
@@ -109,9 +109,9 @@ async fn test_full_lifecycle() {
     assert_eq!(resp[0], 0x07, "expected RESULT_ROWS for filter");
 
     // Decode the filtered rows to verify content
-    let decoded = batadb_server::protocol::Message::decode(&resp).unwrap();
+    let decoded = powdb_server::protocol::Message::decode(&resp).unwrap();
     match decoded {
-        batadb_server::protocol::Message::ResultRows { columns: _, rows } => {
+        powdb_server::protocol::Message::ResultRows { columns: _, rows } => {
             assert_eq!(rows.len(), 1, "filter should return only Alice");
             assert_eq!(rows[0][0], "Alice");
         }

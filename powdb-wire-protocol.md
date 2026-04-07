@@ -1,24 +1,24 @@
-# BataDB: Wire protocol and engine architecture
+# PowDB: Wire protocol and engine architecture
 
 ## Engine architecture
 
-BataDB is a library first, server second. The core engine is a single library
+PowDB is a library first, server second. The core engine is a single library
 with a C ABI that any language can load. The server wraps that library with a
 network listener.
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                   BataDB Engine (library)            │
+│                   PowDB Engine (library)            │
 │                                                      │
 │  ┌──────────┐  ┌──────────┐  ┌───────────────────┐  │
-│  │ BataQL   │  │ Query    │  │ Storage engine     │  │
+│  │ PowQL   │  │ Query    │  │ Storage engine     │  │
 │  │ compiler │→ │ executor │→ │                    │  │
 │  │          │  │ (vector) │  │  B-tree indexes    │  │
 │  └──────────┘  └──────────┘  │  Columnar segments │  │
 │                              │  WAL + group commit│  │
 │  ┌──────────┐               │  Undo-log MVCC     │  │
 │  │ SQL →    │               │  Buffer pool       │  │
-│  │ BataQL   │               └───────────────────┘  │
+│  │ PowQL   │               └───────────────────┘  │
 │  │ compat   │                                      │
 │  └──────────┘                                      │
 └─────────────────────────────────────────────────────┘
@@ -43,47 +43,47 @@ deserializing wire protocol messages.
 
 ```c
 // Connection and transaction management
-bata_conn*    bata_open(const char* path, bata_options* opts);
-void          bata_close(bata_conn* conn);
-bata_tx*      bata_begin(bata_conn* conn, bata_isolation level);
-int           bata_commit(bata_tx* tx);
-int           bata_rollback(bata_tx* tx);
+pow_conn*    pow_open(const char* path, pow_options* opts);
+void          pow_close(pow_conn* conn);
+pow_tx*      pow_begin(pow_conn* conn, pow_isolation level);
+int           pow_commit(pow_tx* tx);
+int           pow_rollback(pow_tx* tx);
 
 // Query execution
-bata_plan*    bata_compile(bata_conn* conn, const char* bataql, size_t len);
-bata_result*  bata_execute(bata_tx* tx, bata_plan* plan, bata_params* params);
-void          bata_plan_free(bata_plan* plan);
+pow_plan*    pow_compile(pow_conn* conn, const char* powql, size_t len);
+pow_result*  pow_execute(pow_tx* tx, pow_plan* plan, pow_params* params);
+void          pow_plan_free(pow_plan* plan);
 
 // Prepared plan cache — compile once, execute many
-uint64_t      bata_plan_hash(bata_plan* plan);
-bata_plan*    bata_plan_lookup(bata_conn* conn, uint64_t hash);
-void          bata_plan_cache(bata_conn* conn, bata_plan* plan);
+uint64_t      pow_plan_hash(pow_plan* plan);
+pow_plan*    pow_plan_lookup(pow_conn* conn, uint64_t hash);
+void          pow_plan_cache(pow_conn* conn, pow_plan* plan);
 
 // Result consumption (streaming)
-int           bata_result_next(bata_result* res);   // advance cursor
-int           bata_result_columns(bata_result* res); // column count
-bata_type     bata_result_type(bata_result* res, int col);
-int64_t       bata_result_int(bata_result* res, int col);
-double        bata_result_float(bata_result* res, int col);
-bata_str      bata_result_str(bata_result* res, int col);
-int           bata_result_is_empty(bata_result* res, int col); // set-based null
-void          bata_result_free(bata_result* res);
+int           pow_result_next(pow_result* res);   // advance cursor
+int           pow_result_columns(pow_result* res); // column count
+pow_type     pow_result_type(pow_result* res, int col);
+int64_t       pow_result_int(pow_result* res, int col);
+double        pow_result_float(pow_result* res, int col);
+pow_str      pow_result_str(pow_result* res, int col);
+int           pow_result_is_empty(pow_result* res, int col); // set-based null
+void          pow_result_free(pow_result* res);
 
 // Direct operations (bypass query compiler — the 42x path)
-bata_result*  bata_scan(bata_tx* tx, bata_table_id table);
-bata_result*  bata_index_lookup(bata_tx* tx, bata_index_id idx, bata_value* key);
-bata_rowid    bata_insert(bata_tx* tx, bata_table_id table, bata_row* row);
-int           bata_update(bata_tx* tx, bata_table_id table, bata_rowid id, bata_row* changes);
-int           bata_delete(bata_tx* tx, bata_table_id table, bata_rowid id);
+pow_result*  pow_scan(pow_tx* tx, pow_table_id table);
+pow_result*  pow_index_lookup(pow_tx* tx, pow_index_id idx, pow_value* key);
+pow_rowid    pow_insert(pow_tx* tx, pow_table_id table, pow_row* row);
+int           pow_update(pow_tx* tx, pow_table_id table, pow_rowid id, pow_row* changes);
+int           pow_delete(pow_tx* tx, pow_table_id table, pow_rowid id);
 
 // Schema
-bata_schema*  bata_schema_current(bata_conn* conn);
-bata_plan*    bata_migrate_plan(bata_conn* conn, const char* new_schema, size_t len);
-int           bata_migrate_apply(bata_conn* conn, bata_plan* plan);
+pow_schema*  pow_schema_current(pow_conn* conn);
+pow_plan*    pow_migrate_plan(pow_conn* conn, const char* new_schema, size_t len);
+int           pow_migrate_apply(pow_conn* conn, pow_plan* plan);
 ```
 
-The key split: `bata_compile` + `bata_execute` is the normal path (Mode 1).
-The `bata_scan` / `bata_index_lookup` / `bata_insert` functions are the direct
+The key split: `pow_compile` + `pow_execute` is the normal path (Mode 1).
+The `pow_scan` / `pow_index_lookup` / `pow_insert` functions are the direct
 path (Mode 2) that compiled languages use to skip the query compiler entirely.
 
 ## Wire protocol
@@ -105,7 +105,7 @@ All messages use a simple binary framing:
 
 Maximum message size: 16MB. Larger results stream as multiple messages.
 
-### Mode 1: Native BataQL protocol
+### Mode 1: Native PowQL protocol
 
 The primary protocol for all non-compiled language drivers.
 
@@ -114,7 +114,7 @@ The primary protocol for all non-compiled language drivers.
 ```
 Client                           Server
   │                                │
-  ├─── QUERY(bataql_text, params) ─→│  compile + execute
+  ├─── QUERY(powql_text, params) ─→│  compile + execute
   │                                │
   │←── RESULT_HEADER(columns, types)│  column metadata
   │←── RESULT_BATCH(rows)         ─│  binary row data (batched)
@@ -128,7 +128,7 @@ Client                           Server
 ```
 Client                           Server
   │                                │
-  ├─── PREPARE(bataql_text)       ─→│  compile + cache
+  ├─── PREPARE(powql_text)       ─→│  compile + cache
   │←── PREPARED(plan_hash)        ─│  returns plan handle
   │                                │
   ├─── EXECUTE(plan_hash, params) ─→│  skip compile, just execute
@@ -138,7 +138,7 @@ Client                           Server
   │                                │
 ```
 
-Prepared queries skip the BataQL compiler on subsequent calls. The server caches
+Prepared queries skip the PowQL compiler on subsequent calls. The server caches
 the compiled plan by hash. This is analogous to PostgreSQL's prepared statements
 but the compiled plan is a physical execution plan, not just a parsed AST.
 
@@ -171,11 +171,11 @@ RESULT_BATCH payload:
 ```
 
 The null bitmap uses set-based nullability: a 1-bit means "empty set" (no value),
-0-bit means "has value." This maps directly to BataQL's `exists` / `not exists`.
+0-bit means "has value." This maps directly to PowQL's `exists` / `not exists`.
 
 ### Mode 2: Prepared operations (compiled languages)
 
-For TurboLang and other compiled languages that compile BataQL at build time.
+For TurboLang and other compiled languages that compile PowQL at build time.
 
 The compiler emits a plan hash + parameter slots. At runtime, the client sends
 the hash + bound parameters. The server looks up the cached plan and executes
@@ -184,7 +184,7 @@ directly — no parsing, no compilation.
 ```
 Client (compiled)                Server
   │                                │
-  │  [build time: compile BataQL   │
+  │  [build time: compile PowQL   │
   │   to plan, compute hash]       │
   │                                │
   ├─── REGISTER_PLAN(hash, plan)  ─→│  cache the plan
@@ -200,15 +200,15 @@ In embedded mode (no network), this becomes a direct function call:
 
 ```c
 // At build time, the compiler emits:
-static bata_plan* plan_get_user_by_email = NULL;
+static pow_plan* plan_get_user_by_email = NULL;
 static uint64_t plan_hash_get_user_by_email = 0xA3F2...;
 
 // At runtime:
 if (!plan_get_user_by_email) {
-    plan_get_user_by_email = bata_plan_lookup(conn, plan_hash_get_user_by_email);
+    plan_get_user_by_email = pow_plan_lookup(conn, plan_hash_get_user_by_email);
 }
-bata_params params = { .values = { email_str } };
-bata_result* res = bata_execute(tx, plan_get_user_by_email, &params);
+pow_params params = { .values = { email_str } };
+pow_result* res = pow_execute(tx, plan_get_user_by_email, &params);
 ```
 
 This is the 42x path. No parsing, no compilation, no planning at runtime.
@@ -216,7 +216,7 @@ Just parameter binding and execution.
 
 ### Mode 3: PostgreSQL wire protocol (compatibility)
 
-BataDB speaks the PostgreSQL v3 wire protocol on a configurable port. This enables:
+PowDB speaks the PostgreSQL v3 wire protocol on a configurable port. This enables:
 - psql, pgAdmin, pgcli (command-line tools)
 - Grafana, Metabase, Tableau (BI tools)
 - Any PostgreSQL driver (psycopg2, node-postgres, JDBC)
@@ -225,20 +225,20 @@ BataDB speaks the PostgreSQL v3 wire protocol on a configurable port. This enabl
 The translation path:
 
 ```
-SQL text → PostgreSQL parser → SQL AST → BataQL AST → compile → execute
+SQL text → PostgreSQL parser → SQL AST → PowQL AST → compile → execute
 ```
 
 This adds the parse + translate overhead (~20μs per query based on our benchmarks)
-but the engine underneath is still BataDB's. So users get:
-- BataDB's compact storage format (not PostgreSQL's bloated heap)
-- BataDB's undo-log MVCC (no VACUUM)
-- BataDB's vectorized executor for analytical queries
-- BataDB's columnar segments for scan-heavy workloads
+but the engine underneath is still PowDB's. So users get:
+- PowDB's compact storage format (not PostgreSQL's bloated heap)
+- PowDB's undo-log MVCC (no VACUUM)
+- PowDB's vectorized executor for analytical queries
+- PowDB's columnar segments for scan-heavy workloads
 
 Limitations of the PG compatibility layer:
 - Not all PostgreSQL SQL extensions are supported (PL/pgSQL, custom types,
   extensions like PostGIS are not available)
-- Some edge cases in NULL handling differ (BataDB uses set-based nullability
+- Some edge cases in NULL handling differ (PowDB uses set-based nullability
   internally but translates to SQL NULL semantics for PG wire)
 - System catalogs (pg_catalog) are emulated for basic tool compatibility
   but not all tables/views are present
@@ -251,15 +251,15 @@ Each language driver wraps the wire protocol (for server mode) or the C ABI
 ### TypeScript / JavaScript driver
 
 ```typescript
-import { BataDB } from '@batadb/client';
+import { PowDB } from '@powdb/client';
 
 // Connect (server mode)
-const db = await BataDB.connect('bata://localhost:5433/mydb');
+const db = await PowDB.connect('pow://localhost:5433/mydb');
 
 // Or embedded mode (loads the native library)
-const db = await BataDB.open('./mydata.bata');
+const db = await PowDB.open('./mydata.pow');
 
-// Query with BataQL — returns typed results
+// Query with PowQL — returns typed results
 const users = await db.query<User>(
   `User filter .age > $age order .name limit $limit`,
   { age: 30, limit: 10 }
@@ -288,7 +288,7 @@ await db.transaction(async (tx) => {
 });
 
 // Migrations
-await db.migrate('./schema.bataql'); // declarative diff + apply
+await db.migrate('./schema.powql'); // declarative diff + apply
 
 // Schema introspection
 const schema = await db.schema();
@@ -298,11 +298,11 @@ const schema = await db.schema();
 ### TurboLang driver (compile-time integration)
 
 ```turbolang
-import bata from "batadb"
+import pow from "powdb"
 
 // Schema is known at compile time — type errors are build errors
-let users = bata.query(User filter .age > 30 { name, email })
-// ↑ This BataQL is parsed and compiled at build time.
+let users = pow.query(User filter .age > 30 { name, email })
+// ↑ This PowQL is parsed and compiled at build time.
 // At runtime it's a pre-compiled plan execution — the 42x path.
 
 // Type-safe: if User doesn't have a .age field, this is a compile error.
@@ -310,22 +310,22 @@ let users = bata.query(User filter .age > 30 { name, email })
 // at build time, not at 3am in production.
 
 // Link traversal compiles to index lookups
-let user_posts = bata.query(
+let user_posts = pow.query(
   User filter .email = email { name, posts: .posts { title } }
 )
 
 // Computed views are just types
-let active = bata.query(ActiveUser filter .age > 50)
+let active = pow.query(ActiveUser filter .age > 50)
 ```
 
 ### Python driver
 
 ```python
-from batadb import connect
+from powdb import connect
 
-db = connect("bata://localhost:5433/mydb")
+db = connect("pow://localhost:5433/mydb")
 
-# BataQL queries
+# PowQL queries
 users = db.query("User filter .age > $age", age=30)
 for user in users:
     print(user.name, user.email)
@@ -340,21 +340,21 @@ df = db.sql("SELECT name, age FROM users WHERE age > 30")
 
 ## Server configuration
 
-BataDB server is a single binary that wraps the engine library:
+PowDB server is a single binary that wraps the engine library:
 
 ```toml
-# batadb.toml
+# powdb.toml
 
 [storage]
-data_dir = "/var/lib/batadb/data"
-wal_dir = "/var/lib/batadb/wal"       # separate disk recommended
+data_dir = "/var/lib/powdb/data"
+wal_dir = "/var/lib/powdb/wal"       # separate disk recommended
 page_size = 4096
 wal_batch_size = 128                   # group commit batch
 direct_io = true                       # bypass OS page cache (Linux only)
 
 [server]
 listen_addr = "0.0.0.0"
-bata_port = 5433                       # native BataQL protocol
+pow_port = 5433                       # native PowQL protocol
 pg_port = 5432                         # PostgreSQL compatibility
 max_connections = 200
 
@@ -388,7 +388,7 @@ Client                              Server
   ├─── BEGIN(isolation)              ─→│  start transaction
   │←── TX_OK(tx_id)                  ─│
   │                                    │
-  ├─── QUERY(bataql, params)         ─→│  compile + execute
+  ├─── QUERY(powql, params)         ─→│  compile + execute
   │←── RESULT_HEADER(cols, types)    ─│
   │←── RESULT_BATCH(rows)           ─│
   │←── RESULT_COMPLETE(stats)        ─│
@@ -407,14 +407,14 @@ The three-product stack:
 ```
 ┌─────────────────────────────────────────────────┐
 │  TurboLang application code                      │
-│  (compile-time BataQL, zero-copy types)          │
+│  (compile-time PowQL, zero-copy types)          │
 ├─────────────────────────────────────────────────┤
-│  BataQL (query language)                         │
+│  PowQL (query language)                         │
 │  - Native protocol (all languages)               │
 │  - PostgreSQL wire protocol (ecosystem tools)    │
 │  - Computed views, streaming, migrations          │
 ├─────────────────────────────────────────────────┤
-│  BataDB (storage engine)                         │
+│  PowDB (storage engine)                         │
 │  - Hybrid row-column storage                     │
 │  - Undo-log MVCC (no VACUUM)                     │
 │  - Vectorized executor                           │
@@ -422,13 +422,13 @@ The three-product stack:
 │  - Embedded library or server process             │
 ├─────────────────────────────────────────────────┤
 │  TurbineORM (existing Postgres ORM)              │
-│  → migrates to BataDB via PG wire protocol       │
-│  → eventually uses native BataQL protocol         │
+│  → migrates to PowDB via PG wire protocol       │
+│  → eventually uses native PowQL protocol         │
 └─────────────────────────────────────────────────┘
 ```
 
 Migration path for existing TurbineORM users:
-1. Replace PostgreSQL with BataDB (PG wire protocol — drop-in replacement)
+1. Replace PostgreSQL with PowDB (PG wire protocol — drop-in replacement)
 2. Existing queries work immediately, faster storage engine underneath
-3. Gradually adopt BataQL for new queries (5-10x improvement over SQL)
+3. Gradually adopt PowQL for new queries (5-10x improvement over SQL)
 4. Adopt TurboLang for critical paths (42x improvement)

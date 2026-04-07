@@ -72,7 +72,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn temp_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("batadb_test_{name}_{}", std::process::id()))
+        std::env::temp_dir().join(format!("powdb_test_{name}_{}", std::process::id()))
     }
 
     #[test]

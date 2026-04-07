@@ -1,5 +1,5 @@
 /**
- * BataDB wire protocol.
+ * PowDB wire protocol.
  *
  * Frame format: [type(1)][flags(1)][len(4 LE)][payload]
  * Strings are encoded as [len(4 LE)][utf-8 bytes].

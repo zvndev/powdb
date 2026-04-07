@@ -1,13 +1,13 @@
 /**
- * BataDB TypeScript client.
+ * PowDB TypeScript client.
  *
- * Thin async wrapper around a TCP socket speaking the BataDB wire protocol.
+ * Thin async wrapper around a TCP socket speaking the PowDB wire protocol.
  *
  *     const client = await Client.connect({
  *       host: "213.188.194.202",
  *       port: 5433,
  *       dbName: "default",
- *       password: process.env.BATADB_PASSWORD,
+ *       password: process.env.POWDB_PASSWORD,
  *     });
  *
  *     const result = await client.query("User filter .age > 27 { .name, .age }");
@@ -108,7 +108,7 @@ export class Client {
     return new Client(socket, reply.version);
   }
 
-  /** Run a BataQL statement and return the typed result. */
+  /** Run a PowQL statement and return the typed result. */
   async query(query: string): Promise<QueryResult> {
     const reply = await this.send({ type: "Query", query });
     switch (reply.type) {

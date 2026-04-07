@@ -1,9 +1,9 @@
-# fly.toml — BataDB on Fly.io
+# fly.toml — PowDB on Fly.io
 #
 # This is a stateful TCP service (not HTTP). One machine, one persistent volume.
 # Scaling out would require sharding/replication which is out of scope for the MVP.
 
-app = "zvndev-batadb"
+app = "zvndev-powdb"
 primary_region = "iad"
 
 [build]
@@ -11,12 +11,12 @@ primary_region = "iad"
 
 [env]
   RUST_LOG = "info"
-  BATADB_DATA = "/data"
-  BATADB_PORT = "5433"
+  POWDB_DATA = "/data"
+  POWDB_PORT = "5433"
 
 # Mount the persistent volume at /data so the database survives machine recycles.
 [mounts]
-  source = "batadb_data"
+  source = "powdb_data"
   destination = "/data"
   initial_size = "1gb"
 

@@ -1,5 +1,5 @@
 [package]
-name = "batadb-storage"
+name = "powdb-storage"
 version.workspace = true
 edition.workspace = true
 

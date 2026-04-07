@@ -2,8 +2,8 @@ use crate::ast::*;
 use crate::plan::*;
 use crate::planner;
 use crate::result::QueryResult;
-use batadb_storage::catalog::Catalog;
-use batadb_storage::types::*;
+use powdb_storage::catalog::Catalog;
+use powdb_storage::types::*;
 use std::io;
 use std::path::Path;
 use std::time::Instant;
@@ -32,7 +32,7 @@ impl Engine {
         Ok(Engine { catalog })
     }
 
-    pub fn execute_bataql(&mut self, input: &str) -> Result<QueryResult, String> {
+    pub fn execute_powql(&mut self, input: &str) -> Result<QueryResult, String> {
         let total_start = Instant::now();
 
         let plan_start = Instant::now();
@@ -430,19 +430,19 @@ mod tests {
 
     fn test_engine() -> Engine {
         let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("batadb_exec_{}_{}", std::process::id(), id));
+        let dir = std::env::temp_dir().join(format!("powdb_exec_{}_{}", std::process::id(), id));
         let mut engine = Engine::new(&dir).unwrap();
-        engine.execute_bataql("type User { required name: str, required email: str, age: int }").unwrap();
-        engine.execute_bataql(r#"insert User { name := "Alice", email := "alice@ex.com", age := 30 }"#).unwrap();
-        engine.execute_bataql(r#"insert User { name := "Bob", email := "bob@ex.com", age := 25 }"#).unwrap();
-        engine.execute_bataql(r#"insert User { name := "Charlie", email := "charlie@ex.com", age := 35 }"#).unwrap();
+        engine.execute_powql("type User { required name: str, required email: str, age: int }").unwrap();
+        engine.execute_powql(r#"insert User { name := "Alice", email := "alice@ex.com", age := 30 }"#).unwrap();
+        engine.execute_powql(r#"insert User { name := "Bob", email := "bob@ex.com", age := 25 }"#).unwrap();
+        engine.execute_powql(r#"insert User { name := "Charlie", email := "charlie@ex.com", age := 35 }"#).unwrap();
         engine
     }
 
     #[test]
     fn test_scan_all() {
         let mut engine = test_engine();
-        let result = engine.execute_bataql("User").unwrap();
+        let result = engine.execute_powql("User").unwrap();
         match result {
             QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 3),
             _ => panic!("expected rows"),
@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn test_filter() {
         let mut engine = test_engine();
-        let result = engine.execute_bataql("User filter .age > 28").unwrap();
+        let result = engine.execute_powql("User filter .age > 28").unwrap();
         match result {
             QueryResult::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 2); // Alice (30) and Charlie (35)
@@ -464,7 +464,7 @@ mod tests {
     #[test]
     fn test_projection() {
         let mut engine = test_engine();
-        let result = engine.execute_bataql("User { name }").unwrap();
+        let result = engine.execute_powql("User { name }").unwrap();
         match result {
             QueryResult::Rows { columns, rows } => {
                 assert_eq!(columns, vec!["name"]);
@@ -477,7 +477,7 @@ mod tests {
     #[test]
     fn test_insert_and_count() {
         let mut engine = test_engine();
-        let result = engine.execute_bataql("count(User)").unwrap();
+        let result = engine.execute_powql("count(User)").unwrap();
         match result {
             QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 3),
             _ => panic!("expected scalar int"),
@@ -487,8 +487,8 @@ mod tests {
     #[test]
     fn test_update() {
         let mut engine = test_engine();
-        engine.execute_bataql(r#"User filter .name = "Alice" update { age := 31 }"#).unwrap();
-        let result = engine.execute_bataql(r#"User filter .name = "Alice" { name, age }"#).unwrap();
+        engine.execute_powql(r#"User filter .name = "Alice" update { age := 31 }"#).unwrap();
+        let result = engine.execute_powql(r#"User filter .name = "Alice" { name, age }"#).unwrap();
         match result {
             QueryResult::Rows { rows, .. } => {
                 assert_eq!(rows[0][1], Value::Int(31));
@@ -500,8 +500,8 @@ mod tests {
     #[test]
     fn test_delete() {
         let mut engine = test_engine();
-        engine.execute_bataql(r#"User filter .name = "Bob" delete"#).unwrap();
-        let result = engine.execute_bataql("count(User)").unwrap();
+        engine.execute_powql(r#"User filter .name = "Bob" delete"#).unwrap();
+        let result = engine.execute_powql("count(User)").unwrap();
         match result {
             QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 2),
             _ => panic!("expected scalar int"),
@@ -511,7 +511,7 @@ mod tests {
     #[test]
     fn test_order_limit() {
         let mut engine = test_engine();
-        let result = engine.execute_bataql("User order .age desc limit 2 { name, age }").unwrap();
+        let result = engine.execute_powql("User order .age desc limit 2 { name, age }").unwrap();
         match result {
             QueryResult::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 2);

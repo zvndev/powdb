@@ -1,7 +1,7 @@
-use batadb_query::executor::Engine;
-use batadb_query::result::QueryResult;
-use batadb_server::protocol::Message;
-use batadb_storage::types::Value;
+use powdb_query::executor::Engine;
+use powdb_query::result::QueryResult;
+use powdb_server::protocol::Message;
+use powdb_storage::types::Value;
 use rustyline::DefaultEditor;
 use std::path::Path;
 use tokio::io::{BufReader, BufWriter};
@@ -16,10 +16,10 @@ struct CliArgs {
 }
 
 fn parse_args() -> CliArgs {
-    let mut data_dir = "./batadb_data".to_string();
+    let mut data_dir = "./powdb_data".to_string();
     let mut remote: Option<String> = None;
     let mut db: String = "main".to_string();
-    let mut password: Option<String> = std::env::var("BATADB_PASSWORD").ok().filter(|s| !s.is_empty());
+    let mut password: Option<String> = std::env::var("POWDB_PASSWORD").ok().filter(|s| !s.is_empty());
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -47,21 +47,21 @@ fn parse_args() -> CliArgs {
                 data_dir = argv[i].clone();
             }
             "--help" | "-h" => {
-                println!("batadb-cli — BataQL interactive shell");
+                println!("powdb-cli — PowQL interactive shell");
                 println!();
                 println!("USAGE:");
-                println!("    batadb-cli [OPTIONS] [DATA_DIR]");
+                println!("    powdb-cli [OPTIONS] [DATA_DIR]");
                 println!();
                 println!("OPTIONS:");
                 println!("    -r, --remote <HOST:PORT>   Connect to a remote server over TCP");
                 println!("        --db <NAME>            Database name (default: main)");
                 println!("        --password <PW>        Password for remote auth");
-                println!("    -d, --data-dir <PATH>      Embedded data dir (default: ./batadb_data)");
+                println!("    -d, --data-dir <PATH>      Embedded data dir (default: ./powdb_data)");
                 println!("    -h, --help                 Print this message");
                 println!();
                 println!("MODES:");
-                println!("    Embedded (default):  batadb-cli ./mydata");
-                println!("    Remote:              batadb-cli --remote 127.0.0.1:5433 --password secret");
+                println!("    Embedded (default):  powdb-cli ./mydata");
+                println!("    Remote:              powdb-cli --remote 127.0.0.1:5433 --password secret");
                 std::process::exit(0);
             }
             other if !other.starts_with('-') && !saw_positional => {
@@ -103,9 +103,9 @@ fn main() {
 // ─── Embedded mode ──────────────────────────────────────────────────────────
 
 fn run_embedded(data_dir: &str) {
-    eprintln!("BataDB v0.1.0 — embedded mode");
+    eprintln!("PowDB v0.1.0 — embedded mode");
     eprintln!("Data directory: {data_dir}");
-    eprintln!("Type BataQL queries. Use Ctrl-D to exit.\n");
+    eprintln!("Type PowQL queries. Use Ctrl-D to exit.\n");
 
     let mut engine = Engine::new(Path::new(data_dir))
         .expect("failed to initialize engine");
@@ -113,7 +113,7 @@ fn run_embedded(data_dir: &str) {
     let mut rl = DefaultEditor::new().expect("failed to init readline");
 
     loop {
-        let line = match rl.readline("bataql> ") {
+        let line = match rl.readline("powql> ") {
             Ok(line) => line,
             Err(rustyline::error::ReadlineError::Eof) => break,
             Err(rustyline::error::ReadlineError::Interrupted) => continue,
@@ -130,7 +130,7 @@ fn run_embedded(data_dir: &str) {
 
         rl.add_history_entry(trimmed).ok();
 
-        match engine.execute_bataql(trimmed) {
+        match engine.execute_powql(trimmed) {
             Ok(result) => print_local_result(&result),
             Err(e) => eprintln!("Error: {e}"),
         }
@@ -142,7 +142,7 @@ fn run_embedded(data_dir: &str) {
 // ─── Remote (wire protocol) mode ────────────────────────────────────────────
 
 async fn run_remote(addr: String, db: String, password: Option<String>) {
-    eprintln!("BataDB v0.1.0 — remote mode");
+    eprintln!("PowDB v0.1.0 — remote mode");
     eprintln!("Connecting to {addr} ...");
 
     let stream = match TcpStream::connect(&addr).await {
@@ -172,7 +172,7 @@ async fn run_remote(addr: String, db: String, password: Option<String>) {
     match Message::read_from(&mut reader).await {
         Ok(Some(Message::ConnectOk { version })) => {
             eprintln!("Connected to db `{db}` (server v{version})");
-            eprintln!("Type BataQL queries. Use Ctrl-D to exit.\n");
+            eprintln!("Type PowQL queries. Use Ctrl-D to exit.\n");
         }
         Ok(Some(Message::Error { message })) => {
             eprintln!("server rejected connection: {message}");
@@ -195,7 +195,7 @@ async fn run_remote(addr: String, db: String, password: Option<String>) {
     let mut rl = DefaultEditor::new().expect("failed to init readline");
 
     loop {
-        let line = match rl.readline("bataql> ") {
+        let line = match rl.readline("powql> ") {
             Ok(line) => line,
             Err(rustyline::error::ReadlineError::Eof) => break,
             Err(rustyline::error::ReadlineError::Interrupted) => continue,

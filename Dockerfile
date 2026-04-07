@@ -18,12 +18,12 @@ RUN mkdir -p crates/storage/src crates/query/src crates/server/src crates/cli/sr
  && echo 'pub fn _stub() {}' > crates/server/src/lib.rs \
  && echo 'fn main() {}'      > crates/server/src/main.rs \
  && echo 'fn main() {}'      > crates/cli/src/main.rs \
- && cargo build --release -p batadb-server 2>/dev/null || true
+ && cargo build --release -p powdb-server 2>/dev/null || true
 
 # Now copy real source and build for real
 COPY crates ./crates
 RUN touch crates/storage/src/lib.rs crates/query/src/lib.rs crates/server/src/lib.rs crates/server/src/main.rs crates/cli/src/main.rs \
- && cargo build --release -p batadb-server
+ && cargo build --release -p powdb-server
 
 # ─── Runtime ────────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
@@ -37,13 +37,13 @@ RUN apt-get update \
 RUN mkdir -p /data
 VOLUME ["/data"]
 
-COPY --from=builder /src/target/release/batadb-server /usr/local/bin/batadb-server
+COPY --from=builder /src/target/release/powdb-server /usr/local/bin/powdb-server
 
 ENV RUST_LOG=info \
-    BATADB_DATA=/data \
-    BATADB_PORT=5433
+    POWDB_DATA=/data \
+    POWDB_PORT=5433
 
 EXPOSE 5433
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["/usr/local/bin/batadb-server"]
+CMD ["/usr/local/bin/powdb-server"]

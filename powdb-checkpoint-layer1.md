@@ -1,4 +1,4 @@
-# BataDB: Layer 1 checkpoint
+# PowDB: Layer 1 checkpoint
 
 ## What we tested
 
@@ -76,15 +76,15 @@ With 8KB pages, each node visit is one page read. On NVMe at 10μs/read, a looku
 
 ### The question
 
-Should BataDB's query language be TurboLang itself, or a separate DSL?
+Should PowDB's query language be TurboLang itself, or a separate DSL?
 
 ### The answer: separate DSL, with TurboLang as a first-class client
 
-A DB-specific query language (BataQL) should be independent of any host language. TurboLang gets the deepest integration, but isn't required.
+A DB-specific query language (PowQL) should be independent of any host language. TurboLang gets the deepest integration, but isn't required.
 
 Why separate:
 
-1. **Audience.** If BataDB only works with TurboLang, adoption is limited to TurboLang users. Every successful database speaks a universal query language — SQL, GraphQL, EdgeQL. The query language IS the API.
+1. **Audience.** If PowDB only works with TurboLang, adoption is limited to TurboLang users. Every successful database speaks a universal query language — SQL, GraphQL, EdgeQL. The query language IS the API.
 
 2. **TurboLang stays clean.** General-purpose languages shouldn't carry storage semantics. Nullable types, transaction blocks, migration syntax — these are DB concerns, not language concerns. Putting them in TurboLang muddies both.
 
@@ -94,25 +94,25 @@ Why separate:
 
 Why TurboLang still gets superpowers:
 
-1. **Compile-time query planning.** TurboLang's compiler can parse BataQL at build time, resolve it against the schema, and emit physical execution plans. Other languages send BataQL strings at runtime — still better than SQL, but without compile-time optimization.
+1. **Compile-time query planning.** TurboLang's compiler can parse PowQL at build time, resolve it against the schema, and emit physical execution plans. Other languages send PowQL strings at runtime — still better than SQL, but without compile-time optimization.
 
-2. **Zero-copy type mapping.** TurboLang structs can match BataDB's page layout exactly. The compiler generates code that reads tuple data directly into application memory with no serialization. Other languages go through a driver that copies and converts.
+2. **Zero-copy type mapping.** TurboLang structs can match PowDB's page layout exactly. The compiler generates code that reads tuple data directly into application memory with no serialization. Other languages go through a driver that copies and converts.
 
-3. **Inline query syntax.** TurboLang can support BataQL as a first-class syntax element (like tagged template literals or LINQ expressions), with IDE autocompletion and type checking. Other languages use BataQL as strings.
+3. **Inline query syntax.** TurboLang can support PowQL as a first-class syntax element (like tagged template literals or LINQ expressions), with IDE autocompletion and type checking. Other languages use PowQL as strings.
 
 The access tiers:
 
 ```
 Tier 1 (TurboLang):  compile-time plans, zero-copy, inline syntax    → 40x over SQL
-Tier 2 (any lang):   BataQL over wire protocol, typed drivers         → 5-10x over SQL  
+Tier 2 (any lang):   PowQL over wire protocol, typed drivers         → 5-10x over SQL  
 Tier 3 (compat):     SQL via Postgres wire protocol                   → 1x (PostgreSQL compatible)
 ```
 
-Tier 3 matters for ecosystem tools — Grafana, pgAdmin, BI tools all speak PostgreSQL wire protocol. BataDB should support this for adoption, even though it's the slowest path.
+Tier 3 matters for ecosystem tools — Grafana, pgAdmin, BI tools all speak PostgreSQL wire protocol. PowDB should support this for adoption, even though it's the slowest path.
 
 ---
 
-## What this means for BataDB's architecture
+## What this means for PowDB's architecture
 
 ### The storage engine (validated)
 
@@ -125,7 +125,7 @@ Based on our experiments, the storage engine should:
 - WAL with group commit at batch=32-128
 - Direct I/O + io_uring on Linux
 
-### The query language (BataQL — to be designed)
+### The query language (PowQL — to be designed)
 
 Requirements from our findings:
 
@@ -158,14 +158,14 @@ Our experiments showed the columnar array loop (a primitive form of vectorized) 
 - Compare against our current array-loop approach and SQLite
 - Test with SIMD-friendly operations (integer comparisons, aggregations)
 
-### Layer 6: BataQL prototype
+### Layer 6: PowQL prototype
 - Design the query language syntax
 - Build a parser that emits typed operations (not SQL)
-- Compare: BataQL → direct execution vs SQL → parse → plan → execute
+- Compare: PowQL → direct execution vs SQL → parse → plan → execute
 
 ### Layer 7: Wire protocol + driver
 - Implement PostgreSQL wire protocol for compatibility
-- Build a native BataQL binary protocol for performance
+- Build a native PowQL binary protocol for performance
 - Measure the serialization overhead of each
 
 ---
@@ -180,4 +180,4 @@ The storage layer experiments validated that:
 4. **Group commit** makes durability cheap (batch=128 gives 48K writes/sec on production hardware)
 5. **These ratios hold across environments** — they're CPU-bound, not I/O-bound
 
-The path forward: BataQL as a standalone query DSL, BataDB as a hybrid row-column storage engine, TurboLang as the first-class client with compile-time superpowers, and PostgreSQL wire protocol compatibility for ecosystem tools.
+The path forward: PowQL as a standalone query DSL, PowDB as a hybrid row-column storage engine, TurboLang as the first-class client with compile-time superpowers, and PostgreSQL wire protocol compatibility for ecosystem tools.

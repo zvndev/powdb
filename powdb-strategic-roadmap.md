@@ -1,13 +1,13 @@
-# BataDB: Strategic roadmap
+# PowDB: Strategic roadmap
 
-## What BataDB is
+## What PowDB is
 
 A new database engine built from validated first principles. Every architectural
 decision is backed by production benchmarks (Railway, Intel Xeon Icelake, ZFS).
 
 Three products form the stack:
-- **BataDB** — the storage engine (embedded library + server)
-- **BataQL** — the query language (standalone DSL, not tied to any host language)
+- **PowDB** — the storage engine (embedded library + server)
+- **PowQL** — the query language (standalone DSL, not tied to any host language)
 - **TurboLang** — first-class client with compile-time superpowers (optional)
 
 TurbineORM (existing Postgres ORM) migrates seamlessly via PostgreSQL wire
@@ -27,7 +27,7 @@ protocol compatibility.
 | Execution | Vectorized (batch processing) | 4-13x in benchmarks, expect 10-50x native |
 | I/O | Direct I/O + io_uring (Linux) | Bypass OS page cache for predictable latency |
 
-### Query language (BataQL)
+### Query language (PowQL)
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Paradigm | Pipeline (filter → shape → aggregate) | Reads in execution order, not SQL's scrambled order |
@@ -43,9 +43,9 @@ protocol compatibility.
 ### Wire protocol
 | Mode | Path | Performance |
 |------|------|-------------|
-| Mode 1: Native BataQL | BataQL text → compile → execute → binary columns | 5-10x over SQL |
+| Mode 1: Native PowQL | PowQL text → compile → execute → binary columns | 5-10x over SQL |
 | Mode 2: Prepared plans | Pre-compiled plan hash + params → execute | 42x over SQL |
-| Mode 3: PG wire compat | SQL → translate → BataQL → compile → execute | ~1x (compat) |
+| Mode 3: PG wire compat | SQL → translate → PowQL → compile → execute | ~1x (compat) |
 
 ### Engine deployment
 | Mode | Description | Use case |
@@ -57,7 +57,7 @@ protocol compatibility.
 | Tier | Language | Integration depth |
 |------|----------|-------------------|
 | 1 | TurboLang | Compile-time plans, zero-copy types, inline syntax |
-| 2 | TypeScript, Python, Rust, Go | BataQL over native protocol, typed drivers |
+| 2 | TypeScript, Python, Rust, Go | PowQL over native protocol, typed drivers |
 | 3 | Any PG-compatible tool | SQL via PostgreSQL wire protocol |
 
 ## Production benchmark results (Railway)
@@ -91,8 +91,8 @@ Environment: Intel Xeon Icelake (shared), ZFS storage, Node.js v22
 - C ABI for embedding
 - Basic vectorized executor (filter, project, aggregate)
 
-### Phase 2: BataQL
-- Parser (BataQL text → AST)
+### Phase 2: PowQL
+- Parser (PowQL text → AST)
 - Type checker (schema-aware)
 - Compiler (AST → physical plan → engine API calls)
 - Plan cache (hash-based)
@@ -102,13 +102,13 @@ Environment: Intel Xeon Icelake (shared), ZFS storage, Node.js v22
 ### Phase 3: Wire protocols
 - Native binary protocol (column-oriented results)
 - PostgreSQL wire protocol (v3, compatibility)
-- TypeScript driver (@batadb/client)
+- TypeScript driver (@powdb/client)
 - Python driver
 
 ### Phase 4: TurboLang integration
-- Compile-time BataQL parsing and plan generation
-- Zero-copy type mapping (TurboLang structs = BataDB row format)
-- Inline BataQL syntax in TurboLang source files
+- Compile-time PowQL parsing and plan generation
+- Zero-copy type mapping (TurboLang structs = PowDB row format)
+- Inline PowQL syntax in TurboLang source files
 
 ### Phase 5: Production hardening
 - Connection pooling
@@ -119,7 +119,7 @@ Environment: Intel Xeon Icelake (shared), ZFS storage, Node.js v22
 
 ## Documents
 
-- [Layer 1 checkpoint](batadb-checkpoint-layer1.md) — benchmark findings and storage decisions
-- [BataQL language design](bataql-language-design.md) — query language syntax and semantics
-- [Wire protocol design](batadb-wire-protocol.md) — protocol, engine API, driver architecture
+- [Layer 1 checkpoint](powdb-checkpoint-layer1.md) — benchmark findings and storage decisions
+- [PowQL language design](powql-language-design.md) — query language syntax and semantics
+- [Wire protocol design](powdb-wire-protocol.md) — protocol, engine API, driver architecture
 - [Experiment code](turbodb-experiments.tar.gz) — 7 benchmark experiments (v0.3)

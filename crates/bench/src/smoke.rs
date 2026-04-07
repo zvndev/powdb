@@ -10,22 +10,22 @@
 //! warm-up, no per-op overhead measurement. Just wall clock over N iterations.
 //! The formal spec (coming next) will use criterion with proper methodology.
 
-use batadb_query::executor::Engine;
-use batadb_storage::types::*;
+use powdb_query::executor::Engine;
+use powdb_storage::types::*;
 use std::path::PathBuf;
 use std::time::Instant;
 
 const N_ROWS: usize = 50_000;
 const N_LOOKUPS: usize = 200_000;
 const N_SCANS: usize = 100;
-const N_BATAQL: usize = 2_000;
+const N_POWQL: usize = 2_000;
 
 fn main() {
-    let data_dir = std::env::temp_dir().join("batadb_bench_smoke");
+    let data_dir = std::env::temp_dir().join("powdb_bench_smoke");
     let _ = std::fs::remove_dir_all(&data_dir);
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    println!("BataDB smoke benchmark");
+    println!("PowDB smoke benchmark");
     println!("data dir: {}", data_dir.display());
     println!("rows:     {N_ROWS}");
     println!();
@@ -34,17 +34,17 @@ fn main() {
     bench_insert(&mut engine, &data_dir);
     bench_index_lookup(&mut engine);
     bench_seq_scan(&mut engine);
-    bench_bataql_parsed(&mut engine);
+    bench_powql_parsed(&mut engine);
 
     let _ = std::fs::remove_dir_all(&data_dir);
 }
 
-// ───── 1. Insert throughput (direct path, no BataQL parse) ──────────────────
+// ───── 1. Insert throughput (direct path, no PowQL parse) ──────────────────
 
 fn bench_insert(engine: &mut Engine, data_dir: &PathBuf) {
     // Create schema via the engine so the catalog persists it.
     engine
-        .execute_bataql(
+        .execute_powql(
             "type User { required id: int, required name: str, required age: int }",
         )
         .expect("create type");
@@ -144,19 +144,19 @@ fn bench_seq_scan(engine: &mut Engine) {
     println!();
 }
 
-// ───── 4. Full BataQL-parsed query path ─────────────────────────────────────
+// ───── 4. Full PowQL-parsed query path ─────────────────────────────────────
 
-fn bench_bataql_parsed(engine: &mut Engine) {
+fn bench_powql_parsed(engine: &mut Engine) {
     // Warm-up parse cache behavior
     for _ in 0..10 {
-        let _ = engine.execute_bataql("User filter .id = 42 { .id, .name }");
+        let _ = engine.execute_powql("User filter .id = 42 { .id, .name }");
     }
 
     let start = Instant::now();
     let mut hits = 0usize;
-    for i in 0..N_BATAQL {
+    for i in 0..N_POWQL {
         let q = format!("User filter .id = {} {{ .id, .name }}", i % N_ROWS);
-        match engine.execute_bataql(&q) {
+        match engine.execute_powql(&q) {
             Ok(_) => hits += 1,
             Err(e) => {
                 eprintln!("query failed at i={i}: {e}");
@@ -165,14 +165,14 @@ fn bench_bataql_parsed(engine: &mut Engine) {
         }
     }
     let elapsed = start.elapsed();
-    let per_op = elapsed.as_nanos() / N_BATAQL as u128;
-    let ops_per_sec = (N_BATAQL as f64) / elapsed.as_secs_f64();
+    let per_op = elapsed.as_nanos() / N_POWQL as u128;
+    let ops_per_sec = (N_POWQL as f64) / elapsed.as_secs_f64();
 
-    println!("[4] full BataQL parse + plan + execute ({N_BATAQL} queries, {hits} hits)");
+    println!("[4] full PowQL parse + plan + execute ({N_POWQL} queries, {hits} hits)");
     println!("    per op:  {:>10} ns ({:.3} ms)", per_op, per_op as f64 / 1_000_000.0);
     println!("    ops/sec: {:>10.0}", ops_per_sec);
     println!();
 
-    println!("Ratio check: direct [2] vs parsed [4] should be ~5-10x gap for BataDB.");
-    println!("The JS scaffolding showed ~42x for SQL; BataQL keeps the parser simple.");
+    println!("Ratio check: direct [2] vs parsed [4] should be ~5-10x gap for PowDB.");
+    println!("The JS scaffolding showed ~42x for SQL; PowQL keeps the parser simple.");
 }

@@ -1,4 +1,4 @@
-/// Top-level BataQL statement.
+/// Top-level PowQL statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     Query(QueryExpr),

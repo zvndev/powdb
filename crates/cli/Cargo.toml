@@ -1,12 +1,12 @@
 [package]
-name = "batadb-cli"
+name = "powdb-cli"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-batadb-storage = { path = "../storage" }
-batadb-query = { path = "../query" }
-batadb-server = { path = "../server" }
+powdb-storage = { path = "../storage" }
+powdb-query = { path = "../query" }
+powdb-server = { path = "../server" }
 rustyline = "15"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "macros"] }
 tracing.workspace = true

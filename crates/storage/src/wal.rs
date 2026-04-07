@@ -168,7 +168,7 @@ mod tests {
     use super::*;
 
     fn temp_wal(name: &str) -> (Wal, PathBuf) {
-        let path = std::env::temp_dir().join(format!("batadb_wal_{name}_{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("powdb_wal_{name}_{}", std::process::id()));
         let wal = Wal::create(&path, 4).unwrap();
         (wal, path)
     }
@@ -251,7 +251,7 @@ mod tests {
 
     #[test]
     fn test_reopen_wal() {
-        let path = std::env::temp_dir().join(format!("batadb_wal_reopen_{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("powdb_wal_reopen_{}", std::process::id()));
         {
             let mut wal = Wal::create(&path, 128).unwrap();
             wal.append(1, WalRecordType::Insert, b"persistent").unwrap();

@@ -418,5 +418,5 @@ console.log('     For read-heavy workloads with many concurrent snapshots, appen
 console.log('     can be simpler (no reconstruction cost).');
 console.log('  4. The VACUUM cost in append-only is the hidden tax PostgreSQL users');
 console.log('     pay. It causes I/O storms, table locking, and unpredictable latency.');
-console.log('  5. BataDB recommendation: undo-log MVCC. The main table stays clean,');
+console.log('  5. PowDB recommendation: undo-log MVCC. The main table stays clean,');
 console.log('     scans never touch dead rows, and undo purge is a pointer advance.\n');

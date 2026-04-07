@@ -1,4 +1,4 @@
-# BataQL: Query language design
+# PowQL: Query language design
 
 ## Why not just use SQL?
 
@@ -29,7 +29,7 @@ SQL was designed in 1974 for non-programmers to query relational data.
 
 ## Design principles
 
-BataQL should be:
+PowQL should be:
 
 1. **Composable** — every expression returns a set. Any expression can be the input to
    any other expression. No special cases.
@@ -47,7 +47,7 @@ BataQL should be:
 5. **Pipeline order** — expressions read left to right in execution order.
    Filter first, then shape, then aggregate. Not SELECT...FROM...WHERE.
 
-6. **Compiles to typed operations** — BataQL doesn't get interpreted. It compiles to a
+6. **Compiles to typed operations** — PowQL doesn't get interpreted. It compiles to a
    physical plan that maps directly to storage engine operations. When used from TurboLang,
    this compilation happens at build time.
 
@@ -55,7 +55,7 @@ BataQL should be:
 
 ### Schema definition
 
-```bataql
+```powql
 type User {
   required name: str
   required email: str
@@ -80,7 +80,7 @@ type Company {
 
 ### Basic queries
 
-```bataql
+```powql
 # Get all users
 User
 
@@ -106,7 +106,7 @@ User
 
 ### Links (not joins)
 
-```bataql
+```powql
 # Get users with their posts
 User { name, posts: .posts { title, created_at } }
 
@@ -129,7 +129,7 @@ User {
 
 ### Aggregations
 
-```bataql
+```powql
 # Count all users
 count(User)
 
@@ -156,7 +156,7 @@ User
 
 ### Set-based nullability
 
-```bataql
+```powql
 # .age returns {} if not set, {value} if set
 
 # Provide default
@@ -175,7 +175,7 @@ User filter not exists .age
 
 ### Computed fields and let bindings
 
-```bataql
+```powql
 # Computed field
 User {
   name,
@@ -193,7 +193,7 @@ active_users filter .age > 30
 
 ### Mutations
 
-```bataql
+```powql
 # Insert
 insert User { name := "Alice", email := "alice@example.com", age := 30 }
 
@@ -227,7 +227,7 @@ User upsert on .email = "alice@example.com" {
 
 ### Transactions
 
-```bataql
+```powql
 transaction {
   let alice := insert User { name := "Alice", email := "alice@ex.com" }
   insert Post { title := "First post", author := alice, ... }
@@ -236,9 +236,9 @@ transaction {
 
 ## How this maps to the storage engine
 
-Each BataQL operation maps directly to engine operations:
+Each PowQL operation maps directly to engine operations:
 
-| BataQL | Engine operation |
+| PowQL | Engine operation |
 |--------|-----------------|
 | `User` | Sequential scan of User table |
 | `filter .age > 30` | Filter operator (vectorized on columnar segment) |
@@ -253,7 +253,7 @@ Each BataQL operation maps directly to engine operations:
 
 The key insight: **there's no parse → plan → optimize at runtime for known queries.**
 
-When BataQL is compiled (especially from TurboLang), the compiler:
+When PowQL is compiled (especially from TurboLang), the compiler:
 1. Resolves all type references at build time
 2. Chooses index scan vs seq scan based on statistics
 3. Emits a direct execution plan — a sequence of engine API calls
@@ -263,7 +263,7 @@ This is the 42x gap we measured — eliminating the SQL translation layers entir
 
 ## Comparison with prior art
 
-| Feature | SQL | EdgeQL | GraphQL | BataQL |
+| Feature | SQL | EdgeQL | GraphQL | PowQL |
 |---------|-----|--------|---------|--------|
 | Composable | No (subqueries) | Yes | Partial | Yes |
 | Links vs joins | Joins | Links | Links | Links |
@@ -273,7 +273,7 @@ This is the 42x gap we measured — eliminating the SQL translation layers entir
 | Compiles to plan | No | Partially | No | Yes |
 | Mutations | Separate syntax | Integrated | Separate | Integrated |
 
-BataQL is most similar to EdgeQL (from EdgeDB/Gel) in philosophy but diverges on:
+PowQL is most similar to EdgeQL (from EdgeDB/Gel) in philosophy but diverges on:
 - Pipeline syntax (`filter` / `order` / `limit` as chained operators, not keywords)
 - Explicit set-based nullability with `??` and `exists`
 - First-class compilation to physical plans
@@ -284,22 +284,22 @@ BataQL is most similar to EdgeQL (from EdgeDB/Gel) in philosophy but diverges on
 Three access modes:
 
 ### Mode 1: Native binary protocol (fastest)
-BataQL text → server-side compile → execute → binary result
+PowQL text → server-side compile → execute → binary result
 The compiled plan is cached. Subsequent calls with same query shape skip compilation.
 Result format: column-oriented binary (no JSON parsing overhead).
 
 ### Mode 2: Prepared operations (compiled languages)
-TurboLang/Rust/C compile BataQL at build time → send plan hash + parameters → execute.
+TurboLang/Rust/C compile PowQL at build time → send plan hash + parameters → execute.
 No parsing or compilation on the server. Just parameter binding + execute.
 This is the 42x path.
 
 ### Mode 3: PostgreSQL wire protocol (compatibility)
-SQL text → translate to BataQL internally → execute → PostgreSQL result format.
+SQL text → translate to PowQL internally → execute → PostgreSQL result format.
 Slowest path but enables Grafana, pgAdmin, BI tools, existing ORMs.
 The translation layer adds the overhead we measured (20-42x) but that's the price
 of compatibility.
 
-## What this means for BataDB's implementation
+## What this means for PowDB's implementation
 
 The engine needs to expose a typed API, not a text API:
 
@@ -314,9 +314,9 @@ fn insert(table: TableId, row: TypedRow) -> RowId
 fn update(table: TableId, rowId: RowId, changes: TypedRow) -> void
 ```
 
-BataQL compiles down to calls against this API. The SQL compatibility layer
+PowQL compiles down to calls against this API. The SQL compatibility layer
 also compiles down to this API but through a longer path (parse SQL → analyze →
-map to BataQL → compile → engine API calls).
+map to PowQL → compile → engine API calls).
 
 ## Design decisions
 
@@ -325,7 +325,7 @@ map to BataQL → compile → engine API calls).
 Links are the default and fast path. For ad-hoc cross-table comparisons that
 aren't predeclared relationships, use `match`:
 
-```bataql
+```powql
 # Predeclared link (fast — engine knows the index)
 User { name, posts: .posts { title } }
 
@@ -344,18 +344,18 @@ looks identical regardless of whether it's indexed.
 
 ### 2. Migrations: declarative schema diffing
 
-The developer maintains a single `schema.bataql` file that IS the schema. To migrate,
-you change the file and BataDB diffs the current state against the desired state,
+The developer maintains a single `schema.powql` file that IS the schema. To migrate,
+you change the file and PowDB diffs the current state against the desired state,
 generates a migration plan, and asks for confirmation before applying.
 
 ```bash
-# Developer edits schema.bataql — adds a field, removes a type, etc.
-batadb migrate --plan          # shows what would change (dry run)
-batadb migrate --apply         # applies the changes
+# Developer edits schema.powql — adds a field, removes a type, etc.
+powdb migrate --plan          # shows what would change (dry run)
+powdb migrate --apply         # applies the changes
 
 # Under the hood:
 # 1. Read current schema from the database
-# 2. Read desired schema from schema.bataql
+# 2. Read desired schema from schema.powql
 # 3. Diff them — compute ADD COLUMN, DROP TYPE, CREATE INDEX, etc.
 # 4. Generate a reversible migration plan
 # 5. Show the plan to the developer for review
@@ -382,9 +382,9 @@ Edge cases handled:
 Migration history is stored in the database itself, so you can always see what
 changed and when:
 
-```bataql
+```powql
 # Built-in migration history
-select BataDB.migrations order .applied_at desc
+select PowDB.migrations order .applied_at desc
 ```
 
 ### 3. Indexes: automatic with manual override
@@ -396,7 +396,7 @@ The engine automatically creates indexes for:
 
 Developers can declare additional indexes explicitly:
 
-```bataql
+```powql
 type User {
   required name: str
   required email: str
@@ -411,7 +411,7 @@ type User {
 The engine also tracks query patterns and suggests indexes:
 
 ```bash
-batadb suggest-indexes    # analyzes recent query patterns
+powdb suggest-indexes    # analyzes recent query patterns
 # Output:
 # Suggested: index on User.age  (used in 847 queries, avg scan 12ms → est. 0.3ms)
 # Suggested: index on Post(.created_at, .author)  (used in 234 queries)
@@ -426,7 +426,7 @@ who aren't sure.
 
 Large result sets stream by default. Small result sets materialize.
 
-```bataql
+```powql
 # Returns a cursor — streams rows as you consume them
 User filter .age > 30 { name, email }
 
@@ -446,9 +446,9 @@ materializes — the overhead of cursor management isn't worth it for small resu
 
 ### 5. Computed views: first-class named queries
 
-Views are named BataQL expressions that behave like types:
+Views are named PowQL expressions that behave like types:
 
-```bataql
+```powql
 # Define a view
 view ActiveUser := User filter .last_login > now() - duration('30d')
 
@@ -466,13 +466,13 @@ TeamSummary filter .headcount > 10 order .avg_age desc
 
 Views compose — a view can reference other views:
 
-```bataql
+```powql
 view SeniorActiveUser := ActiveUser filter .age > 50
 ```
 
 Views can be materialized for performance:
 
-```bataql
+```powql
 # Materialized view — engine maintains a cached result set
 # Updated automatically when underlying data changes
 materialized view DailyStats := Post

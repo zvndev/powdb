@@ -1,7 +1,7 @@
 use crate::protocol::Message;
-use batadb_query::executor::Engine;
-use batadb_query::result::QueryResult;
-use batadb_storage::types::Value;
+use powdb_query::executor::Engine;
+use powdb_query::result::QueryResult;
+use powdb_storage::types::Value;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
@@ -63,7 +63,7 @@ pub async fn handle_connection(stream: TcpStream, engine: Arc<Mutex<Engine>>, ex
             Message::Query { query } => {
                 debug!(peer = %peer, query = %query, "received query");
                 let mut eng = engine.lock().unwrap();
-                match eng.execute_bataql(&query) {
+                match eng.execute_powql(&query) {
                     Ok(result) => query_result_to_message(result),
                     Err(e) => Message::Error { message: e },
                 }

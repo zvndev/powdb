@@ -1,4 +1,4 @@
-use batadb_storage::types::Value;
+use powdb_storage::types::Value;
 
 /// The result of executing a query.
 #[derive(Debug)]

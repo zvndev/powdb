@@ -1,13 +1,13 @@
 [package]
-name = "batadb-bench"
+name = "powdb-bench"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
 
 [dependencies]
-batadb-storage = { path = "../storage" }
-batadb-query = { path = "../query" }
+powdb-storage = { path = "../storage" }
+powdb-query = { path = "../query" }
 
 [[bin]]
 name = "smoke-bench"

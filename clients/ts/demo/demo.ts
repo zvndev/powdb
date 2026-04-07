@@ -1,20 +1,20 @@
 /**
- * BataDB client demo.
+ * PowDB client demo.
  *
- * Connects to the BataDB server (defaults to the Fly deployment), creates a
- * table, inserts a handful of rows, and runs a few BataQL queries against it.
+ * Connects to the PowDB server (defaults to the Fly deployment), creates a
+ * table, inserts a handful of rows, and runs a few PowQL queries against it.
  *
  * Usage:
- *     BATADB_PASSWORD=... tsx demo/demo.ts
- *     BATADB_HOST=127.0.0.1 BATADB_PORT=5433 tsx demo/demo.ts
+ *     POWDB_PASSWORD=... tsx demo/demo.ts
+ *     POWDB_HOST=127.0.0.1 POWDB_PORT=5433 tsx demo/demo.ts
  */
 
 import { Client, type QueryResult } from "../src/index.js";
 
-const HOST = process.env.BATADB_HOST ?? "213.188.194.202";
-const PORT = Number(process.env.BATADB_PORT ?? "5433");
-const DB = process.env.BATADB_DB ?? "default";
-const PASSWORD = process.env.BATADB_PASSWORD ?? null;
+const HOST = process.env.POWDB_HOST ?? "213.188.194.202";
+const PORT = Number(process.env.POWDB_PORT ?? "5433");
+const DB = process.env.POWDB_DB ?? "default";
+const PASSWORD = process.env.POWDB_PASSWORD ?? null;
 
 async function main() {
   console.log(`→ connecting to ${HOST}:${PORT} (db=${DB})`);
@@ -28,7 +28,7 @@ async function main() {
 
   try {
     // Use a unique table name per run so reruns don't collide on a
-    // persistent server. BataQL doesn't have DROP TABLE (yet).
+    // persistent server. PowQL doesn't have DROP TABLE (yet).
     const table = `Demo${Date.now().toString(36)}`;
     console.log(`→ creating type ${table}`);
     await run(

@@ -1,24 +1,24 @@
-# BataDB Implementation Plan
+# PowDB Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build BataDB from scratch in Rust — a real, working database with custom storage engine, BataQL query language, native wire protocol, TCP server, and interactive CLI.
+**Goal:** Build PowDB from scratch in Rust — a real, working database with custom storage engine, PowQL query language, native wire protocol, TCP server, and interactive CLI.
 
-**Architecture:** Library-first design. `batadb-storage` is the core engine (pages, rows, B-tree, WAL, MVCC, buffer pool). `batadb-query` compiles BataQL text into physical plans and executes them against storage. `batadb-server` wraps the library with TCP + native binary protocol. `batadb-cli` is an interactive REPL. Each layer is tested independently before the next layer builds on it.
+**Architecture:** Library-first design. `powdb-storage` is the core engine (pages, rows, B-tree, WAL, MVCC, buffer pool). `powdb-query` compiles PowQL text into physical plans and executes them against storage. `powdb-server` wraps the library with TCP + native binary protocol. `powdb-cli` is an interactive REPL. Each layer is tested independently before the next layer builds on it.
 
 **Tech Stack:** Rust (2024 edition), tokio (async server), crc32fast (checksums), bytes (buffer manipulation), rustyline (CLI readline)
 
-**Spec:** `batadb-implementation-brief.md` — all architectural decisions are backed by production benchmarks.
+**Spec:** `powdb-implementation-brief.md` — all architectural decisions are backed by production benchmarks.
 
 ---
 
 ## Project Structure
 
 ```
-batadb/
+powdb/
 ├── Cargo.toml                          # Workspace root
 ├── crates/
-│   ├── storage/                        # batadb-storage
+│   ├── storage/                        # powdb-storage
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs                  # Public API surface
@@ -34,13 +34,13 @@ batadb/
 │   │       ├── mvcc.rs                 # Undo-log MVCC: in-place update with undo chain, visibility checks
 │   │       ├── table.rs                # Table handle: combines heap + indexes + schema for a single table
 │   │       └── catalog.rs              # System catalog: table registry, schema storage, DDL operations
-│   ├── query/                          # batadb-query
+│   ├── query/                          # powdb-query
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── lib.rs                  # Public API: compile(bataql) -> plan, execute(plan) -> results
-│   │       ├── lexer.rs                # Tokenizer: BataQL text -> token stream
+│   │       ├── lib.rs                  # Public API: compile(powql) -> plan, execute(plan) -> results
+│   │       ├── lexer.rs                # Tokenizer: PowQL text -> token stream
 │   │       ├── token.rs                # Token types (keywords, operators, literals, identifiers)
-│   │       ├── ast.rs                  # AST node types for all BataQL expressions
+│   │       ├── ast.rs                  # AST node types for all PowQL expressions
 │   │       ├── parser.rs               # Recursive descent parser: tokens -> AST
 │   │       ├── typeck.rs               # Type checker: resolve field refs, validate types against schema
 │   │       ├── planner.rs              # Query planner: AST -> logical plan -> physical plan
@@ -48,16 +48,16 @@ batadb/
 │   │       ├── executor.rs             # Plan executor: walks plan tree, calls storage engine ops
 │   │       ├── result.rs               # Query result type: column-oriented batches
 │   │       └── plan_cache.rs           # Hash-based compiled plan cache
-│   ├── server/                         # batadb-server
+│   ├── server/                         # powdb-server
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── main.rs                 # Entry point: parse config, start TCP listener
 │   │       ├── protocol.rs             # Wire protocol: frame encoding/decoding, message types
 │   │       └── handler.rs              # Connection handler: read messages, dispatch to engine, send results
-│   └── cli/                            # batadb-cli
+│   └── cli/                            # powdb-cli
 │       ├── Cargo.toml
 │       └── src/
-│           └── main.rs                 # Interactive REPL: connect to server, send BataQL, display results
+│           └── main.rs                 # Interactive REPL: connect to server, send PowQL, display results
 ```
 
 ---
@@ -95,7 +95,7 @@ crc32fast = "1"
 ```toml
 # crates/storage/Cargo.toml
 [package]
-name = "batadb-storage"
+name = "powdb-storage"
 version.workspace = true
 edition.workspace = true
 
@@ -358,7 +358,7 @@ Expected: All 5 tests PASS.
 git add Cargo.toml crates/storage/
 git commit -m "feat(storage): scaffold workspace and implement value types
 
-Cargo workspace with batadb-storage crate. Value enum with Int, Float,
+Cargo workspace with powdb-storage crate. Value enum with Int, Float,
 Bool, Str, DateTime, Uuid, Bytes, Empty. TypeId discriminant. ColumnDef,
 Schema, and RowId types. Set-based nullability (Empty, not NULL)."
 ```
@@ -451,7 +451,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p batadb-storage -- page`
+Run: `cargo test -p powdb-storage -- page`
 Expected: Compile error — `Page`, `PageType`, constants not defined.
 
 - [ ] **Step 3: Implement Page**
@@ -684,7 +684,7 @@ impl Page {
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cargo test -p batadb-storage -- page`
+Run: `cargo test -p powdb-storage -- page`
 Expected: All 6 tests PASS.
 
 - [ ] **Step 6: Commit**
@@ -783,7 +783,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p batadb-storage -- row`
+Run: `cargo test -p powdb-storage -- row`
 Expected: Compile error — `encode_row`, `decode_row` not defined.
 
 - [ ] **Step 3: Implement encode_row and decode_row**
@@ -979,7 +979,7 @@ pub fn decode_row(schema: &Schema, data: &[u8]) -> Row {
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cargo test -p batadb-storage -- row`
+Run: `cargo test -p powdb-storage -- row`
 Expected: All 3 tests PASS.
 
 - [ ] **Step 6: Commit**
@@ -1012,7 +1012,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn temp_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("batadb_test_{name}_{}", std::process::id()))
+        std::env::temp_dir().join(format!("powdb_test_{name}_{}", std::process::id()))
     }
 
     #[test]
@@ -1145,7 +1145,7 @@ impl DiskManager {
 
 - [ ] **Step 4: Run tests, verify they pass**
 
-Run: `cargo test -p batadb-storage -- disk`
+Run: `cargo test -p powdb-storage -- disk`
 Expected: All 3 tests PASS.
 
 - [ ] **Step 5: Commit**
@@ -1187,7 +1187,7 @@ mod tests {
 
     #[test]
     fn test_insert_and_get() {
-        let path = std::env::temp_dir().join(format!("batadb_heap_basic_{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("powdb_heap_basic_{}", std::process::id()));
         let schema = user_schema();
         let mut heap = HeapFile::create(&path).unwrap();
         let row = vec![Value::Str("Alice".into()), Value::Int(30)];
@@ -1203,7 +1203,7 @@ mod tests {
 
     #[test]
     fn test_scan_all_rows() {
-        let path = std::env::temp_dir().join(format!("batadb_heap_scan_{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("powdb_heap_scan_{}", std::process::id()));
         let schema = user_schema();
         let mut heap = HeapFile::create(&path).unwrap();
         for i in 0..100 {
@@ -1218,7 +1218,7 @@ mod tests {
 
     #[test]
     fn test_delete_row() {
-        let path = std::env::temp_dir().join(format!("batadb_heap_del_{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("powdb_heap_del_{}", std::process::id()));
         let schema = user_schema();
         let mut heap = HeapFile::create(&path).unwrap();
         let r1 = heap.insert(&encode_row(&schema, &vec![Value::Str("A".into()), Value::Int(1)])).unwrap();
@@ -1352,7 +1352,7 @@ impl HeapFile {
 
 - [ ] **Step 4: Run tests, verify they pass**
 
-Run: `cargo test -p batadb-storage -- heap`
+Run: `cargo test -p powdb-storage -- heap`
 Expected: All 3 tests PASS.
 
 - [ ] **Step 5: Commit**
@@ -1385,7 +1385,7 @@ mod tests {
     use crate::types::*;
 
     fn temp_btree(name: &str) -> BTree {
-        let path = std::env::temp_dir().join(format!("batadb_btree_{name}_{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("powdb_btree_{name}_{}", std::process::id()));
         BTree::create(&path).unwrap()
     }
 
@@ -1668,7 +1668,7 @@ impl BTree {
 
 - [ ] **Step 4: Run tests, verify they pass**
 
-Run: `cargo test -p batadb-storage -- btree`
+Run: `cargo test -p powdb-storage -- btree`
 Expected: All 5 tests PASS.
 
 - [ ] **Step 5: Commit**
@@ -1701,7 +1701,7 @@ mod tests {
     use super::*;
 
     fn temp_wal(name: &str) -> Wal {
-        let path = std::env::temp_dir().join(format!("batadb_wal_{name}_{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("powdb_wal_{name}_{}", std::process::id()));
         Wal::create(&path, 4).unwrap() // batch size 4 for testing
     }
 
@@ -1926,7 +1926,7 @@ impl Wal {
 
 - [ ] **Step 4: Run tests, verify they pass**
 
-Run: `cargo test -p batadb-storage -- wal`
+Run: `cargo test -p powdb-storage -- wal`
 Expected: All 4 tests PASS.
 
 - [ ] **Step 5: Commit**
@@ -1960,7 +1960,7 @@ mod tests {
     use crate::page::{Page, PageType};
 
     fn temp_pool(name: &str, capacity: usize) -> BufferPool {
-        let path = std::env::temp_dir().join(format!("batadb_bp_{name}_{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("powdb_bp_{name}_{}", std::process::id()));
         BufferPool::new(&path, capacity).unwrap()
     }
 
@@ -2167,7 +2167,7 @@ impl BufferPool {
 
 - [ ] **Step 4: Run tests, verify they pass**
 
-Run: `cargo test -p batadb-storage -- buffer`
+Run: `cargo test -p powdb-storage -- buffer`
 Expected: All 2 tests PASS.
 
 - [ ] **Step 5: Commit**
@@ -2394,7 +2394,7 @@ impl UndoLog {
 
 - [ ] **Step 5: Run tests, verify they pass**
 
-Run: `cargo test -p batadb-storage -- tx`
+Run: `cargo test -p powdb-storage -- tx`
 Expected: All 5 tests PASS.
 
 - [ ] **Step 6: Commit**
@@ -2430,7 +2430,7 @@ mod tests {
     use crate::types::*;
 
     fn temp_catalog(name: &str) -> Catalog {
-        let dir = std::env::temp_dir().join(format!("batadb_cat_{name}_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("powdb_cat_{name}_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         Catalog::create(&dir).unwrap()
     }
@@ -2735,7 +2735,7 @@ impl Catalog {
 
 - [ ] **Step 5: Run tests, verify they pass**
 
-Run: `cargo test -p batadb-storage -- catalog`
+Run: `cargo test -p powdb-storage -- catalog`
 Expected: All 5 tests PASS.
 
 - [ ] **Step 6: Commit**
@@ -2751,7 +2751,7 @@ lookup. This completes the storage engine foundation."
 
 ---
 
-## Phase 2: BataQL Compiler
+## Phase 2: PowQL Compiler
 
 ### Task 11: Token types and lexer
 
@@ -2767,12 +2767,12 @@ lookup. This completes the storage engine foundation."
 ```toml
 # crates/query/Cargo.toml
 [package]
-name = "batadb-query"
+name = "powdb-query"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-batadb-storage = { path = "../storage" }
+powdb-storage = { path = "../storage" }
 thiserror.workspace = true
 ```
 
@@ -3146,16 +3146,16 @@ pub mod lexer;
 
 - [ ] **Step 5: Run tests, verify they pass**
 
-Run: `cargo test -p batadb-query -- lexer`
+Run: `cargo test -p powdb-query -- lexer`
 Expected: All 6 tests PASS.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add crates/query/
-git commit -m "feat(query): BataQL lexer — tokenize query text
+git commit -m "feat(query): PowQL lexer — tokenize query text
 
-Complete tokenizer for BataQL: identifiers, dot-idents (.field),
+Complete tokenizer for PowQL: identifiers, dot-idents (.field),
 parameters ($name), string/int/float/bool literals, all keywords
 (filter, order, insert, update, delete, group, etc.), operators
 (:=, ->, ??, comparisons), and delimiters."
@@ -3178,7 +3178,7 @@ Recursive descent parser: tokens -> AST. Covers queries, mutations, projections,
 ```rust
 // crates/query/src/ast.rs
 
-/// Top-level BataQL statement.
+/// Top-level PowQL statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     Query(QueryExpr),
@@ -3809,14 +3809,14 @@ pub mod parser;
 
 - [ ] **Step 5: Run tests, verify they pass**
 
-Run: `cargo test -p batadb-query -- parser`
+Run: `cargo test -p powdb-query -- parser`
 Expected: All 9 tests PASS.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add crates/query/src/
-git commit -m "feat(query): BataQL parser — recursive descent to AST
+git commit -m "feat(query): PowQL parser — recursive descent to AST
 
 Parses queries (Type filter/order/limit/projection), inserts,
 updates, deletes, aggregates (count/avg/sum/min/max), and type
@@ -4029,7 +4029,7 @@ fn plan_create_type(ct: CreateTypeExpr) -> Result<PlanNode, PlanError> {
 
 - [ ] **Step 4: Run tests, verify they pass**
 
-Run: `cargo test -p batadb-query -- planner`
+Run: `cargo test -p powdb-query -- planner`
 Expected: All 6 tests PASS.
 
 - [ ] **Step 5: Commit**
@@ -4038,7 +4038,7 @@ Expected: All 6 tests PASS.
 git add crates/query/src/plan.rs crates/query/src/planner.rs crates/query/src/lib.rs
 git commit -m "feat(query): query planner — AST to physical plan nodes
 
-Converts parsed BataQL into a tree of plan nodes: SeqScan, Filter,
+Converts parsed PowQL into a tree of plan nodes: SeqScan, Filter,
 Project, Sort, Limit, Aggregate, Insert, Update, Delete, CreateTable.
 Foundation for the executor."
 ```
@@ -4053,13 +4053,13 @@ Foundation for the executor."
 - Modify: `crates/query/src/lib.rs`
 - Test: inline `#[cfg(test)]` in `executor.rs`
 
-This is where BataQL meets the storage engine. The executor walks the plan tree and calls catalog operations.
+This is where PowQL meets the storage engine. The executor walks the plan tree and calls catalog operations.
 
 - [ ] **Step 1: Define query result types**
 
 ```rust
 // crates/query/src/result.rs
-use batadb_storage::types::Value;
+use powdb_storage::types::Value;
 
 /// A single row in query results.
 #[derive(Debug, Clone)]
@@ -4098,23 +4098,23 @@ impl QueryResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use batadb_storage::types::*;
+    use powdb_storage::types::*;
 
     fn test_engine() -> Engine {
-        let dir = std::env::temp_dir().join(format!("batadb_exec_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("powdb_exec_{}", std::process::id()));
         let mut engine = Engine::new(&dir).unwrap();
         // Create a test table
-        engine.execute_bataql("type User { required name: str, required email: str, age: int }").unwrap();
-        engine.execute_bataql(r#"insert User { name := "Alice", email := "alice@ex.com", age := 30 }"#).unwrap();
-        engine.execute_bataql(r#"insert User { name := "Bob", email := "bob@ex.com", age := 25 }"#).unwrap();
-        engine.execute_bataql(r#"insert User { name := "Charlie", email := "charlie@ex.com", age := 35 }"#).unwrap();
+        engine.execute_powql("type User { required name: str, required email: str, age: int }").unwrap();
+        engine.execute_powql(r#"insert User { name := "Alice", email := "alice@ex.com", age := 30 }"#).unwrap();
+        engine.execute_powql(r#"insert User { name := "Bob", email := "bob@ex.com", age := 25 }"#).unwrap();
+        engine.execute_powql(r#"insert User { name := "Charlie", email := "charlie@ex.com", age := 35 }"#).unwrap();
         engine
     }
 
     #[test]
     fn test_scan_all() {
         let engine = test_engine();
-        let result = engine.execute_bataql("User").unwrap();
+        let result = engine.execute_powql("User").unwrap();
         match result {
             QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 3),
             _ => panic!("expected rows"),
@@ -4124,7 +4124,7 @@ mod tests {
     #[test]
     fn test_filter() {
         let engine = test_engine();
-        let result = engine.execute_bataql("User filter .age > 28").unwrap();
+        let result = engine.execute_powql("User filter .age > 28").unwrap();
         match result {
             QueryResult::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 2); // Alice (30) and Charlie (35)
@@ -4136,7 +4136,7 @@ mod tests {
     #[test]
     fn test_projection() {
         let engine = test_engine();
-        let result = engine.execute_bataql("User { name }").unwrap();
+        let result = engine.execute_powql("User { name }").unwrap();
         match result {
             QueryResult::Rows { columns, rows } => {
                 assert_eq!(columns, vec!["name"]);
@@ -4149,7 +4149,7 @@ mod tests {
     #[test]
     fn test_insert_and_count() {
         let mut engine = test_engine();
-        let result = engine.execute_bataql("count(User)").unwrap();
+        let result = engine.execute_powql("count(User)").unwrap();
         match result {
             QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 3),
             _ => panic!("expected scalar int"),
@@ -4159,8 +4159,8 @@ mod tests {
     #[test]
     fn test_update() {
         let mut engine = test_engine();
-        engine.execute_bataql(r#"User filter .name = "Alice" update { age := 31 }"#).unwrap();
-        let result = engine.execute_bataql(r#"User filter .name = "Alice" { name, age }"#).unwrap();
+        engine.execute_powql(r#"User filter .name = "Alice" update { age := 31 }"#).unwrap();
+        let result = engine.execute_powql(r#"User filter .name = "Alice" { name, age }"#).unwrap();
         match result {
             QueryResult::Rows { rows, .. } => {
                 assert_eq!(rows[0][1], Value::Int(31));
@@ -4172,8 +4172,8 @@ mod tests {
     #[test]
     fn test_delete() {
         let mut engine = test_engine();
-        engine.execute_bataql(r#"User filter .name = "Bob" delete"#).unwrap();
-        let result = engine.execute_bataql("count(User)").unwrap();
+        engine.execute_powql(r#"User filter .name = "Bob" delete"#).unwrap();
+        let result = engine.execute_powql("count(User)").unwrap();
         match result {
             QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 2),
             _ => panic!("expected scalar int"),
@@ -4183,7 +4183,7 @@ mod tests {
     #[test]
     fn test_order_limit() {
         let engine = test_engine();
-        let result = engine.execute_bataql("User order .age desc limit 2 { name, age }").unwrap();
+        let result = engine.execute_powql("User order .age desc limit 2 { name, age }").unwrap();
         match result {
             QueryResult::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 2);
@@ -4204,8 +4204,8 @@ use crate::ast::*;
 use crate::plan::*;
 use crate::planner;
 use crate::result::QueryResult;
-use batadb_storage::catalog::Catalog;
-use batadb_storage::types::*;
+use powdb_storage::catalog::Catalog;
+use powdb_storage::types::*;
 use std::io;
 use std::path::Path;
 
@@ -4221,7 +4221,7 @@ impl Engine {
         })
     }
 
-    pub fn execute_bataql(&mut self, input: &str) -> Result<QueryResult, String> {
+    pub fn execute_powql(&mut self, input: &str) -> Result<QueryResult, String> {
         let plan = planner::plan(input).map_err(|e| e.message)?;
         self.execute_plan(&plan)
     }
@@ -4554,18 +4554,18 @@ fn values_update_field(row: &mut Row, idx: usize, expr: &Expr, columns: &[String
 
 - [ ] **Step 4: Run tests, verify they pass**
 
-Run: `cargo test -p batadb-query -- executor`
+Run: `cargo test -p powdb-query -- executor`
 Expected: All 7 tests PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add crates/query/src/executor.rs crates/query/src/result.rs crates/query/src/lib.rs
-git commit -m "feat(query): executor — run BataQL against storage engine
+git commit -m "feat(query): executor — run PowQL against storage engine
 
-End-to-end: BataQL text -> parse -> plan -> execute against catalog.
+End-to-end: PowQL text -> parse -> plan -> execute against catalog.
 Supports scan, filter, project, sort, limit, aggregate (count/avg/sum/
-min/max), insert, update, delete, create type. This is BataDB working."
+min/max), insert, update, delete, create type. This is PowDB working."
 ```
 
 ---
@@ -4585,13 +4585,13 @@ min/max), insert, update, delete, create type. This is BataDB working."
 ```toml
 # crates/server/Cargo.toml
 [package]
-name = "batadb-server"
+name = "powdb-server"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-batadb-storage = { path = "../storage" }
-batadb-query = { path = "../query" }
+powdb-storage = { path = "../storage" }
+powdb-query = { path = "../query" }
 tokio = { version = "1", features = ["full"] }
 thiserror.workspace = true
 bytes.workspace = true
@@ -4812,7 +4812,7 @@ fn decode_string(data: &[u8], pos: &mut usize) -> Result<String, String> {
 
 - [ ] **Step 4: Run tests, verify they pass**
 
-Run: `cargo test -p batadb-server -- protocol`
+Run: `cargo test -p powdb-server -- protocol`
 Expected: All 4 tests PASS.
 
 - [ ] **Step 5: Commit**
@@ -4877,9 +4877,9 @@ impl Message {
 ```rust
 // crates/server/src/handler.rs
 use crate::protocol::Message;
-use batadb_query::executor::Engine;
-use batadb_query::result::QueryResult;
-use batadb_storage::types::Value;
+use powdb_query::executor::Engine;
+use powdb_query::result::QueryResult;
+use powdb_storage::types::Value;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
 use tokio::io::{BufReader, BufWriter};
@@ -4892,7 +4892,7 @@ pub async fn handle_connection(stream: TcpStream, engine: Arc<Mutex<Engine>>) {
     // Wait for Connect message
     match Message::read_from(&mut reader).await {
         Ok(Some(Message::Connect { db_name })) => {
-            eprintln!("[batadb] client connected to db: {db_name}");
+            eprintln!("[powdb] client connected to db: {db_name}");
             let ok = Message::ConnectOk { version: "0.1.0".into() };
             if ok.write_to(&mut writer).await.is_err() { return; }
             if writer.flush().await.is_err() { return; }
@@ -4911,7 +4911,7 @@ pub async fn handle_connection(stream: TcpStream, engine: Arc<Mutex<Engine>>) {
             Ok(Some(msg)) => msg,
             Ok(None) => break, // client disconnected
             Err(e) => {
-                eprintln!("[batadb] read error: {e}");
+                eprintln!("[powdb] read error: {e}");
                 break;
             }
         };
@@ -4919,7 +4919,7 @@ pub async fn handle_connection(stream: TcpStream, engine: Arc<Mutex<Engine>>) {
         let response = match msg {
             Message::Query { query } => {
                 let mut eng = engine.lock().unwrap();
-                match eng.execute_bataql(&query) {
+                match eng.execute_powql(&query) {
                     Ok(result) => query_result_to_message(result),
                     Err(e) => Message::Error { message: e },
                 }
@@ -4932,7 +4932,7 @@ pub async fn handle_connection(stream: TcpStream, engine: Arc<Mutex<Engine>>) {
         if writer.flush().await.is_err() { break; }
     }
 
-    eprintln!("[batadb] client disconnected");
+    eprintln!("[powdb] client disconnected");
 }
 
 fn query_result_to_message(result: QueryResult) -> Message {
@@ -4976,14 +4976,14 @@ fn value_to_display(v: &Value) -> String {
 mod protocol;
 mod handler;
 
-use batadb_query::executor::Engine;
+use powdb_query::executor::Engine;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() {
-    let port = std::env::var("BATADB_PORT").unwrap_or_else(|_| "5433".into());
-    let data_dir = std::env::var("BATADB_DATA").unwrap_or_else(|_| "./batadb_data".into());
+    let port = std::env::var("POWDB_PORT").unwrap_or_else(|_| "5433".into());
+    let data_dir = std::env::var("POWDB_DATA").unwrap_or_else(|_| "./powdb_data".into());
 
     let engine = Engine::new(std::path::Path::new(&data_dir))
         .expect("failed to initialize storage engine");
@@ -4992,19 +4992,19 @@ async fn main() {
     let addr = format!("0.0.0.0:{port}");
     let listener = TcpListener::bind(&addr).await
         .expect(&format!("failed to bind to {addr}"));
-    eprintln!("[batadb] listening on {addr}");
+    eprintln!("[powdb] listening on {addr}");
 
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
-                eprintln!("[batadb] new connection from {peer}");
+                eprintln!("[powdb] new connection from {peer}");
                 let eng = engine.clone();
                 tokio::spawn(async move {
                     handler::handle_connection(stream, eng).await;
                 });
             }
             Err(e) => {
-                eprintln!("[batadb] accept error: {e}");
+                eprintln!("[powdb] accept error: {e}");
             }
         }
     }
@@ -5013,7 +5013,7 @@ async fn main() {
 
 - [ ] **Step 4: Build and verify it compiles**
 
-Run: `cargo build -p batadb-server`
+Run: `cargo build -p powdb-server`
 Expected: Compiles successfully.
 
 - [ ] **Step 5: Commit**
@@ -5023,7 +5023,7 @@ git add crates/server/
 git commit -m "feat(server): TCP server with async connection handling
 
 Tokio-based TCP server on port 5433. Accepts connections, reads
-Query messages, executes BataQL against the engine, sends results
+Query messages, executes PowQL against the engine, sends results
 back over the wire protocol. Multiple concurrent clients supported."
 ```
 
@@ -5040,13 +5040,13 @@ back over the wire protocol. Multiple concurrent clients supported."
 ```toml
 # crates/cli/Cargo.toml
 [package]
-name = "batadb-cli"
+name = "powdb-cli"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-batadb-storage = { path = "../storage" }
-batadb-query = { path = "../query" }
+powdb-storage = { path = "../storage" }
+powdb-query = { path = "../query" }
 tokio = { version = "1", features = ["full"] }
 rustyline = "15"
 ```
@@ -5055,9 +5055,9 @@ rustyline = "15"
 
 ```rust
 // crates/cli/src/main.rs
-use batadb_query::executor::Engine;
-use batadb_query::result::QueryResult;
-use batadb_storage::types::Value;
+use powdb_query::executor::Engine;
+use powdb_query::result::QueryResult;
+use powdb_storage::types::Value;
 use rustyline::DefaultEditor;
 use std::path::Path;
 
@@ -5065,11 +5065,11 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     // If a path is provided, use embedded mode (no server needed)
-    let data_dir = args.get(1).map(|s| s.as_str()).unwrap_or("./batadb_data");
+    let data_dir = args.get(1).map(|s| s.as_str()).unwrap_or("./powdb_data");
 
-    eprintln!("BataDB v0.1.0 — embedded mode");
+    eprintln!("PowDB v0.1.0 — embedded mode");
     eprintln!("Data directory: {data_dir}");
-    eprintln!("Type BataQL queries. Use Ctrl-D to exit.\n");
+    eprintln!("Type PowQL queries. Use Ctrl-D to exit.\n");
 
     let mut engine = Engine::new(Path::new(data_dir))
         .expect("failed to initialize engine");
@@ -5077,7 +5077,7 @@ fn main() {
     let mut rl = DefaultEditor::new().expect("failed to init readline");
 
     loop {
-        let line = match rl.readline("bataql> ") {
+        let line = match rl.readline("powql> ") {
             Ok(line) => line,
             Err(rustyline::error::ReadlineError::Eof) => break,
             Err(rustyline::error::ReadlineError::Interrupted) => continue,
@@ -5094,7 +5094,7 @@ fn main() {
 
         rl.add_history_entry(trimmed).ok();
 
-        match engine.execute_bataql(trimmed) {
+        match engine.execute_powql(trimmed) {
             Ok(result) => print_result(&result),
             Err(e) => eprintln!("Error: {e}"),
         }
@@ -5168,27 +5168,27 @@ fn format_value(v: &Value) -> String {
 
 - [ ] **Step 3: Build and run the CLI**
 
-Run: `cargo build -p batadb-cli && cargo run -p batadb-cli`
+Run: `cargo build -p powdb-cli && cargo run -p powdb-cli`
 Expected: Opens an interactive REPL. Test with:
 ```
-bataql> type User { required name: str, required email: str, age: int }
+powql> type User { required name: str, required email: str, age: int }
 type User created
-bataql> insert User { name := "Alice", email := "alice@example.com", age := 30 }
+powql> insert User { name := "Alice", email := "alice@example.com", age := 30 }
 1 row affected
-bataql> insert User { name := "Bob", email := "bob@example.com", age := 25 }
+powql> insert User { name := "Bob", email := "bob@example.com", age := 25 }
 1 row affected
-bataql> User
+powql> User
  name  | email            | age
 -------+------------------+----
  Alice | alice@example.com | 30
  Bob   | bob@example.com  | 25
 (2 rows)
-bataql> User filter .age > 28 { name, age }
+powql> User filter .age > 28 { name, age }
  name  | age
 -------+----
  Alice | 30
 (1 row)
-bataql> count(User)
+powql> count(User)
 2
 ```
 
@@ -5196,11 +5196,11 @@ bataql> count(User)
 
 ```bash
 git add crates/cli/
-git commit -m "feat(cli): interactive BataQL REPL
+git commit -m "feat(cli): interactive PowQL REPL
 
 Embedded-mode CLI — no server needed. readline with history,
-tabular result display, all BataQL operations supported.
-Run with: cargo run -p batadb-cli [data_dir]"
+tabular result display, all PowQL operations supported.
+Run with: cargo run -p powdb-cli [data_dir]"
 ```
 
 ---
@@ -5260,12 +5260,12 @@ async fn read_response(stream: &mut TcpStream) -> Vec<u8> {
 #[tokio::test]
 async fn test_full_lifecycle() {
     // Start server in background
-    let data_dir = std::env::temp_dir().join(format!("batadb_integ_{}", std::process::id()));
+    let data_dir = std::env::temp_dir().join(format!("powdb_integ_{}", std::process::id()));
     std::fs::create_dir_all(&data_dir).unwrap();
     let data_dir_str = data_dir.to_str().unwrap().to_string();
 
     let handle = tokio::spawn(async move {
-        let engine = batadb_query::executor::Engine::new(std::path::Path::new(&data_dir_str)).unwrap();
+        let engine = powdb_query::executor::Engine::new(std::path::Path::new(&data_dir_str)).unwrap();
         let engine = std::sync::Arc::new(std::sync::Mutex::new(engine));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:15433").await.unwrap();
 
@@ -5273,7 +5273,7 @@ async fn test_full_lifecycle() {
             let (stream, _) = listener.accept().await.unwrap();
             let eng = engine.clone();
             tokio::spawn(async move {
-                batadb_server::handler::handle_connection(stream, eng).await;
+                powdb_server::handler::handle_connection(stream, eng).await;
             });
         }
     });
@@ -5313,7 +5313,7 @@ async fn test_full_lifecycle() {
 }
 ```
 
-Note: This test requires making `handler` module public in `batadb-server`. Add `pub mod handler;` to `main.rs` — or restructure the server crate to have a `lib.rs` that re-exports the handler. The simplest approach:
+Note: This test requires making `handler` module public in `powdb-server`. Add `pub mod handler;` to `main.rs` — or restructure the server crate to have a `lib.rs` that re-exports the handler. The simplest approach:
 
 - [ ] **Step 2: Add lib.rs to server crate**
 
@@ -5323,7 +5323,7 @@ pub mod protocol;
 pub mod handler;
 ```
 
-Update `main.rs` to use `batadb_server::*` or just reference the modules.
+Update `main.rs` to use `powdb_server::*` or just reference the modules.
 
 - [ ] **Step 3: Run integration test**
 
@@ -5337,7 +5337,7 @@ git add tests/ crates/server/src/lib.rs
 git commit -m "test: end-to-end integration test through TCP
 
 Starts server, connects via TCP, creates table, inserts row,
-queries it back, counts it. Full BataDB lifecycle verified."
+queries it back, counts it. Full PowDB lifecycle verified."
 ```
 
 ---
@@ -5434,7 +5434,7 @@ impl PlanCache {
 
 - [ ] **Step 3: Run tests, verify they pass**
 
-Run: `cargo test -p batadb-query -- plan_cache`
+Run: `cargo test -p powdb-query -- plan_cache`
 Expected: All 3 tests PASS.
 
 - [ ] **Step 4: Commit**
@@ -5466,7 +5466,7 @@ Expected: All tests across all crates PASS.
 - [ ] **Step 3: Manual smoke test with CLI**
 
 ```bash
-cargo run -p batadb-cli -- /tmp/batadb_smoke
+cargo run -p powdb-cli -- /tmp/powdb_smoke
 ```
 
 Then run these queries:
@@ -5492,7 +5492,7 @@ Post
 
 Terminal 1:
 ```bash
-cargo run -p batadb-server
+cargo run -p powdb-server
 ```
 
 Terminal 2 (simple TCP test):
@@ -5505,11 +5505,11 @@ Terminal 2 (simple TCP test):
 
 ```bash
 git add -A
-git commit -m "milestone: BataDB v0.1.0 — working database engine
+git commit -m "milestone: PowDB v0.1.0 — working database engine
 
 Complete vertical slice: storage engine (4KB pages, compact row format,
 B+ tree indexes, WAL with group commit, buffer pool with clock-sweep),
-BataQL compiler (lexer, parser, planner, executor), TCP server with
+PowQL compiler (lexer, parser, planner, executor), TCP server with
 native binary protocol, and interactive CLI.
 
 All tests passing. Manual smoke test verified."
@@ -5522,7 +5522,7 @@ All tests passing. Manual smoke test verified."
 | Phase | Tasks | What it delivers |
 |-------|-------|-----------------|
 | Phase 1: Storage | Tasks 1-10 | Page manager, compact rows, B-tree, WAL, buffer pool, MVCC, catalog |
-| Phase 2: BataQL | Tasks 11-14 | Lexer, parser, planner, executor — BataQL text to query results |
+| Phase 2: PowQL | Tasks 11-14 | Lexer, parser, planner, executor — PowQL text to query results |
 | Phase 3: Server | Tasks 15-20 | Wire protocol, TCP server, CLI REPL, plan cache, integration tests |
 
 Each task is independently testable. Each phase builds on the previous. Nothing is fake.

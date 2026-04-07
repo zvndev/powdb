@@ -133,7 +133,7 @@ mod tests {
     }
 
     fn temp_heap(name: &str) -> (HeapFile, std::path::PathBuf) {
-        let path = std::env::temp_dir().join(format!("batadb_heap_{name}_{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("powdb_heap_{name}_{}", std::process::id()));
         let heap = HeapFile::create(&path).unwrap();
         (heap, path)
     }

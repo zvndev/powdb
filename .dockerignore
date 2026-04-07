@@ -4,7 +4,7 @@ node_modules/
 .DS_Store
 *.swp
 *.swo
-batadb_data/
+powdb_data/
 turbodb-experiments/
 docs/
 *.md

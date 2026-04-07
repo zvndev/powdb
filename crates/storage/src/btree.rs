@@ -249,7 +249,7 @@ mod tests {
     use super::*;
 
     fn temp_btree(name: &str) -> BTree {
-        let path = std::env::temp_dir().join(format!("batadb_btree_{name}_{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("powdb_btree_{name}_{}", std::process::id()));
         BTree::create(&path).unwrap()
     }
 

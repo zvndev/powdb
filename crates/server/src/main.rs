@@ -1,5 +1,5 @@
-use batadb_query::executor::Engine;
-use batadb_server::handler;
+use powdb_query::executor::Engine;
+use powdb_server::handler;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tracing::{info, error};
@@ -13,12 +13,12 @@ struct Args {
 
 fn parse_args() -> Args {
     // Defaults from env vars (preserve old behavior), then overridden by CLI flags.
-    let mut port: u16 = std::env::var("BATADB_PORT")
+    let mut port: u16 = std::env::var("POWDB_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(5433);
-    let mut data_dir: String = std::env::var("BATADB_DATA").unwrap_or_else(|_| "./batadb_data".into());
-    let mut password: Option<String> = std::env::var("BATADB_PASSWORD").ok().filter(|s| !s.is_empty());
+    let mut data_dir: String = std::env::var("POWDB_DATA").unwrap_or_else(|_| "./powdb_data".into());
+    let mut password: Option<String> = std::env::var("POWDB_PASSWORD").ok().filter(|s| !s.is_empty());
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -40,19 +40,19 @@ fn parse_args() -> Args {
                 password = Some(argv[i].clone());
             }
             "--help" | "-h" => {
-                println!("batadb-server — BataDB wire-protocol server");
+                println!("powdb-server — PowDB wire-protocol server");
                 println!();
                 println!("USAGE:");
-                println!("    batadb-server [OPTIONS]");
+                println!("    powdb-server [OPTIONS]");
                 println!();
                 println!("OPTIONS:");
                 println!("    -p, --port <PORT>          TCP port to listen on (default: 5433)");
-                println!("    -d, --data-dir <PATH>      Data directory (default: ./batadb_data)");
+                println!("    -d, --data-dir <PATH>      Data directory (default: ./powdb_data)");
                 println!("        --password <PW>        Require this password on CONNECT");
                 println!("    -h, --help                 Print this message");
                 println!();
                 println!("ENVIRONMENT:");
-                println!("    BATADB_PORT, BATADB_DATA, BATADB_PASSWORD");
+                println!("    POWDB_PORT, POWDB_DATA, POWDB_PASSWORD");
                 println!("    RUST_LOG=info|debug|trace  (defaults to info)");
                 std::process::exit(0);
             }
@@ -86,7 +86,7 @@ async fn main() {
     let listener = TcpListener::bind(&addr).await
         .unwrap_or_else(|_| panic!("failed to bind to {addr}"));
 
-    info!(addr = %addr, data_dir = %args.data_dir, auth = %args.password.is_some(), "batadb server listening");
+    info!(addr = %addr, data_dir = %args.data_dir, auth = %args.password.is_some(), "powdb server listening");
 
     loop {
         match listener.accept().await {

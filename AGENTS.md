@@ -1,22 +1,22 @@
-# BataDB / BataQL — agent notes
+# PowDB / PowQL — agent notes
 
 Quick reference for AI assistants and humans writing client code or queries
-against BataDB. This is the **as-implemented** truth, not the design doc — when
+against PowDB. This is the **as-implemented** truth, not the design doc — when
 they disagree, this file wins. If you change the language or the wire protocol,
 update this file in the same commit.
 
-The design doc (`bataql-language-design.md`) is the long-form vision and still
+The design doc (`powql-language-design.md`) is the long-form vision and still
 has things the parser doesn't yet accept (links, group, let bindings, `??`
 defaults, etc.). Don't paste examples from there into a client without first
 checking they parse.
 
 ---
 
-## BataQL syntax — what the parser actually accepts
+## PowQL syntax — what the parser actually accepts
 
 ### Schema definition
 
-```bataql
+```powql
 type User {
   required name: str,
   required age:  int,
@@ -36,7 +36,7 @@ type User {
 
 ### Insert
 
-```bataql
+```powql
 insert User { name := "Alice", age := 30, city := "NYC" }
 ```
 
@@ -46,7 +46,7 @@ insert User { name := "Alice", age := 30, city := "NYC" }
 
 ### Query pipeline
 
-```bataql
+```powql
 User
 User filter .age > 27
 User filter .age > 27 order .age desc limit 10 { .name, .age }
@@ -64,7 +64,7 @@ User filter .city = "NYC" { .name, .age }
 
 ### Aggregates
 
-```bataql
+```powql
 count(User)
 count(User filter .age > 27)
 avg(User filter .age > 27 | .age)   # not yet — pipe-into-agg is design only
@@ -98,25 +98,25 @@ Public endpoint (zvn-dev org, region `iad`, dedicated IPv4):
 host:     213.188.194.202
 port:     5433
 db:       default
-password: see `fly secrets list -a zvndev-batadb`  (BATADB_PASSWORD)
+password: see `fly secrets list -a zvndev-powdb`  (POWDB_PASSWORD)
 ```
 
-The local copy is at `/tmp/batadb_fly_password.txt` on this machine. Don't
+The local copy is at `/tmp/powdb_fly_password.txt` on this machine. Don't
 commit it.
 
 ### From the local CLI (interactive REPL)
 
 ```bash
 # build once
-cargo build --release -p batadb-cli
+cargo build --release -p powdb-cli
 
 # connect to the Fly server
-./target/release/batadb-cli \
+./target/release/powdb-cli \
   --remote 213.188.194.202:5433 \
-  --password "$(cat /tmp/batadb_fly_password.txt)"
+  --password "$(cat /tmp/powdb_fly_password.txt)"
 ```
 
-You can also `cargo run -p batadb-cli --release -- --remote ... --password ...`
+You can also `cargo run -p powdb-cli --release -- --remote ... --password ...`
 during development. `--db` defaults to `main`; the Fly server uses `default` if
 you want to be explicit, but any name works since the server has a single
 catalog.
@@ -126,20 +126,20 @@ catalog.
 ```bash
 cd clients/ts
 pnpm install                                      # first time only
-BATADB_PASSWORD="$(cat /tmp/batadb_fly_password.txt)" pnpm demo
+POWDB_PASSWORD="$(cat /tmp/powdb_fly_password.txt)" pnpm demo
 ```
 
 That runs `clients/ts/demo/demo.ts` against the Fly endpoint. To use the client
 in your own code:
 
 ```ts
-import { Client } from "@zvndev/batadb-client";
+import { Client } from "@zvndev/powdb-client";
 
 const client = await Client.connect({
   host: "213.188.194.202",
   port: 5433,
   dbName: "default",
-  password: process.env.BATADB_PASSWORD,
+  password: process.env.POWDB_PASSWORD,
 });
 
 const result = await client.query("User filter .age > 27 { .name, .age }");
@@ -159,16 +159,16 @@ client — `telnet`/`nc` will just hang the server's `read_exact`.
 
 ## Server / deploy quick facts
 
-- App: `zvndev-batadb` on Fly.io, single machine, `shared-cpu-1x` 256mb.
-- Persistent volume `batadb_data` mounted at `/data`. `BATADB_DATA=/data` so
+- App: `zvndev-powdb` on Fly.io, single machine, `shared-cpu-1x` 256mb.
+- Persistent volume `powdb_data` mounted at `/data`. `POWDB_DATA=/data` so
   the catalog (`catalog.bin`) and per-table heap files live there.
 - Catalog is persisted on every `type` statement via atomic `temp + rename`
   (`crates/storage/src/catalog.rs`). If you blow away `/data`, you lose
   everything; if you stop and start the machine, data survives.
-- Logs: `fly logs -a zvndev-batadb`. Per-query timings are emitted at info
+- Logs: `fly logs -a zvndev-powdb`. Per-query timings are emitted at info
   level via `tracing`.
-- Restart: `fly machine restart -a zvndev-batadb`.
-- Auth: `BATADB_PASSWORD` is a Fly secret; the server compares it to the
+- Restart: `fly machine restart -a zvndev-powdb`.
+- Auth: `POWDB_PASSWORD` is a Fly secret; the server compares it to the
   `Connect` message's password field. Empty password disables auth.
 
 ## Repo layout

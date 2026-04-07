@@ -12,59 +12,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "batadb-bench"
-version = "0.1.0"
-dependencies = [
- "batadb-query",
- "batadb-storage",
-]
-
-[[package]]
-name = "batadb-cli"
-version = "0.1.0"
-dependencies = [
- "batadb-query",
- "batadb-server",
- "batadb-storage",
- "rustyline",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "batadb-query"
-version = "0.1.0"
-dependencies = [
- "batadb-storage",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "batadb-server"
-version = "0.1.0"
-dependencies = [
- "batadb-query",
- "batadb-storage",
- "bytes",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "batadb-storage"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "crc32fast",
- "thiserror",
- "tracing",
-]
-
-[[package]]
 name = "bitflags"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -292,6 +239,59 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
+name = "powdb-bench"
+version = "0.1.0"
+dependencies = [
+ "powdb-query",
+ "powdb-storage",
+]
+
+[[package]]
+name = "powdb-cli"
+version = "0.1.0"
+dependencies = [
+ "powdb-query",
+ "powdb-server",
+ "powdb-storage",
+ "rustyline",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "powdb-query"
+version = "0.1.0"
+dependencies = [
+ "powdb-storage",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "powdb-server"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "powdb-query",
+ "powdb-storage",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "powdb-storage"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "crc32fast",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "powerfmt"

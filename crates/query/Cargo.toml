@@ -1,9 +1,9 @@
 [package]
-name = "batadb-query"
+name = "powdb-query"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-batadb-storage = { path = "../storage" }
+powdb-storage = { path = "../storage" }
 thiserror.workspace = true
 tracing.workspace = true

@@ -1,6 +1,6 @@
-# BataDB: Complete implementation brief
+# PowDB: Complete implementation brief
 
-This document contains everything needed to implement BataDB from scratch.
+This document contains everything needed to implement PowDB from scratch.
 It is the single source of truth — all architectural decisions are backed by
 production benchmarks and explained with rationale.
 
@@ -8,10 +8,10 @@ production benchmarks and explained with rationale.
 
 ## Table of contents
 
-1. What BataDB is
+1. What PowDB is
 2. Production benchmark evidence (numbers that drive every decision)
 3. Storage engine specification
-4. BataQL query language specification
+4. PowQL query language specification
 5. Wire protocol specification
 6. Engine C ABI specification
 7. Driver specifications
@@ -21,20 +21,20 @@ production benchmarks and explained with rationale.
 
 ---
 
-## 1. What BataDB is
+## 1. What PowDB is
 
 A database engine built for modern hardware, designed to eliminate the
 translation layers that make traditional databases slow.
 
 Three products form the stack:
-- **BataDB** — storage engine (embedded library with C ABI + optional server)
-- **BataQL** — standalone query language DSL (not tied to any host language)
+- **PowDB** — storage engine (embedded library with C ABI + optional server)
+- **PowQL** — standalone query language DSL (not tied to any host language)
 - **TurboLang integration** — optional first-class client with compile-time query planning
 
 Existing product context:
 - **TurbineORM** (turbineorm.dev) — Postgres ORM for TypeScript, already in production
 - **TurboLang** (turbolang.dev) — new general-purpose programming language, in development
-- BataDB must support PostgreSQL wire protocol so TurbineORM users can migrate incrementally
+- PowDB must support PostgreSQL wire protocol so TurbineORM users can migrate incrementally
 
 The core thesis, validated by benchmarks: SQL translation layers (parsing, planning,
 type marshaling) account for 20-42x of query latency. Removing them while keeping
@@ -295,11 +295,11 @@ eviction policy and prevents double-caching.
 
 ---
 
-## 4. BataQL query language specification
+## 4. PowQL query language specification
 
 ### 4.1 Schema definition
 
-```bataql
+```powql
 type User {
   required name: str
   required email: str
@@ -330,7 +330,7 @@ type Company {
 ### 4.2 Query syntax
 
 **Basic operations:**
-```bataql
+```powql
 User                                          # all users (sequential scan)
 User filter .age > 30                         # filter
 User { name, email }                          # projection
@@ -340,14 +340,14 @@ User filter .age > 30 order .name desc limit 10 { name, email }  # full pipeline
 ```
 
 **Link traversal (not joins):**
-```bataql
+```powql
 User { name, posts: .posts { title, created_at } }     # nested results
 User filter count(.posts) > 0                            # filter by link
 User { name, company_name: .company.name }               # deep traversal
 ```
 
 **Aggregations:**
-```bataql
+```powql
 count(User)                                                 # count
 User filter .age > 30 | avg(.age)                          # pipe to aggregate
 User group .company.name {                                  # group by
@@ -359,7 +359,7 @@ User group .company.name filter count(.) > 5 {             # group + having
 ```
 
 **Set-based nullability (no NULL, no three-valued logic):**
-```bataql
+```powql
 User { name, age: .age ?? 0 }       # default value for empty set
 User filter exists .age              # only users who have an age
 User filter not exists .age          # users without an age
@@ -367,13 +367,13 @@ User filter not exists .age          # users without an age
 ```
 
 **Ad-hoc match (escape hatch for non-link joins):**
-```bataql
+```powql
 User as u match Employee as e on u.email = e.personal_email
   { user_name: u.name, employee_name: e.name }
 ```
 
 **Mutations:**
-```bataql
+```powql
 insert User { name := "Alice", email := "alice@example.com", age := 30 }
 
 User filter .email = "alice@example.com" update { age := 31 }
@@ -386,7 +386,7 @@ User upsert on .email = "alice@example.com" {
 ```
 
 **Transactions:**
-```bataql
+```powql
 transaction {
   let alice := insert User { name := "Alice", email := "alice@ex.com" }
   insert Post { title := "First post", author := alice, ... }
@@ -394,7 +394,7 @@ transaction {
 ```
 
 **Computed views:**
-```bataql
+```powql
 view ActiveUser := User filter .last_login > now() - duration('30d')
 view TeamSummary := User group .company.name {
   company: .key, headcount: count(.), avg_age: avg(.age)
@@ -410,7 +410,7 @@ TeamSummary filter .headcount > 10
 ```
 
 **Let bindings:**
-```bataql
+```powql
 let active := User filter .last_login > datetime('2024-01-01')
 active { name, email }
 count(active)
@@ -436,11 +436,11 @@ Modifiers:
 
 ### 4.4 Migrations
 
-Declarative schema diffing. Developer maintains a `schema.bataql` file:
+Declarative schema diffing. Developer maintains a `schema.powql` file:
 
 ```bash
-batadb migrate --plan     # show diff (dry run)
-batadb migrate --apply    # apply transactionally
+powdb migrate --plan     # show diff (dry run)
+powdb migrate --apply    # apply transactionally
 ```
 
 Features:
@@ -456,7 +456,7 @@ Automatic indexes for: primary keys, link targets (foreign keys), frequently
 queried fields.
 
 Manual declaration in schema:
-```bataql
+```powql
 type User {
   ...
   index on .email
@@ -467,7 +467,7 @@ type User {
 
 Suggestion engine:
 ```bash
-batadb suggest-indexes     # analyzes query patterns, recommends indexes
+powdb suggest-indexes     # analyzes query patterns, recommends indexes
 ```
 
 ---
@@ -492,8 +492,8 @@ batadb suggest-indexes     # analyzes query patterns, recommends indexes
 ```
 0x01 CONNECT         client → server  (db name, auth)
 0x02 CONNECT_OK      server → client  (server version)
-0x03 QUERY           client → server  (bataql text + params)
-0x04 PREPARE         client → server  (bataql text)
+0x03 QUERY           client → server  (powql text + params)
+0x04 PREPARE         client → server  (powql text)
 0x05 PREPARED        server → client  (plan hash)
 0x06 EXECUTE         client → server  (plan hash + params)
 0x07 RESULT_HEADER   server → client  (column names + types)
@@ -530,17 +530,17 @@ Column-major results because:
 - Better compression (same-type values cluster)
 - Client analytics can process columns directly as typed arrays
 
-### 5.4 Mode 1: Native BataQL (all language drivers)
+### 5.4 Mode 1: Native PowQL (all language drivers)
 
 ```
-Client → QUERY(bataql_text, params) → Server
-Server: compile BataQL → execute → stream results
+Client → QUERY(powql_text, params) → Server
+Server: compile PowQL → execute → stream results
 Server → RESULT_HEADER → RESULT_BATCH(es) → RESULT_COMPLETE → Client
 ```
 
 Prepared variant:
 ```
-Client → PREPARE(bataql_text) → Server → PREPARED(hash) → Client
+Client → PREPARE(powql_text) → Server → PREPARED(hash) → Client
 Client → EXECUTE(hash, params) → Server → results (skips compile)
 ```
 
@@ -559,7 +559,7 @@ binding and execution happen. This is the 42x path.
 Standard PostgreSQL v3 wire protocol on a separate port. Enables psql,
 pgAdmin, Grafana, Metabase, existing ORMs (including TurbineORM).
 
-Translation path: SQL → PG parser → SQL AST → BataQL AST → compile → execute
+Translation path: SQL → PG parser → SQL AST → PowQL AST → compile → execute
 
 Limitations:
 - No PL/pgSQL, no PostgreSQL extensions
@@ -575,58 +575,58 @@ Every higher-level interface (drivers, server) calls through this API.
 
 ```c
 // === Connection ===
-bata_conn*    bata_open(const char* path, bata_options* opts);
-void          bata_close(bata_conn* conn);
+pow_conn*    pow_open(const char* path, pow_options* opts);
+void          pow_close(pow_conn* conn);
 
 // === Transactions ===
-bata_tx*      bata_begin(bata_conn* conn, bata_isolation level);
-int           bata_commit(bata_tx* tx);
-int           bata_rollback(bata_tx* tx);
+pow_tx*      pow_begin(pow_conn* conn, pow_isolation level);
+int           pow_commit(pow_tx* tx);
+int           pow_rollback(pow_tx* tx);
 
 // === Query compilation + execution ===
-bata_plan*    bata_compile(bata_conn* conn, const char* bataql, size_t len);
-bata_result*  bata_execute(bata_tx* tx, bata_plan* plan, bata_params* params);
-void          bata_plan_free(bata_plan* plan);
+pow_plan*    pow_compile(pow_conn* conn, const char* powql, size_t len);
+pow_result*  pow_execute(pow_tx* tx, pow_plan* plan, pow_params* params);
+void          pow_plan_free(pow_plan* plan);
 
 // === Plan cache ===
-uint64_t      bata_plan_hash(bata_plan* plan);
-bata_plan*    bata_plan_lookup(bata_conn* conn, uint64_t hash);
-void          bata_plan_cache(bata_conn* conn, bata_plan* plan);
+uint64_t      pow_plan_hash(pow_plan* plan);
+pow_plan*    pow_plan_lookup(pow_conn* conn, uint64_t hash);
+void          pow_plan_cache(pow_conn* conn, pow_plan* plan);
 
 // === Result consumption ===
-int           bata_result_next(bata_result* res);
-int           bata_result_columns(bata_result* res);
-bata_type     bata_result_type(bata_result* res, int col);
-int64_t       bata_result_int(bata_result* res, int col);
-double        bata_result_float(bata_result* res, int col);
-bata_str      bata_result_str(bata_result* res, int col);
-int           bata_result_is_empty(bata_result* res, int col);
-void          bata_result_free(bata_result* res);
+int           pow_result_next(pow_result* res);
+int           pow_result_columns(pow_result* res);
+pow_type     pow_result_type(pow_result* res, int col);
+int64_t       pow_result_int(pow_result* res, int col);
+double        pow_result_float(pow_result* res, int col);
+pow_str      pow_result_str(pow_result* res, int col);
+int           pow_result_is_empty(pow_result* res, int col);
+void          pow_result_free(pow_result* res);
 
 // === Direct operations (bypass compiler — the 42x path) ===
-bata_result*  bata_scan(bata_tx* tx, bata_table_id table);
-bata_result*  bata_index_lookup(bata_tx* tx, bata_index_id idx, bata_value* key);
-bata_rowid    bata_insert(bata_tx* tx, bata_table_id table, bata_row* row);
-int           bata_update(bata_tx* tx, bata_table_id table, bata_rowid id, bata_row* changes);
-int           bata_delete(bata_tx* tx, bata_table_id table, bata_rowid id);
+pow_result*  pow_scan(pow_tx* tx, pow_table_id table);
+pow_result*  pow_index_lookup(pow_tx* tx, pow_index_id idx, pow_value* key);
+pow_rowid    pow_insert(pow_tx* tx, pow_table_id table, pow_row* row);
+int           pow_update(pow_tx* tx, pow_table_id table, pow_rowid id, pow_row* changes);
+int           pow_delete(pow_tx* tx, pow_table_id table, pow_rowid id);
 
 // === Schema + migrations ===
-bata_schema*  bata_schema_current(bata_conn* conn);
-bata_plan*    bata_migrate_plan(bata_conn* conn, const char* new_schema, size_t len);
-int           bata_migrate_apply(bata_conn* conn, bata_plan* plan);
+pow_schema*  pow_schema_current(pow_conn* conn);
+pow_plan*    pow_migrate_plan(pow_conn* conn, const char* new_schema, size_t len);
+int           pow_migrate_apply(pow_conn* conn, pow_plan* plan);
 ```
 
 ---
 
 ## 7. Driver specifications
 
-### 7.1 TypeScript driver (@batadb/client)
+### 7.1 TypeScript driver (@powdb/client)
 
 ```typescript
-import { BataDB } from '@batadb/client';
+import { PowDB } from '@powdb/client';
 
-const db = await BataDB.connect('bata://localhost:5433/mydb');  // server
-const db = await BataDB.open('./mydata.bata');                  // embedded
+const db = await PowDB.connect('pow://localhost:5433/mydb');  // server
+const db = await PowDB.open('./mydata.pow');                  // embedded
 
 const users = await db.query<User>(
   `User filter .age > $age order .name limit $limit`,
@@ -644,15 +644,15 @@ await db.transaction(async (tx) => {
   await tx.query(`insert Post { author := $user, ... }`, { user: user.id });
 });
 
-await db.migrate('./schema.bataql');
+await db.migrate('./schema.powql');
 ```
 
 ### 7.2 Python driver
 
 ```python
-from batadb import connect
+from powdb import connect
 
-db = connect("bata://localhost:5433/mydb")
+db = connect("pow://localhost:5433/mydb")
 users = db.query("User filter .age > $age", age=30)
 for batch in db.stream("User", batch_size=5000): process(batch)
 df = db.sql("SELECT name, age FROM users WHERE age > 30")  # PG compat
@@ -661,13 +661,13 @@ df = db.sql("SELECT name, age FROM users WHERE age > 30")  # PG compat
 ### 7.3 TurboLang (compile-time integration)
 
 ```turbolang
-import bata from "batadb"
+import pow from "powdb"
 
 // Parsed and compiled at build time — runtime is just plan execution
-let users = bata.query(User filter .age > 30 { name, email })
+let users = pow.query(User filter .age > 30 { name, email })
 
 // Type errors are compile errors, not runtime errors
-let posts = bata.query(User filter .email = email { name, posts: .posts { title } })
+let posts = pow.query(User filter .email = email { name, posts: .posts { title } })
 ```
 
 ---
@@ -675,18 +675,18 @@ let posts = bata.query(User filter .email = email { name, posts: .posts { title 
 ## 8. Server configuration
 
 ```toml
-# batadb.toml
+# powdb.toml
 
 [storage]
-data_dir = "/var/lib/batadb/data"
-wal_dir = "/var/lib/batadb/wal"
+data_dir = "/var/lib/powdb/data"
+wal_dir = "/var/lib/powdb/wal"
 page_size = 4096
 wal_batch_size = 128
 direct_io = true
 
 [server]
 listen_addr = "0.0.0.0"
-bata_port = 5433
+pow_port = 5433
 pg_port = 5432
 max_connections = 200
 
@@ -732,10 +732,10 @@ The compact row format should match or beat the JavaScript scaffolding numbers.
 B-tree should achieve >1M lookups/sec. WAL batch=128 should achieve >50K writes/sec
 on production NVMe.
 
-### Phase 2: BataQL compiler
+### Phase 2: PowQL compiler
 
 Deliverables:
-1. **Lexer + parser** — BataQL text → AST
+1. **Lexer + parser** — PowQL text → AST
 2. **Type checker** — resolve types against schema, catch errors at compile time
 3. **Planner** — AST → logical plan → physical plan (choose index scan vs seq scan,
    choose vectorized vs row-oriented based on data shape)
@@ -757,15 +757,15 @@ Deliverables:
 
 Deliverables:
 1. **Network listener** — TCP + TLS, connection management
-2. **Native protocol** — BataQL binary protocol implementation
-3. **PostgreSQL wire protocol** — v3 protocol, SQL → BataQL translation layer
-4. **TypeScript driver** — npm package @batadb/client
-5. **Python driver** — pip package batadb
+2. **Native protocol** — PowQL binary protocol implementation
+3. **PostgreSQL wire protocol** — v3 protocol, SQL → PowQL translation layer
+4. **TypeScript driver** — npm package @powdb/client
+5. **Python driver** — pip package powdb
 
 ### Phase 5: TurboLang integration + production hardening
 
 Deliverables:
-1. **TurboLang compiler plugin** — parse BataQL at build time, emit plan hashes
+1. **TurboLang compiler plugin** — parse PowQL at build time, emit plan hashes
 2. **Connection pooling** — server-side connection management
 3. **Replication** — leader-follower for read scaling
 4. **Background columnar merge** — async conversion of hot rows → columnar segments
@@ -788,10 +788,10 @@ These items need to be resolved during implementation but don't block starting:
 3. **Replication protocol** — leader-follower with WAL shipping? Or something more
    sophisticated like Raft consensus for multi-leader?
 
-4. **Text search** — should BataDB have built-in full-text search, or leave that to
+4. **Text search** — should PowDB have built-in full-text search, or leave that to
    external systems (Elasticsearch, Meilisearch)?
 
-5. **Geospatial** — should BataDB support geometric types and spatial indexes (R-tree)?
+5. **Geospatial** — should PowDB support geometric types and spatial indexes (R-tree)?
    Or is PostGIS compatibility through the PG wire protocol sufficient?
 
 6. **JSON support** — the `json` type is an escape hatch for schemaless data. How deep
