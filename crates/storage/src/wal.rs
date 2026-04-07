@@ -1,6 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write, BufWriter};
 use std::path::{Path, PathBuf};
+use tracing::debug;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -94,9 +95,13 @@ impl Wal {
 
     /// Flush buffered records to disk with fsync (the group commit point).
     pub fn flush(&mut self) -> io::Result<()> {
+        let batch = self.pending;
         self.writer.flush()?;
         self.writer.get_ref().sync_data()?;
         self.pending = 0;
+        if batch > 0 {
+            debug!(records = batch, "wal group commit");
+        }
         Ok(())
     }
 

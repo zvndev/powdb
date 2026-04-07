@@ -1,0 +1,10 @@
+target/
+node_modules/
+.git/
+.DS_Store
+*.swp
+*.swo
+batadb_data/
+turbodb-experiments/
+docs/
+*.md

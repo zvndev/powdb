@@ -6,6 +6,8 @@ use batadb_storage::catalog::Catalog;
 use batadb_storage::types::*;
 use std::io;
 use std::path::Path;
+use std::time::Instant;
+use tracing::{info, debug, error};
 
 pub struct Engine {
     catalog: Catalog,
@@ -14,14 +16,61 @@ pub struct Engine {
 impl Engine {
     pub fn new(data_dir: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
-        Ok(Engine {
-            catalog: Catalog::create(data_dir)?,
-        })
+        // Try to reopen an existing database first; only create a fresh
+        // catalog when there isn't one already on disk.
+        let catalog = match Catalog::open(data_dir) {
+            Ok(c) => {
+                info!(data_dir = %data_dir.display(), "engine reopened existing database");
+                c
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                info!(data_dir = %data_dir.display(), "engine initialized fresh database");
+                Catalog::create(data_dir)?
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(Engine { catalog })
     }
 
     pub fn execute_bataql(&mut self, input: &str) -> Result<QueryResult, String> {
-        let plan = planner::plan(input).map_err(|e| e.message)?;
-        self.execute_plan(&plan)
+        let total_start = Instant::now();
+
+        let plan_start = Instant::now();
+        let plan = planner::plan(input).map_err(|e| {
+            error!(query = %input, error = %e.message, "query plan failed");
+            e.message
+        })?;
+        let plan_us = plan_start.elapsed().as_micros();
+
+        let exec_start = Instant::now();
+        let result = self.execute_plan(&plan);
+        let exec_us = exec_start.elapsed().as_micros();
+
+        let total_us = total_start.elapsed().as_micros();
+        match &result {
+            Ok(r) => {
+                info!(
+                    query = %input,
+                    plan_us = plan_us,
+                    exec_us = exec_us,
+                    total_us = total_us,
+                    rows = r.row_count(),
+                    "query ok"
+                );
+            }
+            Err(e) => {
+                error!(
+                    query = %input,
+                    plan_us = plan_us,
+                    exec_us = exec_us,
+                    error = %e,
+                    "query failed"
+                );
+            }
+        }
+
+        debug!(plan = ?plan, "executed plan");
+        result
     }
 
     pub fn execute_plan(&mut self, plan: &PlanNode) -> Result<QueryResult, String> {
@@ -233,7 +282,40 @@ impl Engine {
                 Ok(QueryResult::Created(name.clone()))
             }
 
-            PlanNode::IndexScan { .. } => Err("index scan not yet implemented".into()),
+            PlanNode::IndexScan { table, column, key } => {
+                let schema = self.catalog.schema(table)
+                    .ok_or_else(|| format!("table '{table}' not found"))?
+                    .clone();
+                let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+                let key_value = literal_to_value(key)?;
+
+                let tbl = self.catalog.get_table(table)
+                    .ok_or_else(|| format!("table '{table}' not found"))?;
+
+                // Fast path: the table has a B-tree on this column. A single
+                // point lookup returns 0 or 1 rows — this is the whole reason
+                // the planner bothers emitting IndexScan.
+                if tbl.indexes.contains_key(column) {
+                    let rows = match tbl.index_lookup(column, &key_value) {
+                        Some((_, row)) => vec![row],
+                        None => Vec::new(),
+                    };
+                    return Ok(QueryResult::Rows { columns, rows });
+                }
+
+                // Fallback: no index on this column. The planner emits IndexScan
+                // eagerly (it has no visibility into which columns are indexed),
+                // so we do the equality filter ourselves here instead of erroring.
+                // This preserves the previous SeqScan+Filter behavior.
+                let col_idx = schema.column_index(column)
+                    .ok_or_else(|| format!("column '{column}' not found"))?;
+                let rows: Vec<Vec<Value>> = tbl.scan()
+                    .filter_map(|(_, row)| {
+                        if row[col_idx] == key_value { Some(row) } else { None }
+                    })
+                    .collect();
+                Ok(QueryResult::Rows { columns, rows })
+            }
         }
     }
 

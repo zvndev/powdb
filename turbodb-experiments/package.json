@@ -1,0 +1,17 @@
+{
+  "name": "turbodb-experiments",
+  "version": "0.3.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "bench": "node src/run-all.js",
+    "bench:pages": "node src/benchmarks/01-page-io.js",
+    "bench:formats": "node src/benchmarks/02-row-formats.js",
+    "bench:sqlite": "node src/benchmarks/03-sqlite-compare.js",
+    "bench:indexes": "node src/benchmarks/04-index-perf.js",
+    "bench:wal": "node src/benchmarks/05-wal-cost.js",
+    "bench:mvcc": "node src/benchmarks/06-mvcc-cost.js",
+    "bench:vectorized": "node src/benchmarks/07-vectorized.js"
+  },
+  "dependencies": { "sql.js": "^1.11.0" }
+}

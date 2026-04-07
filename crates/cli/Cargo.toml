@@ -6,4 +6,8 @@ edition.workspace = true
 [dependencies]
 batadb-storage = { path = "../storage" }
 batadb-query = { path = "../query" }
+batadb-server = { path = "../server" }
 rustyline = "15"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "macros"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -5,24 +5,45 @@ use batadb_storage::types::Value;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
+use tracing::{info, debug, warn, error};
 
-pub async fn handle_connection(stream: TcpStream, engine: Arc<Mutex<Engine>>) {
+pub async fn handle_connection(stream: TcpStream, engine: Arc<Mutex<Engine>>, expected_password: Option<String>) {
+    let peer = stream.peer_addr().ok().map(|a| a.to_string()).unwrap_or_else(|| "unknown".into());
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut writer = BufWriter::new(writer);
 
     // Wait for Connect message
     match Message::read_from(&mut reader).await {
-        Ok(Some(Message::Connect { db_name })) => {
-            eprintln!("[batadb] client connected to db: {db_name}");
+        Ok(Some(Message::Connect { db_name, password })) => {
+            // Check password if server requires one
+            if let Some(expected) = &expected_password {
+                if password.as_deref() != Some(expected.as_str()) {
+                    warn!(peer = %peer, db = %db_name, "auth rejected: bad password");
+                    let err = Message::Error { message: "authentication failed".into() };
+                    err.write_to(&mut writer).await.ok();
+                    writer.flush().await.ok();
+                    return;
+                }
+            }
+            info!(peer = %peer, db = %db_name, "client connected");
             let ok = Message::ConnectOk { version: "0.1.0".into() };
             if ok.write_to(&mut writer).await.is_err() { return; }
             if writer.flush().await.is_err() { return; }
         }
-        _ => {
+        Ok(Some(_)) => {
+            warn!(peer = %peer, "first message was not CONNECT");
             let err = Message::Error { message: "expected CONNECT".into() };
             err.write_to(&mut writer).await.ok();
             writer.flush().await.ok();
+            return;
+        }
+        Ok(None) => {
+            debug!(peer = %peer, "client closed before CONNECT");
+            return;
+        }
+        Err(e) => {
+            error!(peer = %peer, error = %e, "error reading CONNECT");
             return;
         }
     }
@@ -33,20 +54,24 @@ pub async fn handle_connection(stream: TcpStream, engine: Arc<Mutex<Engine>>) {
             Ok(Some(msg)) => msg,
             Ok(None) => break,
             Err(e) => {
-                eprintln!("[batadb] read error: {e}");
+                error!(peer = %peer, error = %e, "read error");
                 break;
             }
         };
 
         let response = match msg {
             Message::Query { query } => {
+                debug!(peer = %peer, query = %query, "received query");
                 let mut eng = engine.lock().unwrap();
                 match eng.execute_bataql(&query) {
                     Ok(result) => query_result_to_message(result),
                     Err(e) => Message::Error { message: e },
                 }
             }
-            Message::Disconnect => break,
+            Message::Disconnect => {
+                debug!(peer = %peer, "received DISCONNECT");
+                break;
+            }
             _ => Message::Error { message: "unexpected message type".into() },
         };
 
@@ -54,7 +79,7 @@ pub async fn handle_connection(stream: TcpStream, engine: Arc<Mutex<Engine>>) {
         if writer.flush().await.is_err() { break; }
     }
 
-    eprintln!("[batadb] client disconnected");
+    info!(peer = %peer, "client disconnected");
 }
 
 fn query_result_to_message(result: QueryResult) -> Message {

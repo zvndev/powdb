@@ -3,4 +3,5 @@
 *.swp
 *.swo
 batadb_data/
-/node_modules
+node_modules/
+clients/ts/dist/

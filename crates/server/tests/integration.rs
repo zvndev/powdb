@@ -6,6 +6,8 @@ fn encode_connect(db: &str) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&(db.len() as u32).to_le_bytes());
     payload.extend_from_slice(db.as_bytes());
+    // Empty password (len=0) means None
+    payload.extend_from_slice(&0u32.to_le_bytes());
     let mut frame = Vec::new();
     frame.push(0x01); // CONNECT
     frame.push(0);    // flags
@@ -62,7 +64,7 @@ async fn test_full_lifecycle() {
             let (stream, _) = listener.accept().await.unwrap();
             let eng = engine.clone();
             tokio::spawn(async move {
-                batadb_server::handler::handle_connection(stream, eng).await;
+                batadb_server::handler::handle_connection(stream, eng, None).await;
             });
         }
     });

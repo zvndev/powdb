@@ -11,7 +11,7 @@ const MSG_DISCONNECT: u8  = 0x10;
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Connect { db_name: String },
+    Connect { db_name: String, password: Option<String> },
     ConnectOk { version: String },
     Query { query: String },
     ResultRows {
@@ -28,7 +28,15 @@ impl Message {
     /// Encode message into wire format: [type(1)][flags(1)][len(4)][payload]
     pub fn encode(&self) -> Vec<u8> {
         let (msg_type, payload) = match self {
-            Message::Connect { db_name } => (MSG_CONNECT, encode_string(db_name)),
+            Message::Connect { db_name, password } => {
+                let mut buf = encode_string(db_name);
+                // Password is encoded as a length-prefixed string. Empty (len=0) means None.
+                match password {
+                    Some(p) => buf.extend_from_slice(&encode_string(p)),
+                    None => buf.extend_from_slice(&0u32.to_le_bytes()),
+                }
+                (MSG_CONNECT, buf)
+            }
             Message::ConnectOk { version } => (MSG_CONNECT_OK, encode_string(version)),
             Message::Query { query } => (MSG_QUERY, encode_string(query)),
             Message::ResultRows { columns, rows } => {
@@ -71,8 +79,17 @@ impl Message {
 
         match msg_type {
             MSG_CONNECT => {
-                let db_name = decode_string(payload, &mut 0)?;
-                Ok(Message::Connect { db_name })
+                let mut pos = 0;
+                let db_name = decode_string(payload, &mut pos)?;
+                // Password is optional. If there are no more bytes, treat as None
+                // (backwards compatible with old clients that don't send a password).
+                let password = if pos < payload.len() {
+                    let p = decode_string(payload, &mut pos)?;
+                    if p.is_empty() { None } else { Some(p) }
+                } else {
+                    None
+                };
+                Ok(Message::Connect { db_name, password })
             }
             MSG_CONNECT_OK => {
                 let version = decode_string(payload, &mut 0)?;

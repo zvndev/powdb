@@ -1,0 +1,25 @@
+{
+  "name": "@zvndev/batadb-client",
+  "version": "0.1.0",
+  "description": "TypeScript client for BataDB (BataQL wire protocol)",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "src"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "demo": "tsx demo/demo.ts",
+    "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "tsx": "^4",
+    "typescript": "^5.6"
+  }
+}

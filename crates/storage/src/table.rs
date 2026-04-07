@@ -20,6 +20,15 @@ impl Table {
         Ok(Table { schema, heap, indexes: HashMap::new() })
     }
 
+    /// Reopen an existing table from disk. Caller supplies the schema (loaded
+    /// from the catalog file). Indexes are not rebuilt — they live in memory
+    /// until `create_index` is called again.
+    pub fn open(schema: Schema, data_dir: &Path) -> io::Result<Self> {
+        let heap_path = data_dir.join(format!("{}.heap", schema.table_name));
+        let heap = HeapFile::open(&heap_path)?;
+        Ok(Table { schema, heap, indexes: HashMap::new() })
+    }
+
     pub fn insert(&mut self, values: &Row) -> io::Result<RowId> {
         let encoded = encode_row(&self.schema, values);
         let rid = self.heap.insert(&encoded)?;
