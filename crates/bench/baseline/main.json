@@ -1,17 +1,18 @@
 {
   "schema": 1,
   "runner": "ubuntu-24.04",
-  "rustc": "unknown",
+  "rustc": "stable",
   "updated": "2026-04-07",
-  "commit": "uninitialized",
-  "note": "Null values trigger first-run capture mode in the comparator. Run cargo bench in CI on ubuntu-24.04, copy the printed values into this file, commit, then the gate is live.",
+  "commit": "35acee9",
+  "captured_from": "GHA run 24065496323",
+  "note": "First baseline captured from CI on 2026-04-07. powql_point/btree_lookup ratio = 2.055x at capture (well under 2.5 ceiling). Per-workload absolute gate is ±7% from these values. Run scripts/update-bench-baseline.sh to refresh after an intentional change.",
   "workloads": {
-    "insert_10k":              { "ns_per_iter": null, "ops_per_sec": null },
-    "btree_lookup":            { "ns_per_iter": null, "ops_per_sec": null },
-    "seq_scan_filter":         { "ns_per_iter": null, "ops_per_sec": null },
-    "powql_point":             { "ns_per_iter": null, "ops_per_sec": null },
-    "powql_filter_only":       { "ns_per_iter": null, "ops_per_sec": null },
-    "powql_filter_projection": { "ns_per_iter": null, "ops_per_sec": null },
-    "powql_aggregation":       { "ns_per_iter": null, "ops_per_sec": null }
+    "insert_10k":              { "ns_per_iter": 42243936, "ops_per_sec": 24 },
+    "btree_lookup":            { "ns_per_iter": 1832,     "ops_per_sec": 545852 },
+    "seq_scan_filter":         { "ns_per_iter": 13738549, "ops_per_sec": 73 },
+    "powql_point":             { "ns_per_iter": 3764,     "ops_per_sec": 265675 },
+    "powql_filter_only":       { "ns_per_iter": 15997706, "ops_per_sec": 63 },
+    "powql_filter_projection": { "ns_per_iter": 21281178, "ops_per_sec": 47 },
+    "powql_aggregation":       { "ns_per_iter": 656,      "ops_per_sec": 1524390 }
   }
 }

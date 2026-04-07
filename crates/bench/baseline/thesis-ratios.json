@@ -12,8 +12,8 @@
       "numerator": "powql_point",
       "denominator": "btree_lookup",
       "ceiling": 2.5,
-      "observed_at_last_edit": 2.14,
-      "meaning": "Full PowQL parser+planner+executor overhead over the raw B-tree probe. This is THE thesis metric. Smoke bench (2026-04-06) measured 2641ns / 1237ns = 2.14x. Ceiling 2.5 leaves ~17% headroom for incidental overhead but not enough to hide a planner regression that un-folds .field=literal into SeqScan+Filter."
+      "observed_at_last_edit": 2.055,
+      "meaning": "Full PowQL parser+planner+executor overhead over the raw B-tree probe. This is THE thesis metric. First captured from GHA run 24065496323 on ubuntu-24.04: 3764ns / 1832ns = 2.055x. Ceiling 2.5 leaves ~22% headroom for incidental overhead but not enough to hide a planner regression that un-folds .field=literal into SeqScan+Filter. Smoke bench on M1 measured this same ratio at 1.897-2.14x — the ratio is hardware-stable."
     }
   }
 }
