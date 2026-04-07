@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "updated": "2026-04-07",
+  "_README": [
+    "This file is HAND-EDITED ONLY. No script writes to it.",
+    "Each ratio enforces a structural property of PowDB that should not silently degrade.",
+    "Raising a ceiling means the thesis gave ground — justify it in the commit message.",
+    "Convention: 'bench: relax <ratio_name> <old> -> <new> (<why>)'."
+  ],
+  "ratios": {
+    "powql_point_over_btree_lookup": {
+      "numerator": "powql_point",
+      "denominator": "btree_lookup",
+      "ceiling": 2.5,
+      "observed_at_last_edit": 2.14,
+      "meaning": "Full PowQL parser+planner+executor overhead over the raw B-tree probe. This is THE thesis metric. Smoke bench (2026-04-06) measured 2641ns / 1237ns = 2.14x. Ceiling 2.5 leaves ~17% headroom for incidental overhead but not enough to hide a planner regression that un-folds .field=literal into SeqScan+Filter."
+    }
+  }
+}

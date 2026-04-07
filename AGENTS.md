@@ -171,6 +171,114 @@ client — `telnet`/`nc` will just hang the server's `read_exact`.
 - Auth: `POWDB_PASSWORD` is a Fly secret; the server compares it to the
   `Connect` message's password field. Empty password disables auth.
 
+## Bench regression gate
+
+PowDB has a criterion-based regression gate that runs on every PR to `main`.
+Its job is to catch silent perf regressions in the load-bearing query paths —
+especially the `powql_point` workload (the 3,020x IndexScan-fold path that
+validates the thesis). When the gate fires, **don't blindly rebaseline** —
+investigate first.
+
+Spec: `docs/superpowers/specs/2026-04-07-bench-regression-gate-design.md`.
+
+### Run locally
+
+```bash
+cargo bench -p powdb-bench           # ~60s, runs all 7 workloads
+cargo run -p powdb-bench --bin compare
+```
+
+The comparator reads `target/criterion/<workload>/new/estimates.json` and
+compares against two checked-in baselines:
+
+- `crates/bench/baseline/main.json` — per-workload absolute (±7% gate)
+- `crates/bench/baseline/thesis-ratios.json` — ratio ceilings (currently
+  `powql_point / btree_lookup ≤ 2.5x`)
+
+Either guard fires → exit non-zero → CI blocks merge.
+
+The cheap `smoke-bench` binary (`cargo run --release -p powdb-bench --bin
+smoke-bench`) is still around for fast local iteration. It does not gate
+anything — it just prints numbers.
+
+### Interpreting a failure
+
+The comparator output names the workload, the baseline value, the current
+value, and the delta. Two failure modes:
+
+1. **One workload exceeds 7% absolute.** Storage / executor / parser
+   slowdown. Run `cargo bench -p powdb-bench` locally on `main` to confirm
+   it isn't transient runner noise. If it reproduces, profile the workload
+   (`cargo flamegraph --bench storage` etc.) and fix the regression.
+
+2. **A thesis ratio exceeds its ceiling.** Planner / translation regression
+   — the parser+planner+executor overhead grew relative to the raw B-tree.
+   This is the failure mode the gate exists for. Almost always means
+   someone broke a planner rewrite (e.g., the `.field = literal` →
+   `IndexScan` fold from commit `077b960`). Look at the planner first.
+
+### Rebaseline (intentional change)
+
+Use this when you legitimately moved the numbers and the new floor is the
+new truth.
+
+```bash
+./scripts/update-bench-baseline.sh
+git diff --cached crates/bench/baseline/main.json     # sanity-check the diff
+git commit -m "bench: rebaseline after <change> (<workload>: <delta>)"
+```
+
+The script runs the bench suite, extracts each workload's median, writes a
+new `main.json` with the current rustc version + git sha + date, and stages
+it. **It does not commit** — you commit, with a message that explains *why*
+the baseline moved. The PR reviewer will check that the baseline diff
+matches the claimed change.
+
+### Raise a thesis ratio ceiling (rare, requires justification)
+
+**Hand-edit only.** No script touches `thesis-ratios.json`. Raising a
+ceiling means the thesis gave ground, so the commit must explain the
+tradeoff. Convention:
+
+```
+bench: relax powql_point_over_btree_lookup 2.5 -> 2.8
+       (cost-model planner adds ~400ns to plan phase, acceptable for join support)
+```
+
+Commit it in isolation — do not bundle with code changes. There is no CI
+guard preventing a drive-by edit; the file format and the social contract
+are the guard.
+
+### Branch protection (manual setup, one time)
+
+The bench job has to be a **required status check** to actually block
+merges. This is a GitHub repo settings change, not a file in the repo.
+
+1. Go to `Settings → Branches → Branch protection rules → main → Edit`.
+2. Tick "Require status checks to pass before merging."
+3. Tick "Require branches to be up to date before merging."
+4. In the status checks search box, find `criterion + regression gate` (the
+   job name from `.github/workflows/bench.yml`) and add it.
+5. Save.
+
+If you fork or re-clone the repo, redo this — it's not version controlled.
+
+### When the gate gets noisy
+
+GHA shared-tenancy noise on `ubuntu-24.04` is normally <5% on the workloads
+in this suite, so the 7% gate should rarely false-positive. If it starts
+flapping (~once a month or more on noise alone):
+
+1. First, widen the absolute threshold to 10% in
+   `crates/bench/src/bin/compare.rs` (`ABSOLUTE_THRESHOLD`). Cheap fix.
+2. Only after that, consider a self-hosted runner. Adds ops burden — last
+   resort.
+
+The ratio guard is hardware-proof (both numerator and denominator move
+together) so it doesn't need tuning when noise widens.
+
+---
+
 ## Repo layout
 
 ```

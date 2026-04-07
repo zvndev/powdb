@@ -1,0 +1,68 @@
+name: bench
+
+# PowDB regression gate. Runs the criterion suite on every PR to main and on
+# pushes to main. Comparator exits non-zero on regression beyond the gate
+# thresholds (7% per-workload absolute, 2.5x ratio ceiling on the thesis
+# metric).
+#
+# See docs/superpowers/specs/2026-04-07-bench-regression-gate-design.md
+# and the "Bench regression gate" section of AGENTS.md.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Cancel in-progress runs on the same branch when a new commit lands. Bench
+# runs are expensive and the older one's results would be wasted anyway.
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    name: criterion + regression gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: bench-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            bench-${{ runner.os }}-
+
+      - name: Print rustc version
+        run: rustc --version
+
+      - name: Build bench targets
+        run: cargo bench -p powdb-bench --no-run
+
+      - name: Run criterion bench suite
+        run: cargo bench -p powdb-bench --quiet
+
+      - name: Run regression gate comparator
+        run: cargo run -p powdb-bench --bin compare --quiet
+
+      - name: Upload criterion estimates on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-estimates
+          path: target/criterion/*/new/estimates.json
+          retention-days: 14
