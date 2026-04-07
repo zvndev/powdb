@@ -3,6 +3,7 @@ use crate::plan::*;
 use crate::planner;
 use crate::result::QueryResult;
 use powdb_storage::catalog::Catalog;
+use powdb_storage::row::{RowLayout, decode_column, decode_row};
 use powdb_storage::types::*;
 use std::io;
 use std::path::Path;
@@ -88,6 +89,39 @@ impl Engine {
             }
 
             PlanNode::Filter { input, predicate } => {
+                // Fast path: fuse Filter + SeqScan into a zero-copy streaming
+                // loop. Uses decode_column() to evaluate the predicate on only
+                // the columns it references, avoiding heap allocations for
+                // String/Bytes columns that aren't part of the filter.
+                if let PlanNode::SeqScan { table } = input.as_ref() {
+                    let schema = self.catalog.schema(table)
+                        .ok_or_else(|| format!("table '{table}' not found"))?
+                        .clone();
+                    let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+                    let layout = RowLayout::new(&schema);
+                    let mut rows: Vec<Vec<Value>> = Vec::new();
+
+                    // Try compiled predicate for the filter check
+                    if let Some(compiled) = try_compile_int_predicate(predicate, &columns, &layout) {
+                        self.catalog.for_each_row_raw(table, |_rid, data| {
+                            if compiled(data) {
+                                rows.push(decode_row(&schema, data));
+                            }
+                        }).map_err(|e| e.to_string())?;
+                    } else {
+                        let pred_cols = predicate_column_indices(predicate, &columns);
+                        self.catalog.for_each_row_raw(table, |_rid, data| {
+                            let pred_row = decode_selective(&schema, &layout, data, &pred_cols);
+                            if eval_predicate(predicate, &pred_row, &columns) {
+                                rows.push(decode_row(&schema, data));
+                            }
+                        }).map_err(|e| e.to_string())?;
+                    }
+
+                    return Ok(QueryResult::Rows { columns, rows });
+                }
+
+                // General path: materialise then filter.
                 let result = self.execute_plan(input)?;
                 match result {
                     QueryResult::Rows { columns, rows } => {
@@ -101,6 +135,53 @@ impl Engine {
             }
 
             PlanNode::Project { input, fields } => {
+                // Fast path: Project over IndexScan — decode only projected
+                // columns from raw bytes instead of full decode_row.
+                if let PlanNode::IndexScan { table, column, key } = input.as_ref() {
+                    let schema = self.catalog.schema(table)
+                        .ok_or_else(|| format!("table '{table}' not found"))?
+                        .clone();
+                    let all_columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+                    let key_value = literal_to_value(key)?;
+                    let tbl = self.catalog.get_table(table)
+                        .ok_or_else(|| format!("table '{table}' not found"))?;
+
+                    let proj_columns: Vec<String> = fields.iter().map(|f| {
+                        f.alias.clone().unwrap_or_else(|| match &f.expr {
+                            Expr::Field(name) => name.clone(),
+                            _ => "?".into(),
+                        })
+                    }).collect();
+
+                    // Determine which column indices the projection needs
+                    let proj_indices: Vec<usize> = fields.iter().filter_map(|f| {
+                        if let Expr::Field(name) = &f.expr {
+                            all_columns.iter().position(|c| c == name)
+                        } else {
+                            None
+                        }
+                    }).collect();
+
+                    if tbl.indexes.contains_key(column) {
+                        let layout = RowLayout::new(&schema);
+                        let rows = match tbl.indexes.get(column).unwrap().lookup(&key_value) {
+                            Some(rid) => {
+                                match tbl.heap.get(rid) {
+                                    Some(data) => {
+                                        let row: Vec<Value> = proj_indices.iter()
+                                            .map(|&ci| decode_column(&schema, &layout, &data, ci))
+                                            .collect();
+                                        vec![row]
+                                    }
+                                    None => Vec::new(),
+                                }
+                            }
+                            None => Vec::new(),
+                        };
+                        return Ok(QueryResult::Rows { columns: proj_columns, rows });
+                    }
+                }
+
                 let result = self.execute_plan(input)?;
                 match result {
                     QueryResult::Rows { columns, rows } => {
@@ -164,6 +245,51 @@ impl Engine {
             }
 
             PlanNode::Aggregate { input, function, field } => {
+                // Fast path: count() over SeqScan — count rows without any decode
+                if *function == AggFunc::Count {
+                    if let PlanNode::SeqScan { table } = input.as_ref() {
+                        let mut count: i64 = 0;
+                        self.catalog.for_each_row_raw(table, |_rid, _data| {
+                            count += 1;
+                        }).map_err(|e| e.to_string())?;
+                        return Ok(QueryResult::Scalar(Value::Int(count)));
+                    }
+                    // Fast path: count() over Filter(SeqScan) — try compiled
+                    // predicate first, fall back to decode_column path.
+                    if let PlanNode::Filter { input: inner, predicate } = input.as_ref() {
+                        if let PlanNode::SeqScan { table } = inner.as_ref() {
+                            let schema = self.catalog.schema(table)
+                                .ok_or_else(|| format!("table '{table}' not found"))?
+                                .clone();
+                            let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+                            let layout = RowLayout::new(&schema);
+
+                            // Try compiled predicate (zero-allocation hot path)
+                            if let Some(compiled) = try_compile_int_predicate(predicate, &columns, &layout) {
+                                let mut count: i64 = 0;
+                                self.catalog.for_each_row_raw(table, |_rid, data| {
+                                    if compiled(data) {
+                                        count += 1;
+                                    }
+                                }).map_err(|e| e.to_string())?;
+                                return Ok(QueryResult::Scalar(Value::Int(count)));
+                            }
+
+                            // Fallback: decode predicate columns
+                            let pred_cols = predicate_column_indices(predicate, &columns);
+                            let mut count: i64 = 0;
+                            self.catalog.for_each_row_raw(table, |_rid, data| {
+                                let pred_row = decode_selective(&schema, &layout, data, &pred_cols);
+                                if eval_predicate(predicate, &pred_row, &columns) {
+                                    count += 1;
+                                }
+                            }).map_err(|e| e.to_string())?;
+
+                            return Ok(QueryResult::Scalar(Value::Int(count)));
+                        }
+                    }
+                }
+
                 let result = self.execute_plan(input)?;
                 match result {
                     QueryResult::Rows { columns, rows } => {
@@ -382,6 +508,102 @@ fn eval_predicate(expr: &Expr, row: &[Value], columns: &[String]) -> bool {
         Value::Bool(b) => b,
         _ => false,
     }
+}
+
+/// Try to compile a simple predicate (field op literal) into a closure that
+/// operates directly on raw row bytes, bypassing Value allocation entirely.
+/// Returns None if the predicate is too complex to compile.
+fn try_compile_int_predicate(
+    expr: &Expr,
+    columns: &[String],
+    layout: &RowLayout,
+) -> Option<Box<dyn Fn(&[u8]) -> bool>> {
+    if let Expr::BinaryOp(left, op, right) = expr {
+        // Pattern: .field op literal_int
+        let (field_name, literal_val, op) = match (left.as_ref(), right.as_ref()) {
+            (Expr::Field(name), Expr::Literal(Literal::Int(v))) => (name, *v, *op),
+            (Expr::Literal(Literal::Int(v)), Expr::Field(name)) => {
+                // Flip: literal op field → field flipped_op literal
+                let flipped = match op {
+                    BinOp::Lt => BinOp::Gt,
+                    BinOp::Gt => BinOp::Lt,
+                    BinOp::Lte => BinOp::Gte,
+                    BinOp::Gte => BinOp::Lte,
+                    other => *other, // Eq, Neq are symmetric
+                };
+                (name, *v, flipped)
+            }
+            _ => return None,
+        };
+
+        let col_idx = columns.iter().position(|c| c == field_name)?;
+        let byte_offset = layout.fixed_offset(col_idx)?; // Must be fixed-size
+        let bitmap_byte = col_idx / 8;
+        let bitmap_bit = col_idx % 8;
+        let data_offset = 2 + layout.bitmap_size() + byte_offset; // 2B length prefix + bitmap + fixed offset
+
+        Some(Box::new(move |data: &[u8]| {
+            // Check null
+            let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
+            if is_null {
+                return false;
+            }
+            let val = i64::from_le_bytes(
+                data[data_offset..data_offset + 8].try_into().unwrap(),
+            );
+            match op {
+                BinOp::Eq => val == literal_val,
+                BinOp::Neq => val != literal_val,
+                BinOp::Lt => val < literal_val,
+                BinOp::Gt => val > literal_val,
+                BinOp::Lte => val <= literal_val,
+                BinOp::Gte => val >= literal_val,
+                _ => false,
+            }
+        }))
+    } else {
+        None
+    }
+}
+
+/// Collect the column indices referenced by a predicate expression.
+fn predicate_column_indices(expr: &Expr, columns: &[String]) -> Vec<usize> {
+    let mut indices = Vec::new();
+    collect_field_indices(expr, columns, &mut indices);
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+}
+
+fn collect_field_indices(expr: &Expr, columns: &[String], out: &mut Vec<usize>) {
+    match expr {
+        Expr::Field(name) => {
+            if let Some(idx) = columns.iter().position(|c| c == name) {
+                out.push(idx);
+            }
+        }
+        Expr::BinaryOp(left, _, right) => {
+            collect_field_indices(left, columns, out);
+            collect_field_indices(right, columns, out);
+        }
+        Expr::Coalesce(left, right) => {
+            collect_field_indices(left, columns, out);
+            collect_field_indices(right, columns, out);
+        }
+        _ => {}
+    }
+}
+
+/// Decode only the specified columns from raw row bytes, filling the rest
+/// with `Value::Empty`. This avoids heap allocations for String/Bytes
+/// columns that the predicate doesn't reference.
+fn decode_selective(schema: &Schema, layout: &RowLayout, data: &[u8], col_indices: &[usize]) -> Vec<Value> {
+    let n_cols = schema.columns.len();
+    let mut values = vec![Value::Empty; n_cols];
+    for &ci in col_indices {
+        values[ci] = decode_column(schema, layout, data, ci);
+    }
+    values
 }
 
 fn eval_binop(left: &Value, op: BinOp, right: &Value) -> Value {

@@ -1,5 +1,5 @@
 use crate::disk::DiskManager;
-use crate::page::{Page, PageType};
+use crate::page::{Page, PageType, PAGE_SIZE, iter_page_slots};
 use crate::types::RowId;
 use std::io;
 use std::path::Path;
@@ -10,12 +10,14 @@ pub struct HeapFile {
     disk: DiskManager,
     /// Pages with known free space.
     pages_with_space: Vec<u32>,
+    /// Optional mmap for zero-syscall reads. Activated by `enable_mmap()`.
+    mmap_ptr: Option<(*const u8, usize)>,
 }
 
 impl HeapFile {
     pub fn create(path: &Path) -> io::Result<Self> {
         let disk = DiskManager::create(path)?;
-        Ok(HeapFile { disk, pages_with_space: Vec::new() })
+        Ok(HeapFile { disk, pages_with_space: Vec::new(), mmap_ptr: None })
     }
 
     pub fn open(path: &Path) -> io::Result<Self> {
@@ -30,7 +32,35 @@ impl HeapFile {
                 }
             }
         }
-        Ok(HeapFile { disk, pages_with_space })
+        Ok(HeapFile { disk, pages_with_space, mmap_ptr: None })
+    }
+
+    /// Activate mmap for zero-syscall reads. Call after all inserts are done.
+    /// The mmap covers the current file size; new inserts will invalidate it.
+    pub fn enable_mmap(&mut self) {
+        if self.mmap_ptr.is_some() {
+            return;
+        }
+        let num_pages = self.disk.num_pages();
+        if num_pages == 0 {
+            return;
+        }
+        let file_len = num_pages as usize * PAGE_SIZE;
+        use std::os::unix::io::AsRawFd;
+        let fd = self.disk.file_ref().as_raw_fd();
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                file_len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                fd,
+                0,
+            )
+        };
+        if ptr != libc::MAP_FAILED {
+            self.mmap_ptr = Some((ptr as *const u8, file_len));
+        }
     }
 
     /// Insert encoded row data. Returns RowId.
@@ -63,6 +93,29 @@ impl HeapFile {
 
     /// Read row data by RowId.
     pub fn get(&self, rid: RowId) -> Option<Vec<u8>> {
+        // Fast path: mmap — read directly from mapped memory
+        if let Some((ptr, len)) = self.mmap_ptr {
+            let offset = rid.page_id as usize * PAGE_SIZE;
+            if offset + PAGE_SIZE <= len {
+                let page_bytes = unsafe {
+                    std::slice::from_raw_parts(ptr.add(offset), PAGE_SIZE)
+                };
+                let entry_off = PAGE_SIZE - 2 - ((rid.slot_index as usize + 1) * 4);
+                let slot_offset = u16::from_le_bytes(
+                    page_bytes[entry_off..entry_off + 2].try_into().unwrap(),
+                );
+                let slot_length = u16::from_le_bytes(
+                    page_bytes[entry_off + 2..entry_off + 4].try_into().unwrap(),
+                );
+                if slot_length == 0xFFFF {
+                    return None; // deleted
+                }
+                let start = slot_offset as usize;
+                let end = start + slot_length as usize;
+                return Some(page_bytes[start..end].to_vec());
+            }
+        }
+
         let buf = self.disk.read_page(rid.page_id).ok()?;
         let page = Page::from_bytes(&buf)?;
         page.get(rid.slot_index).map(|d| d.to_vec())
@@ -111,10 +164,76 @@ impl HeapFile {
         })
     }
 
+    /// Zero-copy scan: calls `f` for every live row without allocating a
+    /// `Vec<u8>` per row. Uses mmap when available to avoid per-page syscalls.
+    pub fn for_each_row<F>(&self, mut f: F)
+    where
+        F: FnMut(RowId, &[u8]),
+    {
+        let num_pages = self.disk.num_pages();
+        if num_pages == 0 {
+            return;
+        }
+
+        // Try mmap for zero-syscall scanning
+        use std::os::unix::io::AsRawFd;
+        let fd = self.disk.file_ref().as_raw_fd();
+        let file_len = (num_pages as usize) * PAGE_SIZE;
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                file_len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                fd,
+                0,
+            )
+        };
+
+        if ptr != libc::MAP_FAILED {
+            // mmap succeeded — iterate pages from mapped memory, zero-copy
+            let mapped = unsafe { std::slice::from_raw_parts(ptr as *const u8, file_len) };
+            for page_id in 0..num_pages {
+                let offset = page_id as usize * PAGE_SIZE;
+                let page_bytes = &mapped[offset..offset + PAGE_SIZE];
+                for (slot, data) in iter_page_slots(page_bytes) {
+                    f(RowId { page_id, slot_index: slot }, data);
+                }
+            }
+            unsafe { libc::munmap(ptr, file_len); }
+        } else {
+            // Fallback: per-page read
+            for page_id in 0..num_pages {
+                let buf = match self.disk.read_page(page_id) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                if let Some(page) = Page::from_bytes(&buf) {
+                    for (slot, data) in page.iter() {
+                        f(RowId { page_id, slot_index: slot }, data);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn flush(&mut self) -> io::Result<()> {
         self.disk.flush()
     }
 }
+
+impl Drop for HeapFile {
+    fn drop(&mut self) {
+        if let Some((ptr, len)) = self.mmap_ptr.take() {
+            unsafe { libc::munmap(ptr as *mut libc::c_void, len); }
+        }
+    }
+}
+
+// SAFETY: The mmap pointer is read-only and the file is not modified
+// while the map is active. The HeapFile is not Send/Sync anyway (it
+// contains DiskManager with File), so this is fine for single-threaded use.
+unsafe impl Send for HeapFile {}
 
 #[cfg(test)]
 mod tests {
