@@ -203,6 +203,29 @@ impl Page {
     }
 }
 
+/// Iterate live slots directly from a page-sized byte slice without copying.
+/// Used by mmap-based scans to avoid the 4KB memcpy in `Page::from_bytes`.
+pub fn iter_page_slots(page_bytes: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
+    let slot_count = u16::from_le_bytes(
+        page_bytes[PAGE_SIZE - 2..PAGE_SIZE].try_into().unwrap(),
+    );
+    (0..slot_count).filter_map(move |i| {
+        let entry_off = PAGE_SIZE - SLOT_COUNT_SIZE - ((i as usize + 1) * SLOT_ENTRY_SIZE);
+        let offset = u16::from_le_bytes(
+            page_bytes[entry_off..entry_off + 2].try_into().unwrap(),
+        );
+        let length = u16::from_le_bytes(
+            page_bytes[entry_off + 2..entry_off + 4].try_into().unwrap(),
+        );
+        if length == DELETED_MARKER {
+            return None;
+        }
+        let start = offset as usize;
+        let end = start + length as usize;
+        Some((i, &page_bytes[start..end]))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

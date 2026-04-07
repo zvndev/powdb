@@ -63,6 +63,11 @@ impl DiskManager {
     pub fn num_pages(&self) -> u32 {
         self.num_pages
     }
+
+    /// Borrow the underlying file (for mmap-based scans).
+    pub fn file_ref(&self) -> &File {
+        &self.file
+    }
 }
 
 #[cfg(test)]

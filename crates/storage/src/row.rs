@@ -85,6 +85,126 @@ pub fn encode_row(schema: &Schema, values: &[Value]) -> Vec<u8> {
     buf
 }
 
+/// Precomputed layout information for fast selective column decoding.
+///
+/// Computing offsets requires iterating through schema columns every time,
+/// which is wasteful when decoding thousands of rows. This struct caches the
+/// layout once so that `decode_column` can jump directly to the right byte
+/// offset.
+pub struct RowLayout {
+    /// Byte offset within the fixed-column region for each fixed column.
+    /// Variable-length columns have `None`.
+    fixed_offsets: Vec<Option<usize>>,
+    /// Total size of the fixed-column region in bytes.
+    fixed_region_size: usize,
+    /// For each column: if it is variable-length, its index within the
+    /// variable-column offset table. Fixed columns have `None`.
+    var_index: Vec<Option<usize>>,
+    /// Total number of variable-length columns.
+    n_var: usize,
+    /// Size of the null bitmap in bytes.
+    bitmap_size: usize,
+}
+
+impl RowLayout {
+    /// Fixed byte offset for a column (None if variable-length).
+    pub fn fixed_offset(&self, col_idx: usize) -> Option<usize> {
+        self.fixed_offsets[col_idx]
+    }
+
+    /// Size of the null bitmap in bytes.
+    pub fn bitmap_size(&self) -> usize {
+        self.bitmap_size
+    }
+
+    /// Build a `RowLayout` from a schema. This is cheap — do it once per scan,
+    /// not once per row.
+    pub fn new(schema: &Schema) -> Self {
+        let n_cols = schema.columns.len();
+        let bitmap_size = (n_cols + 7) / 8;
+
+        let mut fixed_offsets = vec![None; n_cols];
+        let mut var_index = vec![None; n_cols];
+        let mut fixed_pos: usize = 0;
+        let mut var_count: usize = 0;
+
+        for (i, col) in schema.columns.iter().enumerate() {
+            if is_fixed_size(col.type_id) {
+                fixed_offsets[i] = Some(fixed_pos);
+                fixed_pos += fixed_size(col.type_id).unwrap();
+            } else {
+                var_index[i] = Some(var_count);
+                var_count += 1;
+            }
+        }
+
+        RowLayout {
+            fixed_offsets,
+            fixed_region_size: fixed_pos,
+            var_index,
+            n_var: var_count,
+            bitmap_size,
+        }
+    }
+}
+
+/// Decode a single column from the raw row bytes without allocating anything
+/// for other columns.
+pub fn decode_column(schema: &Schema, layout: &RowLayout, data: &[u8], col_idx: usize) -> Value {
+    let col = &schema.columns[col_idx];
+
+    // Check null bitmap
+    let bitmap_start = 2; // skip 2-byte length prefix
+    let is_null = (data[bitmap_start + col_idx / 8] >> (col_idx % 8)) & 1 == 1;
+    if is_null {
+        return Value::Empty;
+    }
+
+    let fixed_start = 2 + layout.bitmap_size;
+
+    if let Some(offset) = layout.fixed_offsets[col_idx] {
+        let pos = fixed_start + offset;
+        match col.type_id {
+            TypeId::Int => {
+                Value::Int(i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()))
+            }
+            TypeId::Float => {
+                Value::Float(f64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()))
+            }
+            TypeId::Bool => {
+                Value::Bool(data[pos] != 0)
+            }
+            TypeId::DateTime => {
+                Value::DateTime(i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()))
+            }
+            TypeId::Uuid => {
+                let mut v = [0u8; 16];
+                v.copy_from_slice(&data[pos..pos + 16]);
+                Value::Uuid(v)
+            }
+            _ => unreachable!(),
+        }
+    } else {
+        let vi = layout.var_index[col_idx].unwrap();
+        let offset_table_start = fixed_start + layout.fixed_region_size;
+        let off_pos = offset_table_start + vi * 2;
+        let next_off_pos = offset_table_start + (vi + 1) * 2;
+        let var_offset = u16::from_le_bytes(data[off_pos..off_pos + 2].try_into().unwrap()) as usize;
+        let var_next = u16::from_le_bytes(data[next_off_pos..next_off_pos + 2].try_into().unwrap()) as usize;
+
+        let var_data_start = offset_table_start + (layout.n_var + 1) * 2;
+        let start = var_data_start + var_offset;
+        let end = var_data_start + var_next;
+        let bytes = &data[start..end];
+
+        match col.type_id {
+            TypeId::Str => Value::Str(String::from_utf8_lossy(bytes).into_owned()),
+            TypeId::Bytes => Value::Bytes(bytes.to_vec()),
+            _ => unreachable!(),
+        }
+    }
+}
+
 /// Decode a row from its compact binary format back into Values.
 pub fn decode_row(schema: &Schema, data: &[u8]) -> Row {
     let n_cols = schema.columns.len();

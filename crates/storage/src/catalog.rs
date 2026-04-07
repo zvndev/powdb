@@ -108,6 +108,18 @@ impl Catalog {
         Ok(t.scan())
     }
 
+    /// Zero-copy scan: passes raw row bytes to the callback without any
+    /// per-row allocation. Used by the executor's fast paths.
+    pub fn for_each_row_raw<F>(&self, table: &str, f: F) -> io::Result<()>
+    where
+        F: FnMut(RowId, &[u8]),
+    {
+        let t = self.tables.get(table)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
+        t.for_each_row_raw(f);
+        Ok(())
+    }
+
     pub fn create_index(&mut self, table: &str, column: &str) -> io::Result<()> {
         let data_dir = self.data_dir.clone();
         let t = self.tables.get_mut(table)

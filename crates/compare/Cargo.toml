@@ -1,0 +1,17 @@
+[package]
+name = "powdb-compare"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+powdb-storage = { path = "../storage" }
+powdb-query = { path = "../query" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+postgres = "0.19"
+tempfile = "3"
+
+[[bin]]
+name = "compare-engines"
+path = "src/main.rs"

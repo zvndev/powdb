@@ -75,6 +75,16 @@ impl Table {
         })
     }
 
+    /// Zero-copy scan that passes raw row bytes to the callback without
+    /// decoding or allocating per-row. The caller is responsible for
+    /// decoding only the columns it needs via `decode_column`.
+    pub fn for_each_row_raw<F>(&self, f: F)
+    where
+        F: FnMut(RowId, &[u8]),
+    {
+        self.heap.for_each_row(f);
+    }
+
     pub fn index_lookup(&self, col_name: &str, key: &Value) -> Option<(RowId, Row)> {
         let btree = self.indexes.get(col_name)?;
         let rid = btree.lookup(key)?;
