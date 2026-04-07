@@ -90,7 +90,12 @@ fn bench_powql_point(c: &mut Criterion) {
         b.iter(|| {
             let q = &queries[idx % queries.len()];
             idx = idx.wrapping_add(1);
-            black_box(engine.execute_powql(q))
+            // .expect() so a parse/plan/exec failure surfaces as a bench
+            // failure instead of silently turning the workload into a "time
+            // how fast we return Err" benchmark. (We learned this the hard
+            // way: powql_aggregation was 656ns because count(... filter ...)
+            // didn't parse — see commit fixing parser.rs.)
+            black_box(engine.execute_powql(q).expect("query failed"))
         });
     });
 }
@@ -114,7 +119,12 @@ fn bench_powql_filter_only(c: &mut Criterion) {
         b.iter(|| {
             let q = &queries[idx % queries.len()];
             idx = idx.wrapping_add(1);
-            black_box(engine.execute_powql(q))
+            // .expect() so a parse/plan/exec failure surfaces as a bench
+            // failure instead of silently turning the workload into a "time
+            // how fast we return Err" benchmark. (We learned this the hard
+            // way: powql_aggregation was 656ns because count(... filter ...)
+            // didn't parse — see commit fixing parser.rs.)
+            black_box(engine.execute_powql(q).expect("query failed"))
         });
     });
 }
@@ -140,7 +150,12 @@ fn bench_powql_filter_projection(c: &mut Criterion) {
         b.iter(|| {
             let q = &queries[idx % queries.len()];
             idx = idx.wrapping_add(1);
-            black_box(engine.execute_powql(q))
+            // .expect() so a parse/plan/exec failure surfaces as a bench
+            // failure instead of silently turning the workload into a "time
+            // how fast we return Err" benchmark. (We learned this the hard
+            // way: powql_aggregation was 656ns because count(... filter ...)
+            // didn't parse — see commit fixing parser.rs.)
+            black_box(engine.execute_powql(q).expect("query failed"))
         });
     });
 }
@@ -163,7 +178,12 @@ fn bench_powql_aggregation(c: &mut Criterion) {
         b.iter(|| {
             let q = &queries[idx % queries.len()];
             idx = idx.wrapping_add(1);
-            black_box(engine.execute_powql(q))
+            // .expect() so a parse/plan/exec failure surfaces as a bench
+            // failure instead of silently turning the workload into a "time
+            // how fast we return Err" benchmark. (We learned this the hard
+            // way: powql_aggregation was 656ns because count(... filter ...)
+            // didn't parse — see commit fixing parser.rs.)
+            black_box(engine.execute_powql(q).expect("query failed"))
         });
     });
 }

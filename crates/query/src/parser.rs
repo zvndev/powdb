@@ -56,6 +56,9 @@ impl Parser {
             t => return Err(ParseError { message: format!("expected type name, got {t:?}") }),
         };
 
+        // Walk filter/order/limit/offset/projection, peeling off update/delete
+        // mutations as we hit them. Anything else terminates the read pipeline
+        // and we return a Query.
         let mut filter = None;
         let mut order = None;
         let mut limit = None;
@@ -105,6 +108,54 @@ impl Parser {
             projection,
             aggregation: None,
         }))
+    }
+
+    /// Parse the read-only tail of a query (filter/order/limit/offset/projection)
+    /// after `source` has already been consumed. Stops at the first token that
+    /// isn't part of a read pipeline — the caller decides whether that's a
+    /// terminator (RParen for an aggregate, EOF for a top-level query, etc.).
+    /// Always returns `aggregation: None`; the caller layers that on.
+    fn parse_query_tail(&mut self, source: String) -> Result<QueryExpr, ParseError> {
+        let mut filter = None;
+        let mut order = None;
+        let mut limit = None;
+        let mut offset = None;
+        let mut projection = None;
+
+        loop {
+            match self.peek() {
+                Token::Filter => {
+                    self.advance();
+                    filter = Some(self.parse_expr()?);
+                }
+                Token::Order => {
+                    self.advance();
+                    order = Some(self.parse_order()?);
+                }
+                Token::Limit => {
+                    self.advance();
+                    limit = Some(self.parse_expr()?);
+                }
+                Token::Offset => {
+                    self.advance();
+                    offset = Some(self.parse_expr()?);
+                }
+                Token::LBrace => {
+                    projection = Some(self.parse_projection()?);
+                }
+                _ => break,
+            }
+        }
+
+        Ok(QueryExpr {
+            source,
+            filter,
+            order,
+            limit,
+            offset,
+            projection,
+            aggregation: None,
+        })
     }
 
     fn parse_insert(&mut self) -> Result<Statement, ParseError> {
@@ -193,16 +244,13 @@ impl Parser {
             Token::Ident(name) => name,
             t => return Err(ParseError { message: format!("expected type name, got {t:?}") }),
         };
+        // Allow a full read-pipeline tail inside the parens, e.g.
+        // `count(User filter .age > 27 limit 100)`. parse_query_tail stops at
+        // the first non-pipeline token, which here must be RParen.
+        let mut query = self.parse_query_tail(source)?;
         self.expect(&Token::RParen)?;
-        Ok(Statement::Query(QueryExpr {
-            source,
-            filter: None,
-            order: None,
-            limit: None,
-            offset: None,
-            projection: None,
-            aggregation: Some(AggregateExpr { function: func, field: None }),
-        }))
+        query.aggregation = Some(AggregateExpr { function: func, field: None });
+        Ok(Statement::Query(query))
     }
 
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
@@ -457,6 +505,37 @@ mod tests {
             Statement::Query(q) => {
                 let agg = q.aggregation.unwrap();
                 assert_eq!(agg.function, AggFunc::Count);
+                assert!(q.filter.is_none());
+            }
+            _ => panic!("expected query with aggregation"),
+        }
+    }
+
+    #[test]
+    fn test_parse_count_with_filter() {
+        // Regression: previously returned "expected RParen, got Filter".
+        // count(<query>) must accept a full read-pipeline tail.
+        let stmt = parse("count(User filter .age > 30)").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                assert_eq!(q.source, "User");
+                let agg = q.aggregation.unwrap();
+                assert_eq!(agg.function, AggFunc::Count);
+                assert!(q.filter.is_some(), "filter should have been parsed");
+            }
+            _ => panic!("expected query with aggregation"),
+        }
+    }
+
+    #[test]
+    fn test_parse_count_with_filter_and_limit() {
+        let stmt = parse("count(User filter .age > 30 limit 100)").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                assert_eq!(q.source, "User");
+                assert!(q.filter.is_some());
+                assert!(q.limit.is_some());
+                assert_eq!(q.aggregation.unwrap().function, AggFunc::Count);
             }
             _ => panic!("expected query with aggregation"),
         }
