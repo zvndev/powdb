@@ -1,6 +1,7 @@
 use crate::disk::DiskManager;
 use crate::page::{Page, PageType, PAGE_SIZE, iter_page_slots};
 use crate::types::RowId;
+use rustc_hash::FxHashMap;
 use std::io;
 use std::path::Path;
 
@@ -24,8 +25,18 @@ struct HotPage {
 /// Tracks which pages have free space for fast insertion.
 pub struct HeapFile {
     disk: DiskManager,
-    /// Pages with known free space.
+    /// Pages with known free space. Iteration order matters for the
+    /// `insert` fallback path, so this is a `Vec`. Membership is tracked
+    /// in `in_free_list` for O(1) `contains` checks.
     pages_with_space: Vec<u32>,
+    /// Mission C Phase 8: sidecar bitmap parallel to `pages_with_space`
+    /// that answers "is page N already on the free-space list?" in O(1).
+    /// Indexed by page_id. Previously `delete` did a linear `contains`
+    /// over `pages_with_space` on every call — for a scattered delete
+    /// that walks every page, that's quadratic in the number of pages
+    /// with free space and shows up as a ~30% overhead on
+    /// `delete_by_filter`.
+    in_free_list: Vec<bool>,
     /// Optional mmap for zero-syscall reads. Activated by `enable_mmap()`.
     mmap_ptr: Option<(*const u8, usize)>,
     /// Mission C Phase 1: write-back cache for the most recently touched
@@ -33,6 +44,17 @@ pub struct HeapFile {
     /// hit disk when a different page is accessed, a scan runs, or the
     /// heap is dropped. Invariant: at most one dirty page lives in memory.
     hot_page: Option<HotPage>,
+    /// Mission C Phase 9: deferred-write buffer for pages that were
+    /// previously hot, got mutated, and have since been evicted from the
+    /// `hot_page` slot. The previous design synchronously wrote the old
+    /// hot page to disk on every page transition — for a scattered
+    /// `delete_by_filter` that walks ~2000 pages, that's ~2000
+    /// `write_page` syscalls on the critical path. Now the evicted dirty
+    /// page gets parked here in memory, reclaimed on the next access to
+    /// the same page, and only persisted via an explicit
+    /// [`flush_all_dirty`] call (or `Drop`). Scan operations call
+    /// `flush_all_dirty` first so their view is consistent with disk.
+    dirty_buffer: FxHashMap<u32, Page>,
 }
 
 impl HeapFile {
@@ -41,19 +63,24 @@ impl HeapFile {
         Ok(HeapFile {
             disk,
             pages_with_space: Vec::new(),
+            in_free_list: Vec::new(),
             mmap_ptr: None,
             hot_page: None,
+            dirty_buffer: FxHashMap::default(),
         })
     }
 
     pub fn open(path: &Path) -> io::Result<Self> {
         let disk = DiskManager::open(path)?;
+        let num_pages = disk.num_pages();
         let mut pages_with_space = Vec::new();
-        for i in 0..disk.num_pages() {
+        let mut in_free_list = vec![false; num_pages as usize];
+        for i in 0..num_pages {
             if let Ok(buf) = disk.read_page(i) {
                 if let Some(page) = Page::from_bytes(&buf) {
                     if page.free_space() > 64 {
                         pages_with_space.push(i);
+                        in_free_list[i as usize] = true;
                     }
                 }
             }
@@ -61,33 +88,105 @@ impl HeapFile {
         Ok(HeapFile {
             disk,
             pages_with_space,
+            in_free_list,
             mmap_ptr: None,
             hot_page: None,
+            dirty_buffer: FxHashMap::default(),
         })
     }
 
-    /// Flush the pinned hot page to disk if it's dirty, then drop it. A
-    /// scan or a cross-page access must call this first so readers see a
-    /// consistent view. Called implicitly by `enable_mmap`, `for_each_row`,
-    /// `try_for_each_row`, and `Drop`.
-    pub fn flush_hot_page(&mut self) -> io::Result<()> {
+    /// O(1) check: is `page_id` currently on the free-space list?
+    #[inline]
+    fn is_in_free_list(&self, page_id: u32) -> bool {
+        self.in_free_list
+            .get(page_id as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Mark `page_id` as no-longer-free in the sidecar bitmap. Caller is
+    /// responsible for removing it from `pages_with_space`.
+    #[inline]
+    fn mark_not_free(&mut self, page_id: u32) {
+        if let Some(slot) = self.in_free_list.get_mut(page_id as usize) {
+            *slot = false;
+        }
+    }
+
+    /// Mark `page_id` as free in the sidecar bitmap, growing the vec if
+    /// the id is beyond current capacity. Caller is responsible for
+    /// pushing it onto `pages_with_space`.
+    #[inline]
+    fn mark_free(&mut self, page_id: u32) {
+        let idx = page_id as usize;
+        if idx >= self.in_free_list.len() {
+            self.in_free_list.resize(idx + 1, false);
+        }
+        self.in_free_list[idx] = true;
+    }
+
+    /// Park the pinned hot page into the deferred-write buffer (or drop
+    /// it if clean). Does not write to disk. Use [`flush_all_dirty`]
+    /// to persist every buffered page.
+    ///
+    /// Mission C Phase 9: this was previously a write-through. Now the
+    /// only callers that actually touch disk are `flush_all_dirty`,
+    /// `enable_mmap`, and `Drop`.
+    fn park_hot_page(&mut self) {
         if let Some(hot) = self.hot_page.take() {
             if hot.dirty {
+                self.dirty_buffer.insert(hot.page_id, hot.page);
+            }
+        }
+    }
+
+    /// Public API kept for compatibility: park the hot page AND flush
+    /// every buffered dirty page to disk. Callers that need an on-disk
+    /// consistent view (scans, mmap rebuilds) use this.
+    pub fn flush_hot_page(&mut self) -> io::Result<()> {
+        self.flush_all_dirty()
+    }
+
+    /// Write every buffered dirty page to disk, including the current
+    /// hot page if dirty. Clears the buffer. Called by scans,
+    /// `enable_mmap`, explicit flush requests, and `Drop`.
+    pub fn flush_all_dirty(&mut self) -> io::Result<()> {
+        if let Some(hot) = self.hot_page.as_mut() {
+            if hot.dirty {
                 self.disk.write_page(hot.page_id, hot.page.as_bytes())?;
+                hot.dirty = false;
+            }
+        }
+        if !self.dirty_buffer.is_empty() {
+            // Drain via a swap to avoid borrowing `self` twice.
+            let drained: Vec<(u32, Page)> = self.dirty_buffer.drain().collect();
+            for (page_id, page) in drained {
+                self.disk.write_page(page_id, page.as_bytes())?;
             }
         }
         Ok(())
     }
 
     /// Make `page_id` the hot page. If a different page is currently hot,
-    /// flush it first. If the target is already hot, this is a no-op.
+    /// park it into the deferred-write buffer first. If `page_id` is
+    /// already in the buffer, reclaim it instead of re-reading from disk.
     fn ensure_hot(&mut self, page_id: u32) -> io::Result<()> {
         if let Some(hot) = &self.hot_page {
             if hot.page_id == page_id {
                 return Ok(());
             }
         }
-        self.flush_hot_page()?;
+        self.park_hot_page();
+
+        // Mission C Phase 9: reclaim the page from the dirty buffer if
+        // we've touched it before. This is the hot path for scattered
+        // delete/update workloads — we re-visit the same pages via the
+        // index lookups and don't want to re-read them from disk.
+        if let Some(page) = self.dirty_buffer.remove(&page_id) {
+            self.hot_page = Some(HotPage { page_id, page, dirty: true });
+            return Ok(());
+        }
+
         let buf = self.disk.read_page(page_id)?;
         let page = Page::from_bytes(&buf)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "corrupt page"))?;
@@ -96,9 +195,9 @@ impl HeapFile {
     }
 
     /// Install a freshly-allocated page (no disk read) as the hot page.
-    /// The previous hot page, if any, is flushed first.
+    /// The previous hot page, if any, is parked into the dirty buffer.
     fn install_fresh_hot(&mut self, page_id: u32, page: Page) -> io::Result<()> {
-        self.flush_hot_page()?;
+        self.park_hot_page();
         self.hot_page = Some(HotPage { page_id, page, dirty: true });
         Ok(())
     }
@@ -112,11 +211,11 @@ impl HeapFile {
         if self.mmap_ptr.is_some() {
             return;
         }
-        // Flush any dirty hot page so the mmap sees the same bytes the
-        // reader would expect. Silently swallow errors — we never want
-        // `enable_mmap` to fail the bench harness, and the fall-back is
-        // per-call mmap which is still correct (if slower).
-        let _ = self.flush_hot_page();
+        // Flush every dirty page (hot + buffered) so the mmap sees the
+        // same bytes the reader would expect. Silently swallow errors —
+        // we never want `enable_mmap` to fail the bench harness, and the
+        // fall-back is per-call mmap which is still correct (if slower).
+        let _ = self.flush_all_dirty();
 
         let num_pages = self.disk.num_pages();
         if num_pages == 0 {
@@ -158,6 +257,7 @@ impl HeapFile {
                     if let Some(pos) = self.pages_with_space.iter().position(|p| *p == page_id) {
                         self.pages_with_space.swap_remove(pos);
                     }
+                    self.mark_not_free(page_id);
                 }
                 return Ok(RowId { page_id, slot_index: slot });
             }
@@ -175,6 +275,7 @@ impl HeapFile {
                 hot.dirty = true;
                 if hot.page.free_space() < 64 {
                     self.pages_with_space.swap_remove(idx);
+                    self.mark_not_free(page_id);
                 }
                 return Ok(RowId { page_id, slot_index: slot });
             }
@@ -188,6 +289,7 @@ impl HeapFile {
             .expect("row too large for empty page");
         if page.free_space() >= 64 {
             self.pages_with_space.push(page_id);
+            self.mark_free(page_id);
         }
         self.install_fresh_hot(page_id, page)?;
         Ok(RowId { page_id, slot_index: slot })
@@ -210,6 +312,12 @@ impl HeapFile {
             if hot.page_id == rid.page_id {
                 return hot.page.get(rid.slot_index).map(|d| d.to_vec());
             }
+        }
+
+        // Mission C Phase 9: parked dirty page is also authoritative
+        // over mmap/disk.
+        if let Some(page) = self.dirty_buffer.get(&rid.page_id) {
+            return page.get(rid.slot_index).map(|d| d.to_vec());
         }
 
         // Fast path: mmap — read directly from mapped memory
@@ -249,8 +357,13 @@ impl HeapFile {
         let hot = self.hot_page.as_mut().unwrap();
         hot.page.delete(rid.slot_index);
         hot.dirty = true;
-        if !self.pages_with_space.contains(&rid.page_id) {
+        // Mission C Phase 8: O(1) membership check via sidecar bitmap.
+        // On scattered `delete_by_filter` runs this used to be the single
+        // biggest hot-loop cost — `Vec::contains` grows linearly as pages
+        // get added to the free list.
+        if !self.is_in_free_list(rid.page_id) {
             self.pages_with_space.push(rid.page_id);
+            self.mark_free(rid.page_id);
         }
         Ok(())
     }
@@ -334,6 +447,13 @@ impl HeapFile {
     pub fn scan(&self) -> impl Iterator<Item = (RowId, Vec<u8>)> + '_ {
         let hot_view = self.hot_page.as_ref().map(|hot| (hot.page_id, *hot.page.as_bytes()));
         (0..self.disk.num_pages()).flat_map(move |page_id| {
+            // Mission C Phase 9: parked dirty pages override disk.
+            if let Some(page) = self.dirty_buffer.get(&page_id) {
+                let entries: Vec<_> = page.iter()
+                    .map(|(slot, data)| (RowId { page_id, slot_index: slot }, data.to_vec()))
+                    .collect();
+                return entries.into_iter();
+            }
             let entries: Vec<_> = match &hot_view {
                 Some((hid, hbytes)) if *hid == page_id => {
                     iter_page_slots(hbytes.as_slice())
@@ -394,6 +514,15 @@ impl HeapFile {
             let pages_in_map = len / PAGE_SIZE;
             let limit = num_pages.min(pages_in_map as u32);
             'outer: for page_id in 0..limit {
+                // Mission C Phase 9: dirty buffer > hot page > mmap.
+                if let Some(page) = self.dirty_buffer.get(&page_id) {
+                    for (slot, data) in iter_page_slots(page.as_bytes()) {
+                        if let ControlFlow::Break(()) = f(RowId { page_id, slot_index: slot }, data) {
+                            break 'outer;
+                        }
+                    }
+                    continue;
+                }
                 let page_bytes: &[u8] = match hot_view {
                     Some((hid, hbytes)) if hid == page_id => hbytes.as_slice(),
                     _ => {
@@ -411,9 +540,21 @@ impl HeapFile {
             // enable_mmap. If the hot page lives beyond that window, visit
             // it explicitly so inserts into fresh pages stay observable.
             if let Some((hid, hbytes)) = hot_view {
-                if hid >= limit && hid < num_pages {
+                if hid >= limit && hid < num_pages && !self.dirty_buffer.contains_key(&hid) {
                     for (slot, data) in iter_page_slots(hbytes) {
                         if let ControlFlow::Break(()) = f(RowId { page_id: hid, slot_index: slot }, data) {
+                            return;
+                        }
+                    }
+                }
+            }
+            // Visit any dirty-buffered pages that sit beyond the mmap
+            // window (pages allocated after enable_mmap that we then
+            // evicted from the hot slot).
+            for page_id in limit..num_pages {
+                if let Some(page) = self.dirty_buffer.get(&page_id) {
+                    for (slot, data) in iter_page_slots(page.as_bytes()) {
+                        if let ControlFlow::Break(()) = f(RowId { page_id, slot_index: slot }, data) {
                             return;
                         }
                     }
@@ -440,6 +581,15 @@ impl HeapFile {
         if ptr != libc::MAP_FAILED {
             let mapped = unsafe { std::slice::from_raw_parts(ptr as *const u8, file_len) };
             'outer: for page_id in 0..num_pages {
+                // Mission C Phase 9: dirty buffer has priority.
+                if let Some(page) = self.dirty_buffer.get(&page_id) {
+                    for (slot, data) in iter_page_slots(page.as_bytes()) {
+                        if let ControlFlow::Break(()) = f(RowId { page_id, slot_index: slot }, data) {
+                            break 'outer;
+                        }
+                    }
+                    continue;
+                }
                 let page_bytes: &[u8] = match hot_view {
                     Some((hid, hbytes)) if hid == page_id => hbytes.as_slice(),
                     _ => {
@@ -457,6 +607,14 @@ impl HeapFile {
         } else {
             // Fallback: per-page read.
             'outer: for page_id in 0..num_pages {
+                if let Some(page) = self.dirty_buffer.get(&page_id) {
+                    for (slot, data) in iter_page_slots(page.as_bytes()) {
+                        if let ControlFlow::Break(()) = f(RowId { page_id, slot_index: slot }, data) {
+                            break 'outer;
+                        }
+                    }
+                    continue;
+                }
                 if let Some((hid, hbytes)) = hot_view {
                     if hid == page_id {
                         for (slot, data) in iter_page_slots(hbytes) {
@@ -513,6 +671,12 @@ impl HeapFile {
             let pages_in_map = len / PAGE_SIZE;
             let limit = num_pages.min(pages_in_map as u32);
             for page_id in 0..limit {
+                if let Some(page) = self.dirty_buffer.get(&page_id) {
+                    for (slot, data) in iter_page_slots(page.as_bytes()) {
+                        f(RowId { page_id, slot_index: slot }, data);
+                    }
+                    continue;
+                }
                 let page_bytes: &[u8] = match hot_view {
                     Some((hid, hbytes)) if hid == page_id => hbytes.as_slice(),
                     _ => {
@@ -526,9 +690,16 @@ impl HeapFile {
             }
             // Hot page allocated after enable_mmap — visit it explicitly.
             if let Some((hid, hbytes)) = hot_view {
-                if hid >= limit && hid < num_pages {
+                if hid >= limit && hid < num_pages && !self.dirty_buffer.contains_key(&hid) {
                     for (slot, data) in iter_page_slots(hbytes) {
                         f(RowId { page_id: hid, slot_index: slot }, data);
+                    }
+                }
+            }
+            for page_id in limit..num_pages {
+                if let Some(page) = self.dirty_buffer.get(&page_id) {
+                    for (slot, data) in iter_page_slots(page.as_bytes()) {
+                        f(RowId { page_id, slot_index: slot }, data);
                     }
                 }
             }
@@ -553,6 +724,12 @@ impl HeapFile {
         if ptr != libc::MAP_FAILED {
             let mapped = unsafe { std::slice::from_raw_parts(ptr as *const u8, file_len) };
             for page_id in 0..num_pages {
+                if let Some(page) = self.dirty_buffer.get(&page_id) {
+                    for (slot, data) in iter_page_slots(page.as_bytes()) {
+                        f(RowId { page_id, slot_index: slot }, data);
+                    }
+                    continue;
+                }
                 let page_bytes: &[u8] = match hot_view {
                     Some((hid, hbytes)) if hid == page_id => hbytes.as_slice(),
                     _ => {
@@ -568,6 +745,12 @@ impl HeapFile {
         } else {
             // Fallback: per-page read
             for page_id in 0..num_pages {
+                if let Some(page) = self.dirty_buffer.get(&page_id) {
+                    for (slot, data) in iter_page_slots(page.as_bytes()) {
+                        f(RowId { page_id, slot_index: slot }, data);
+                    }
+                    continue;
+                }
                 if let Some((hid, hbytes)) = hot_view {
                     if hid == page_id {
                         for (slot, data) in iter_page_slots(hbytes) {
@@ -600,10 +783,11 @@ impl HeapFile {
 
 impl Drop for HeapFile {
     fn drop(&mut self) {
-        // Mission C Phase 1: persist the hot page before the file handle
-        // goes away. Without this, the final write-back of a bench's last
-        // batch would be lost on close.
-        let _ = self.flush_hot_page();
+        // Mission C Phase 1 / Phase 9: persist the hot page AND every
+        // parked dirty page before the file handle goes away. Without
+        // this, the final write-back of a bench's last batch (and of
+        // any deferred-flush mutations) would be lost on close.
+        let _ = self.flush_all_dirty();
         if let Some((ptr, len)) = self.mmap_ptr.take() {
             unsafe { libc::munmap(ptr as *mut libc::c_void, len); }
         }
