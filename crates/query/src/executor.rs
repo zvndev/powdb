@@ -247,6 +247,37 @@ impl Engine {
                     }
                 }
 
+                // Mission D4: Project(Filter(SeqScan)) without Limit. Reuses
+                // `project_filter_limit_fast` with limit = usize::MAX so the
+                // hot loop decodes only projected columns and uses the
+                // compiled predicate. Previously this fell through to the
+                // generic Filter branch which materialised every column via
+                // `decode_row` then re-projected — quadratic work.
+                //
+                // multi_col_and_filter (`U filter .age > 30 and .status =
+                // "active" { .name, .age }`) was 6.18ms (0.7x SQLite) and
+                // is the load-bearing workload for this fast path.
+                if let PlanNode::Filter { input: fi, predicate } = input.as_ref() {
+                    if let PlanNode::SeqScan { table } = fi.as_ref() {
+                        if let Some(result) = self.project_filter_limit_fast(
+                            table, fields, usize::MAX, Some(predicate),
+                        )? {
+                            return Ok(result);
+                        }
+                    }
+                }
+
+                // Mission D4: Project(SeqScan) without Filter or Limit.
+                // Decode only projected columns; the previous fall-through
+                // built full Vec<Value> rows then re-projected.
+                if let PlanNode::SeqScan { table } = input.as_ref() {
+                    if let Some(result) = self.project_filter_limit_fast(
+                        table, fields, usize::MAX, None,
+                    )? {
+                        return Ok(result);
+                    }
+                }
+
                 let result = self.execute_plan(input)?;
                 match result {
                     QueryResult::Rows { columns, rows } => {
@@ -1098,32 +1129,150 @@ impl FastLayout {
 type CompiledPredicate = Box<dyn Fn(&[u8]) -> bool>;
 type IntReader = Box<dyn Fn(&[u8]) -> Option<i64>>;
 
+/// A single flattened predicate leaf — pure data, no closures, no allocation
+/// per call. Mission D3: replaces recursive Box<dyn Fn> conjunctions with a
+/// `Vec<CompiledLeaf>` so the inner scan loop becomes a tight match instead
+/// of N+1 vtable indirect calls per row.
+enum CompiledLeaf {
+    /// `.field <op> literal_int` (or reversed)
+    Int {
+        data_offset: usize,
+        bitmap_byte: usize,
+        bitmap_bit: u8,
+        op: BinOp,
+        literal: i64,
+    },
+    /// `.field = string_literal` or `.field != string_literal`
+    StrEq {
+        var_offset_table_start: usize,
+        var_data_start: usize,
+        var_idx: usize,
+        bitmap_byte: usize,
+        bitmap_bit: u8,
+        negate: bool,
+        needle: Vec<u8>,
+    },
+}
+
+impl CompiledLeaf {
+    /// Evaluate this leaf against a row's raw bytes. `#[inline]` so the
+    /// match folds into the caller's tight loop with LTO.
+    #[inline]
+    fn eval(&self, data: &[u8]) -> bool {
+        match self {
+            CompiledLeaf::Int {
+                data_offset,
+                bitmap_byte,
+                bitmap_bit,
+                op,
+                literal,
+            } => {
+                let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
+                if is_null {
+                    return false;
+                }
+                let val = i64::from_le_bytes(
+                    data[*data_offset..*data_offset + 8].try_into().unwrap(),
+                );
+                match op {
+                    BinOp::Eq => val == *literal,
+                    BinOp::Neq => val != *literal,
+                    BinOp::Lt => val < *literal,
+                    BinOp::Gt => val > *literal,
+                    BinOp::Lte => val <= *literal,
+                    BinOp::Gte => val >= *literal,
+                    _ => false,
+                }
+            }
+            CompiledLeaf::StrEq {
+                var_offset_table_start,
+                var_data_start,
+                var_idx,
+                bitmap_byte,
+                bitmap_bit,
+                negate,
+                needle,
+            } => {
+                let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
+                if is_null {
+                    return false;
+                }
+                let off_pos = var_offset_table_start + var_idx * 2;
+                let next_pos = var_offset_table_start + (var_idx + 1) * 2;
+                let start = u16::from_le_bytes(data[off_pos..off_pos + 2].try_into().unwrap()) as usize;
+                let end = u16::from_le_bytes(data[next_pos..next_pos + 2].try_into().unwrap()) as usize;
+                let slice = &data[var_data_start + start..var_data_start + end];
+                let eq = slice == needle.as_slice();
+                if *negate { !eq } else { eq }
+            }
+        }
+    }
+}
+
 /// Attempt to compile a predicate expression into a closure over raw row
 /// bytes. Returns None if the predicate contains shapes we don't handle
 /// (arithmetic, Or, Coalesce, non-literal comparands, etc.). Supported:
 ///   - `.field <op> literal_int` and its reversed form
 ///   - `.field = string_literal` / `string_literal = .field`
 ///   - `And` conjunctions of any number of the above
+///
+/// Mission D3: AND chains are flattened into a single `Vec<CompiledLeaf>`
+/// closed over by ONE outer closure. The previous implementation built a
+/// recursive `Box<Fn>` per AND combinator, costing N+1 indirect vtable
+/// calls per row for an N-leaf conjunction. The flat version dispatches
+/// each leaf via match (predictable branch, fully inlinable with LTO),
+/// short-circuiting on the first failing leaf.
 fn compile_predicate(
     expr: &Expr,
     columns: &[String],
     layout: &FastLayout,
     schema: &Schema,
 ) -> Option<CompiledPredicate> {
+    let mut leaves: Vec<CompiledLeaf> = Vec::new();
+    flatten_and_compile(expr, columns, layout, schema, &mut leaves)?;
+    if leaves.is_empty() {
+        return None;
+    }
+    if leaves.len() == 1 {
+        // Single-leaf fast path: skip the Vec iteration entirely.
+        let leaf = leaves.into_iter().next().unwrap();
+        return Some(Box::new(move |data: &[u8]| leaf.eval(data)));
+    }
+    Some(Box::new(move |data: &[u8]| {
+        // Tight short-circuit AND loop. With CompiledLeaf::eval marked
+        // #[inline], LTO can fold the match arms into this loop body.
+        for leaf in &leaves {
+            if !leaf.eval(data) {
+                return false;
+            }
+        }
+        true
+    }))
+}
+
+/// Recursively walk an AND chain and push each leaf into `out`. Returns
+/// `None` if any sub-expression isn't a supported leaf shape.
+fn flatten_and_compile(
+    expr: &Expr,
+    columns: &[String],
+    layout: &FastLayout,
+    schema: &Schema,
+    out: &mut Vec<CompiledLeaf>,
+) -> Option<()> {
     match expr {
         Expr::BinaryOp(left, BinOp::And, right) => {
-            let l = compile_predicate(left, columns, layout, schema)?;
-            let r = compile_predicate(right, columns, layout, schema)?;
-            Some(Box::new(move |data| l(data) && r(data)))
+            flatten_and_compile(left, columns, layout, schema, out)?;
+            flatten_and_compile(right, columns, layout, schema, out)?;
+            Some(())
         }
         Expr::BinaryOp(left, op, right) => {
-            // Try int-leaf first
-            if let Some(c) = compile_int_leaf(left, *op, right, columns, layout) {
-                return Some(c);
+            if let Some(leaf) = build_int_leaf(left, *op, right, columns, layout) {
+                out.push(leaf);
+                return Some(());
             }
-            // Then try string-eq leaf
-            if let Some(c) = compile_str_eq_leaf(left, *op, right, columns, layout, schema) {
-                return Some(c);
+            if let Some(leaf) = build_str_eq_leaf(left, *op, right, columns, layout, schema) {
+                out.push(leaf);
+                return Some(());
             }
             None
         }
@@ -1131,14 +1280,14 @@ fn compile_predicate(
     }
 }
 
-/// Compile `.field <op> literal_int` (or reversed) into a closure.
-fn compile_int_leaf(
+/// Build an `Int` leaf from `.field <op> literal_int` (or reversed).
+fn build_int_leaf(
     left: &Expr,
     op: BinOp,
     right: &Expr,
     columns: &[String],
     layout: &FastLayout,
-) -> Option<CompiledPredicate> {
+) -> Option<CompiledLeaf> {
     let (field_name, literal_val, op) = match (left, right) {
         (Expr::Field(name), Expr::Literal(Literal::Int(v))) => (name, *v, op),
         (Expr::Literal(Literal::Int(v)), Expr::Field(name)) => {
@@ -1155,42 +1304,29 @@ fn compile_int_leaf(
     };
 
     let col_idx = columns.iter().position(|c| c == field_name)?;
-    let byte_offset = layout.fixed_offsets[col_idx]?; // must be fixed-size
+    let byte_offset = layout.fixed_offsets[col_idx]?;
     let bitmap_byte = col_idx / 8;
-    let bitmap_bit = col_idx % 8;
+    let bitmap_bit = (col_idx % 8) as u8;
     let data_offset = 2 + layout.bitmap_size + byte_offset;
 
-    Some(Box::new(move |data: &[u8]| {
-        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
-        if is_null {
-            return false;
-        }
-        let val = i64::from_le_bytes(
-            data[data_offset..data_offset + 8].try_into().unwrap(),
-        );
-        match op {
-            BinOp::Eq => val == literal_val,
-            BinOp::Neq => val != literal_val,
-            BinOp::Lt => val < literal_val,
-            BinOp::Gt => val > literal_val,
-            BinOp::Lte => val <= literal_val,
-            BinOp::Gte => val >= literal_val,
-            _ => false,
-        }
-    }))
+    Some(CompiledLeaf::Int {
+        data_offset,
+        bitmap_byte,
+        bitmap_bit,
+        op,
+        literal: literal_val,
+    })
 }
 
-/// Compile `.field = string_literal` (or reversed) into a closure that
-/// compares raw UTF-8 bytes directly from the var-data region — no
-/// allocation, no UTF-8 validation.
-fn compile_str_eq_leaf(
+/// Build a `StrEq` leaf from `.field = string_literal` (or reversed).
+fn build_str_eq_leaf(
     left: &Expr,
     op: BinOp,
     right: &Expr,
     columns: &[String],
     layout: &FastLayout,
     schema: &Schema,
-) -> Option<CompiledPredicate> {
+) -> Option<CompiledLeaf> {
     if op != BinOp::Eq && op != BinOp::Neq {
         return None;
     }
@@ -1201,7 +1337,6 @@ fn compile_str_eq_leaf(
     };
 
     let col_idx = columns.iter().position(|c| c == field_name)?;
-    // Must be a Str column
     if schema.columns[col_idx].type_id != TypeId::Str {
         return None;
     }
@@ -1209,23 +1344,18 @@ fn compile_str_eq_leaf(
     let var_offset_table_start = layout.var_offset_table_start();
     let var_data_start = layout.var_data_start();
     let bitmap_byte = col_idx / 8;
-    let bitmap_bit = col_idx % 8;
+    let bitmap_bit = (col_idx % 8) as u8;
     let negate = op == BinOp::Neq;
-    let needle = literal_str.into_bytes();
 
-    Some(Box::new(move |data: &[u8]| {
-        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
-        if is_null {
-            return false;
-        }
-        let off_pos = var_offset_table_start + var_idx * 2;
-        let next_pos = var_offset_table_start + (var_idx + 1) * 2;
-        let start = u16::from_le_bytes(data[off_pos..off_pos + 2].try_into().unwrap()) as usize;
-        let end = u16::from_le_bytes(data[next_pos..next_pos + 2].try_into().unwrap()) as usize;
-        let slice = &data[var_data_start + start..var_data_start + end];
-        let eq = slice == needle.as_slice();
-        if negate { !eq } else { eq }
-    }))
+    Some(CompiledLeaf::StrEq {
+        var_offset_table_start,
+        var_data_start,
+        var_idx,
+        bitmap_byte,
+        bitmap_bit,
+        negate,
+        needle: literal_str.into_bytes(),
+    })
 }
 
 /// Build a closure that reads the value of a single fixed-size int column
