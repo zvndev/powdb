@@ -555,6 +555,11 @@ impl Engine {
                     })
                     .collect::<Result<_, _>>()?;
 
+                // Mission C Phase 2: the hint Table::update_hinted needs to
+                // decide whether to read the old row for index diff.
+                let changed_cols: Vec<usize> =
+                    resolved_assignments.iter().map(|(i, _)| *i).collect();
+
                 // Collect matching RowIds in a single pass (fixes the old
                 // O(N*M) value-equality join against a materialised row set).
                 let matching_rids = self.collect_rids_for_mutation(input, table, &schema)?;
@@ -568,7 +573,9 @@ impl Engine {
                     for (idx, val) in &resolved_assignments {
                         row[*idx] = val.clone();
                     }
-                    self.catalog.update(table, rid, &row).map_err(|e| e.to_string())?;
+                    self.catalog
+                        .update_hinted(table, rid, &row, Some(&changed_cols))
+                        .map_err(|e| e.to_string())?;
                     count += 1;
                 }
                 Ok(QueryResult::Modified(count))

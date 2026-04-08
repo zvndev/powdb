@@ -7,82 +7,134 @@ use crate::types::*;
 /// Fixed columns are written in schema order, with placeholder zeros for Empty values.
 /// Variable columns use an offset table (n_var + 1 entries) pointing into var data.
 /// Overhead: 2 bytes (length) + ceil(n_cols/8) bytes (bitmap).
+///
+/// Mission C Phase 2: kept as a thin wrapper around [`encode_row_into`] so
+/// existing tests continue to work. Hot callers (bench insert/update loops)
+/// should go through `encode_row_into` and reuse the output buffer.
 pub fn encode_row(schema: &Schema, values: &[Value]) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_row_into(schema, values, &mut out);
+    out
+}
+
+/// Encode a row into a caller-provided scratch buffer.
+///
+/// Mission C Phase 2: the previous `encode_row` allocated 5-6 temporary Vecs
+/// per call (null bitmap, fixed buf, var indices, var data, var offsets,
+/// final buf). On the `update_by_filter` bench that fired ~50K times. The
+/// rewrite below walks the schema twice and writes straight into `out`,
+/// reusing the buffer's backing store between calls.
+///
+/// Contract:
+/// - `out` is cleared and filled with exactly the encoded row bytes.
+/// - No allocations happen if `out.capacity()` is already large enough
+///   (the common case after the first insert of a given shape).
+pub fn encode_row_into(schema: &Schema, values: &[Value], out: &mut Vec<u8>) {
     debug_assert_eq!(values.len(), schema.columns.len());
+
+    out.clear();
 
     let n_cols = schema.columns.len();
     let bitmap_size = (n_cols + 7) / 8;
 
-    // Build null bitmap: bit=1 means empty
-    let mut null_bitmap = vec![0u8; bitmap_size];
-    for (i, val) in values.iter().enumerate() {
-        if val.is_empty() {
-            null_bitmap[i / 8] |= 1 << (i % 8);
+    // First pass: compute sizes so we can reserve once and avoid any
+    // intermediate growth. The pass walks the same value slice twice, but
+    // the second pass writes without branching on capacity.
+    let mut fixed_region_size = 0usize;
+    let mut n_var = 0usize;
+    let mut var_data_size = 0usize;
+    for (i, col) in schema.columns.iter().enumerate() {
+        if is_fixed_size(col.type_id) {
+            fixed_region_size += fixed_size(col.type_id).unwrap();
+        } else {
+            n_var += 1;
+            if !values[i].is_empty() {
+                match &values[i] {
+                    Value::Str(s) => var_data_size += s.len(),
+                    Value::Bytes(b) => var_data_size += b.len(),
+                    _ => {}
+                }
+            }
         }
     }
 
-    // Encode fixed-size columns in schema order
-    let mut fixed_buf = Vec::new();
+    let n_offsets = n_var + 1;
+    let body_size = bitmap_size + fixed_region_size + n_offsets * 2 + var_data_size;
+    let total_size = 2 + body_size;
+
+    out.reserve(total_size);
+
+    // Length prefix — placeholder that we'll fill in after writing. The
+    // total is already known, so just write it directly.
+    out.extend_from_slice(&(total_size as u16).to_le_bytes());
+
+    // Null bitmap — write byte at a time.
+    let bitmap_start = out.len();
+    out.resize(bitmap_start + bitmap_size, 0);
+    for (i, val) in values.iter().enumerate() {
+        if val.is_empty() {
+            out[bitmap_start + i / 8] |= 1 << (i % 8);
+        }
+    }
+
+    // Fixed columns packed in schema order.
     for (i, col) in schema.columns.iter().enumerate() {
         if !is_fixed_size(col.type_id) {
             continue;
         }
+        let sz = fixed_size(col.type_id).unwrap();
         if values[i].is_empty() {
-            // Write zeros as placeholder so offsets stay predictable
-            if let Some(sz) = fixed_size(col.type_id) {
-                fixed_buf.extend_from_slice(&vec![0u8; sz]);
-            }
+            // Placeholder zeros so offsets stay predictable.
+            out.resize(out.len() + sz, 0);
         } else {
             match &values[i] {
-                Value::Int(v)      => fixed_buf.extend_from_slice(&v.to_le_bytes()),
-                Value::Float(v)    => fixed_buf.extend_from_slice(&v.to_le_bytes()),
-                Value::Bool(v)     => fixed_buf.push(if *v { 1 } else { 0 }),
-                Value::DateTime(v) => fixed_buf.extend_from_slice(&v.to_le_bytes()),
-                Value::Uuid(v)     => fixed_buf.extend_from_slice(v),
+                Value::Int(v)      => out.extend_from_slice(&v.to_le_bytes()),
+                Value::Float(v)    => out.extend_from_slice(&v.to_le_bytes()),
+                Value::Bool(v)     => out.push(if *v { 1 } else { 0 }),
+                Value::DateTime(v) => out.extend_from_slice(&v.to_le_bytes()),
+                Value::Uuid(v)     => out.extend_from_slice(v),
                 _ => unreachable!("fixed column with non-fixed value"),
             }
         }
     }
 
-    // Collect variable-length columns
-    let var_col_indices: Vec<usize> = schema.columns.iter().enumerate()
-        .filter(|(_, c)| !is_fixed_size(c.type_id))
-        .map(|(i, _)| i)
-        .collect();
+    // Variable-column offset table. Compute as we go.
+    let offsets_start = out.len();
+    out.resize(offsets_start + n_offsets * 2, 0);
 
-    let mut var_data = Vec::new();
-    let mut var_offsets: Vec<u16> = Vec::with_capacity(var_col_indices.len() + 1);
+    let mut var_cursor: u16 = 0;
+    let mut off_slot = 0usize;
+    for (i, col) in schema.columns.iter().enumerate() {
+        if is_fixed_size(col.type_id) {
+            continue;
+        }
+        let pos = offsets_start + off_slot * 2;
+        out[pos..pos + 2].copy_from_slice(&var_cursor.to_le_bytes());
+        off_slot += 1;
+        match &values[i] {
+            Value::Str(s) => var_cursor += s.len() as u16,
+            Value::Bytes(b) => var_cursor += b.len() as u16,
+            _ => {}
+        }
+    }
+    // End sentinel.
+    let end_pos = offsets_start + off_slot * 2;
+    out[end_pos..end_pos + 2].copy_from_slice(&var_cursor.to_le_bytes());
 
-    for &ci in &var_col_indices {
-        var_offsets.push(var_data.len() as u16);
-        match &values[ci] {
-            Value::Str(s) => var_data.extend_from_slice(s.as_bytes()),
-            Value::Bytes(b) => var_data.extend_from_slice(b),
-            Value::Empty => {} // zero-length entry
+    // Variable-column data.
+    for (i, col) in schema.columns.iter().enumerate() {
+        if is_fixed_size(col.type_id) {
+            continue;
+        }
+        match &values[i] {
+            Value::Str(s) => out.extend_from_slice(s.as_bytes()),
+            Value::Bytes(b) => out.extend_from_slice(b),
+            Value::Empty => {} // zero-length
             _ => unreachable!("variable column with non-variable value"),
         }
     }
-    // End sentinel so we can compute lengths
-    var_offsets.push(var_data.len() as u16);
 
-    // Assemble
-    let body_size = bitmap_size
-        + fixed_buf.len()
-        + var_offsets.len() * 2
-        + var_data.len();
-    let total_size = 2 + body_size; // 2B length prefix
-
-    let mut buf = Vec::with_capacity(total_size);
-    buf.extend_from_slice(&(total_size as u16).to_le_bytes());
-    buf.extend_from_slice(&null_bitmap);
-    buf.extend_from_slice(&fixed_buf);
-    for off in &var_offsets {
-        buf.extend_from_slice(&off.to_le_bytes());
-    }
-    buf.extend_from_slice(&var_data);
-
-    debug_assert_eq!(buf.len(), total_size);
-    buf
+    debug_assert_eq!(out.len(), total_size);
 }
 
 /// Precomputed layout information for fast selective column decoding.

@@ -106,6 +106,21 @@ impl Catalog {
         t.update(rid, values)
     }
 
+    /// Mission C Phase 2: update with a hint about which columns actually
+    /// changed. Lets [`Table::update_hinted`] skip the old-row read when
+    /// the hint shows no indexed column is in the changed set.
+    pub fn update_hinted(
+        &mut self,
+        table: &str,
+        rid: RowId,
+        values: &Row,
+        changed_col_indices: Option<&[usize]>,
+    ) -> io::Result<RowId> {
+        let t = self.tables.get_mut(table)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
+        t.update_hinted(rid, values, changed_col_indices)
+    }
+
     pub fn scan(&self, table: &str) -> io::Result<impl Iterator<Item = (RowId, Row)> + '_> {
         let t = self.tables.get(table)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;

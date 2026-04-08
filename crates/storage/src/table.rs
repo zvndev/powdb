@@ -1,6 +1,6 @@
 use crate::btree::BTree;
 use crate::heap::HeapFile;
-use crate::row::{encode_row, decode_row};
+use crate::row::{encode_row_into, decode_row};
 use crate::types::*;
 use rustc_hash::FxHashMap;
 use std::io;
@@ -11,17 +11,33 @@ use std::path::Path;
 /// Mission F: indexes use FxHashMap. Per-row index lookup happens inside
 /// every insert/delete/update — even one HashMap probe per row matters at
 /// 200ns/op tier.
+///
+/// Mission C Phase 2: holds `encode_scratch`, a reusable buffer for
+/// [`crate::row::encode_row_into`]. Bench loops that push thousands of
+/// rows through `insert`/`update` reuse the same allocation across calls,
+/// cutting the allocator traffic to ~zero after the first row.
 pub struct Table {
     pub schema: Schema,
     pub heap: HeapFile,
     pub indexes: FxHashMap<String, BTree>, // column_name -> index
+    /// Reusable scratch buffer for row encoding. Cleared on every call.
+    encode_scratch: Vec<u8>,
+    /// Precomputed set of schema column indices that have an index. Kept
+    /// in sync with `indexes` — updated by `create_index`.
+    indexed_col_indices: Vec<usize>,
 }
 
 impl Table {
     pub fn create(schema: Schema, data_dir: &Path) -> io::Result<Self> {
         let heap_path = data_dir.join(format!("{}.heap", schema.table_name));
         let heap = HeapFile::create(&heap_path)?;
-        Ok(Table { schema, heap, indexes: FxHashMap::default() })
+        Ok(Table {
+            schema,
+            heap,
+            indexes: FxHashMap::default(),
+            encode_scratch: Vec::new(),
+            indexed_col_indices: Vec::new(),
+        })
     }
 
     /// Reopen an existing table from disk. Caller supplies the schema (loaded
@@ -30,12 +46,18 @@ impl Table {
     pub fn open(schema: Schema, data_dir: &Path) -> io::Result<Self> {
         let heap_path = data_dir.join(format!("{}.heap", schema.table_name));
         let heap = HeapFile::open(&heap_path)?;
-        Ok(Table { schema, heap, indexes: FxHashMap::default() })
+        Ok(Table {
+            schema,
+            heap,
+            indexes: FxHashMap::default(),
+            encode_scratch: Vec::new(),
+            indexed_col_indices: Vec::new(),
+        })
     }
 
     pub fn insert(&mut self, values: &Row) -> io::Result<RowId> {
-        let encoded = encode_row(&self.schema, values);
-        let rid = self.heap.insert(&encoded)?;
+        encode_row_into(&self.schema, values, &mut self.encode_scratch);
+        let rid = self.heap.insert(&self.encode_scratch)?;
 
         // Update all indexes
         for (col_name, btree) in &mut self.indexes {
@@ -83,28 +105,51 @@ impl Table {
     /// (a) prefer `heap.update` which tries in-place first and (b) only
     /// touch indexes whose value actually changed.
     pub fn update(&mut self, rid: RowId, values: &Row) -> io::Result<RowId> {
-        // Read the old row once so we can both check which indexed columns
-        // changed AND avoid touching indexes for unchanged columns.
-        let old_row = self.get(rid);
+        self.update_hinted(rid, values, None)
+    }
 
-        let encoded = encode_row(&self.schema, values);
-        let new_rid = self.heap.update(rid, &encoded)?;
+    /// Same as `update`, but the caller can supply the set of column
+    /// indices that actually changed. If supplied, the old-row read is
+    /// skipped entirely when none of the changed columns is indexed.
+    ///
+    /// Mission C Phase 2: `update_by_filter` hits this path ~50K times with
+    /// a single-column assignment (status) on a table whose only index is
+    /// on `id`. The old code called `self.get(rid)` unconditionally — a
+    /// heap read + full decode every time — even though the result was
+    /// always thrown away for non-indexed updates. Skipping that read is
+    /// worth ~300ns/row, or ~15ms on a 50K-row update_by_filter.
+    pub fn update_hinted(
+        &mut self,
+        rid: RowId,
+        values: &Row,
+        changed_col_indices: Option<&[usize]>,
+    ) -> io::Result<RowId> {
+        let touches_index = if self.indexes.is_empty() {
+            false
+        } else if let Some(changed) = changed_col_indices {
+            self.indexed_col_indices
+                .iter()
+                .any(|i| changed.contains(i))
+        } else {
+            // No hint — fall back to the safe path that reads the old row.
+            true
+        };
 
-        // Index maintenance — only re-key columns whose value differs.
-        // For the common "update one non-indexed column" case this is a
-        // no-op walk over a tiny FxHashMap.
-        if !self.indexes.is_empty() {
+        let old_row = if touches_index { self.get(rid) } else { None };
+
+        encode_row_into(&self.schema, values, &mut self.encode_scratch);
+        let new_rid = self.heap.update(rid, &self.encode_scratch)?;
+
+        if touches_index {
             for (col_name, btree) in &mut self.indexes {
                 let Some(idx) = self.schema.column_index(col_name) else { continue };
                 let new_val = &values[idx];
                 let old_val_opt = old_row.as_ref().map(|r| &r[idx]);
 
-                // Skip if column didn't change AND row didn't move.
                 if let Some(old_val) = old_val_opt {
                     if old_val == new_val && new_rid == rid {
                         continue;
                     }
-                    // Remove old entry — even if rid is unchanged, the key may differ.
                     if !old_val.is_empty() {
                         btree.delete(old_val);
                     }
@@ -163,6 +208,12 @@ impl Table {
         }
 
         self.indexes.insert(col_name.to_string(), btree);
+        // Mission C Phase 2: keep the precomputed index-col set in sync so
+        // `update_hinted` can cheaply decide whether an update touches any
+        // indexed column.
+        if !self.indexed_col_indices.contains(&col_idx) {
+            self.indexed_col_indices.push(col_idx);
+        }
         Ok(())
     }
 }
