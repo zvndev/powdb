@@ -171,7 +171,15 @@ impl Engine {
 
                     if tbl.indexes.contains_key(column) {
                         let layout = RowLayout::new(&schema);
-                        let rows = match tbl.indexes.get(column).unwrap().lookup(&key_value) {
+                        // Mission D7: int-specialized lookup skips the
+                        // `<Value as Ord>::cmp` discriminant dispatch on
+                        // int-keyed indexes (the vast majority).
+                        let btree = tbl.indexes.get(column).unwrap();
+                        let lookup_result = match &key_value {
+                            Value::Int(k) => btree.lookup_int(*k),
+                            other => btree.lookup(other),
+                        };
+                        let rows = match lookup_result {
                             Some(rid) => {
                                 match tbl.heap.get(rid) {
                                     Some(data) => {
@@ -547,9 +555,22 @@ impl Engine {
                 // Fast path: the table has a B-tree on this column. A single
                 // point lookup returns 0 or 1 rows — this is the whole reason
                 // the planner bothers emitting IndexScan.
-                if tbl.indexes.contains_key(column) {
-                    let rows = match tbl.index_lookup(column, &key_value) {
-                        Some((_, row)) => vec![row],
+                //
+                // Mission D7: use `lookup_int` on int-keyed indexes to skip
+                // the Value enum dispatch in the inner binary search. The
+                // generic `tbl.index_lookup` helper can't do this without
+                // lying about the key type, so we inline the index+heap
+                // touch here.
+                if let Some(btree) = tbl.indexes.get(column) {
+                    let hit = match &key_value {
+                        Value::Int(k) => btree.lookup_int(*k),
+                        other => btree.lookup(other),
+                    };
+                    let rows = match hit {
+                        Some(rid) => match tbl.heap.get(rid) {
+                            Some(data) => vec![decode_row(&tbl.schema, &data)],
+                            None => Vec::new(),
+                        },
                         None => Vec::new(),
                     };
                     return Ok(QueryResult::Rows { columns, rows });
@@ -904,8 +925,15 @@ impl Engine {
                     .ok_or_else(|| format!("table '{table}' not found"))?;
 
                 // Indexed case: single lookup, 0 or 1 rows.
+                // Mission D7: int-specialized fast path on int-keyed indexes
+                // (primary keys, created_at, etc.) — the common case for
+                // `update_by_pk` / `delete where id = ?`.
                 if let Some(btree) = tbl.indexes.get(column) {
-                    return Ok(match btree.lookup(&key_value) {
+                    let hit = match &key_value {
+                        Value::Int(k) => btree.lookup_int(*k),
+                        other => btree.lookup(other),
+                    };
+                    return Ok(match hit {
                         Some(rid) => vec![rid],
                         None => Vec::new(),
                     });

@@ -212,9 +212,13 @@ impl BenchEngine for PowdbEngine {
         // Direct B-tree lookup — bypasses the PowQL parser entirely. This
         // is the "cached plan / direct API" path a real client SDK would
         // use. See §4 FASTPATH→BENCH in PLAN-MISSION-A.md.
+        //
+        // Mission D7: use the int-specialized `lookup_int` path to skip
+        // the `<Value as Ord>::cmp` discriminant dispatch (5-10ns × ~24
+        // comparisons per lookup on an order-256 tree).
         let engine = self.engine.borrow();
         let tbl = engine.catalog().get_table("User")?;
-        let rid = tbl.indexes.get("id")?.lookup(&Value::Int(id))?;
+        let rid = tbl.indexes.get("id")?.lookup_int(id)?;
         let data = tbl.heap.get(rid)?;
         // Columns: id=0, name=1, age=2, status=3, email=4, created_at=5
         let layout = self.layout.as_ref().unwrap();
