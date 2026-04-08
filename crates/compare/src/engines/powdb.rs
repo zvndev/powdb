@@ -293,7 +293,11 @@ impl BenchEngine for PowdbEngine {
     }
 
     fn point_lookup_nonindexed(&self, created_at: i64) -> Option<String> {
-        let query = format!("User filter .created_at = {created_at} {{ .name }}");
+        // Fair comparison with SQLite's `LIMIT 1` — stop scanning as soon
+        // as the first (and usually only) match is found.
+        let query = format!(
+            "User filter .created_at = {created_at} limit 1 {{ .name }}"
+        );
         self.powql_first_string(&query)
     }
 
