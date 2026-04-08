@@ -124,6 +124,20 @@ impl Catalog {
         Ok(())
     }
 
+    /// Zero-copy scan with early termination. The callback returns
+    /// `ControlFlow::Break(())` to stop. Used by `Limit` fast paths so a
+    /// `limit 100` query doesn't pay decode/predicate cost for every row
+    /// in the table after the limit is reached.
+    pub fn try_for_each_row_raw<F>(&self, table: &str, f: F) -> io::Result<()>
+    where
+        F: FnMut(RowId, &[u8]) -> std::ops::ControlFlow<()>,
+    {
+        let t = self.tables.get(table)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
+        t.try_for_each_row_raw(f);
+        Ok(())
+    }
+
     pub fn create_index(&mut self, table: &str, column: &str) -> io::Result<()> {
         let data_dir = self.data_dir.clone();
         let t = self.tables.get_mut(table)

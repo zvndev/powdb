@@ -89,6 +89,15 @@ impl Table {
         self.heap.for_each_row(f);
     }
 
+    /// Zero-copy scan with early termination. The callback returns
+    /// `ControlFlow::Break(())` to stop. Used by `Limit` fast paths.
+    pub fn try_for_each_row_raw<F>(&self, f: F)
+    where
+        F: FnMut(RowId, &[u8]) -> std::ops::ControlFlow<()>,
+    {
+        self.heap.try_for_each_row(f);
+    }
+
     pub fn index_lookup(&self, col_name: &str, key: &Value) -> Option<(RowId, Row)> {
         let btree = self.indexes.get(col_name)?;
         let rid = btree.lookup(key)?;

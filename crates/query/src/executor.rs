@@ -695,18 +695,23 @@ impl Engine {
         };
 
         let mut out: Vec<Vec<Value>> = Vec::with_capacity(limit.min(1024));
-        let mut done = false;
-        self.catalog.for_each_row_raw(table, |_rid, data| {
-            if done { return; }
+        // Mission D2: use try_for_each_row_raw to actually stop iterating
+        // once the limit is reached. The previous `done` flag only short-
+        // circuited the closure body, so a `limit 100` over 100K rows still
+        // walked all 100K slots — burning ~30x SQLite on scan_filter_project_top100.
+        self.catalog.try_for_each_row_raw(table, |_rid, data| {
+            use std::ops::ControlFlow;
             if let Some(ref pred) = compiled_pred {
-                if !pred(data) { return; }
+                if !pred(data) { return ControlFlow::Continue(()); }
             }
             let row: Vec<Value> = proj_indices.iter()
                 .map(|&ci| decode_column(&schema, &row_layout, data, ci))
                 .collect();
             out.push(row);
             if out.len() >= limit {
-                done = true;
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
             }
         }).map_err(|e| e.to_string())?;
 

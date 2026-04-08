@@ -59,7 +59,10 @@ impl BTree {
         let node = self.nodes[node_id].clone();
         match node {
             Node::Leaf { mut keys, mut values, next_leaf } => {
-                let pos = keys.iter().position(|k| k >= &key).unwrap_or(keys.len());
+                // Mission D1: binary search for the insertion position. Old
+                // linear scan was O(N); ORDER=256 makes this ~5x faster on
+                // average for the leaf-walk inside every insert.
+                let pos = keys.partition_point(|k| k < &key);
 
                 // Duplicate key — update in place
                 if pos < keys.len() && keys[pos] == key {
@@ -89,7 +92,9 @@ impl BTree {
                 }
             }
             Node::Internal { keys, children } => {
-                let pos = keys.iter().position(|k| &key < k).unwrap_or(keys.len());
+                // Mission D1: binary search for child descent.
+                // First child whose separator is strictly greater than `key`.
+                let pos = keys.partition_point(|k| k <= &key);
                 let child_id = children[pos];
 
                 if let Some((mid_key, new_child_id)) = self.insert_recursive(child_id, key, rid) {
@@ -127,21 +132,27 @@ impl BTree {
 
     /// Point lookup: find the RowId for a given key.
     ///
-    /// Mission F: `#[inline]` lets LTO fold this into Engine::index_lookup
-    /// fast paths so the call frame doesn't dominate single-row reads.
-    /// (D1 will replace the linear scans with binary search, but inlining
-    /// already helps even in the linear case.)
+    /// Mission D1: binary search instead of linear scan. With ORDER=256 nodes,
+    /// linear scan was ~128 comparisons average; binary search is ~8. The
+    /// `Value` Ord impl is total, so `binary_search` is sound. Mission F's
+    /// `#[inline]` is preserved so LTO can still fold this into the index-
+    /// lookup fast path.
     #[inline]
     pub fn lookup(&self, key: &Value) -> Option<RowId> {
         let mut node_id = self.root;
         loop {
             match &self.nodes[node_id] {
                 Node::Leaf { keys, values, .. } => {
-                    return keys.iter().position(|k| k == key)
-                        .map(|i| values[i]);
+                    return match keys.binary_search(key) {
+                        Ok(i) => Some(values[i]),
+                        Err(_) => None,
+                    };
                 }
                 Node::Internal { keys, children } => {
-                    let pos = keys.iter().position(|k| key < k).unwrap_or(keys.len());
+                    // First child whose separator is strictly greater than `key`.
+                    // `partition_point(p)` returns the first index where `p` is
+                    // false, so `|k| k <= key` finds the first `k > key`.
+                    let pos = keys.partition_point(|k| k <= key);
                     node_id = children[pos];
                 }
             }
@@ -157,7 +168,8 @@ impl BTree {
             let is_leaf = matches!(self.nodes[node_id], Node::Leaf { .. });
             if is_leaf {
                 if let Node::Leaf { keys, values, .. } = &mut self.nodes[node_id] {
-                    if let Some(pos) = keys.iter().position(|k| k == key) {
+                    // Mission D1: binary search the leaf for an exact match.
+                    if let Ok(pos) = keys.binary_search(key) {
                         keys.remove(pos);
                         values.remove(pos);
                         return true;
@@ -167,7 +179,8 @@ impl BTree {
             }
             match &self.nodes[node_id] {
                 Node::Internal { keys, children } => {
-                    let pos = keys.iter().position(|k| key < k).unwrap_or(keys.len());
+                    // Mission D1: binary search for child descent.
+                    let pos = keys.partition_point(|k| k <= key);
                     node_id = children[pos];
                 }
                 _ => unreachable!(),
@@ -182,7 +195,8 @@ impl BTree {
         loop {
             match &self.nodes[node_id] {
                 Node::Internal { keys, children } => {
-                    let pos = keys.iter().position(|k| start < k).unwrap_or(keys.len());
+                    // Mission D1: binary search for child descent.
+                    let pos = keys.partition_point(|k| k <= start);
                     node_id = children[pos];
                 }
                 Node::Leaf { .. } => break,

@@ -169,6 +169,72 @@ impl HeapFile {
         })
     }
 
+    /// Zero-copy scan with early termination. The callback returns
+    /// `ControlFlow::Break(())` to stop iteration immediately.
+    ///
+    /// Mission D2: this is the load-bearing fix for `Project(Limit(...))`
+    /// fast paths. Without it, `limit 100` on a 100K-row table still walked
+    /// all 100K slots — the existing `done` flag in executor only short-
+    /// circuited the *body* of the closure, not the iteration itself, so
+    /// the inner loop kept paying decode_column / pred / call-frame cost
+    /// for the trailing 99,900 rows.
+    #[inline]
+    pub fn try_for_each_row<F>(&self, mut f: F)
+    where
+        F: FnMut(RowId, &[u8]) -> std::ops::ControlFlow<()>,
+    {
+        use std::ops::ControlFlow;
+
+        let num_pages = self.disk.num_pages();
+        if num_pages == 0 {
+            return;
+        }
+
+        // Try mmap for zero-syscall scanning (same fast path as for_each_row).
+        use std::os::unix::io::AsRawFd;
+        let fd = self.disk.file_ref().as_raw_fd();
+        let file_len = (num_pages as usize) * PAGE_SIZE;
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                file_len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                fd,
+                0,
+            )
+        };
+
+        if ptr != libc::MAP_FAILED {
+            let mapped = unsafe { std::slice::from_raw_parts(ptr as *const u8, file_len) };
+            'outer: for page_id in 0..num_pages {
+                let offset = page_id as usize * PAGE_SIZE;
+                let page_bytes = &mapped[offset..offset + PAGE_SIZE];
+                for (slot, data) in iter_page_slots(page_bytes) {
+                    if let ControlFlow::Break(()) = f(RowId { page_id, slot_index: slot }, data) {
+                        break 'outer;
+                    }
+                }
+            }
+            unsafe { libc::munmap(ptr, file_len); }
+        } else {
+            // Fallback: per-page read.
+            'outer: for page_id in 0..num_pages {
+                let buf = match self.disk.read_page(page_id) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                if let Some(page) = Page::from_bytes(&buf) {
+                    for (slot, data) in page.iter() {
+                        if let ControlFlow::Break(()) = f(RowId { page_id, slot_index: slot }, data) {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Zero-copy scan: calls `f` for every live row without allocating a
     /// `Vec<u8>` per row. Uses mmap when available to avoid per-page syscalls.
     pub fn for_each_row<F>(&self, mut f: F)
