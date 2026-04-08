@@ -5,5 +5,6 @@ pub mod parser;
 pub mod plan;
 pub mod planner;
 pub mod result;
+pub mod canonicalize;
 pub mod plan_cache;
 pub mod executor;

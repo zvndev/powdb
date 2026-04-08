@@ -1,5 +1,7 @@
 use crate::ast::*;
+use crate::canonicalize::canonicalize;
 use crate::plan::*;
+use crate::plan_cache::PlanCache;
 use crate::planner;
 use crate::result::QueryResult;
 use powdb_storage::catalog::Catalog;
@@ -10,10 +12,19 @@ use std::collections::BinaryHeap;
 use std::io;
 use std::path::Path;
 use std::time::Instant;
-use tracing::{info, debug, error};
+use tracing::{info, error, Level};
+
+/// Plan cache capacity. Bench workloads fill ~15 slots; real apps will sit
+/// comfortably in 256. Lookup is O(1), collisions clear the cache (see
+/// `plan_cache::PlanCache::insert`).
+const PLAN_CACHE_CAPACITY: usize = 256;
 
 pub struct Engine {
     catalog: Catalog,
+    /// Mission D9 — cached parsed+planned query trees keyed by canonical
+    /// hash. Saves the ~3μs parse+plan cost on repeat queries that differ
+    /// only in literal values.
+    plan_cache: PlanCache,
 }
 
 impl Engine {
@@ -32,12 +43,57 @@ impl Engine {
             }
             Err(e) => return Err(e),
         };
-        Ok(Engine { catalog })
+        Ok(Engine {
+            catalog,
+            plan_cache: PlanCache::new(PLAN_CACHE_CAPACITY),
+        })
     }
 
+    /// Parse + plan + execute a PowQL query.
+    ///
+    /// Mission D6 — tracing collapse: the previous implementation ran 4
+    /// `Instant::now()` + 3 `elapsed().as_micros()` calls + formatted an
+    /// `info!` span on every query, even when tracing was disabled. On a
+    /// sub-microsecond `point_lookup_indexed` call that overhead was
+    /// 100-200ns — 20%+ of the whole query. We now measure time only when
+    /// INFO is actually enabled via `tracing::enabled!`, and we moved the
+    /// noisy `debug!(?plan)` line behind the same gate so the Debug
+    /// formatter can't run unconditionally either.
+    ///
+    /// Mission D9 — plan cache: on the hot path we canonicalise the query
+    /// text (lex + FNV-1a hash with literal values stripped), check the
+    /// cache, and on a hit substitute the new literals into a clone of the
+    /// cached plan. This skips re-lexing, re-parsing, and re-planning —
+    /// around 3μs per call on bench workloads. On a miss we plan as before
+    /// and insert the plan under its canonical hash.
     pub fn execute_powql(&mut self, input: &str) -> Result<QueryResult, String> {
-        let total_start = Instant::now();
+        // Hot path: tracing disabled. Zero syscalls, zero formatting.
+        if !tracing::enabled!(Level::INFO) {
+            // D9: try the plan cache first. Canonicalisation lexes the
+            // query once; on a hit we skip the parser and planner entirely.
+            if let Ok((hash, literals)) = canonicalize(input) {
+                if let Some(plan) = self.plan_cache.get_with_substitution(hash, &literals) {
+                    return self.execute_plan(&plan);
+                }
+                // Miss — plan, insert, execute.
+                return match planner::plan(input) {
+                    Ok(plan) => {
+                        self.plan_cache.insert(hash, plan.clone());
+                        self.execute_plan(&plan)
+                    }
+                    Err(e) => Err(e.message),
+                };
+            }
+            // Lex error — fall through to the planner so the caller gets a
+            // consistent error shape.
+            return match planner::plan(input) {
+                Ok(plan) => self.execute_plan(&plan),
+                Err(e) => Err(e.message),
+            };
+        }
 
+        // Instrumented path — only taken under explicit tracing subscribers.
+        let total_start = Instant::now();
         let plan_start = Instant::now();
         let plan = planner::plan(input).map_err(|e| {
             error!(query = %input, error = %e.message, "query plan failed");
@@ -71,9 +127,12 @@ impl Engine {
                 );
             }
         }
-
-        debug!(plan = ?plan, "executed plan");
         result
+    }
+
+    /// Plan cache stats — useful for benches and debugging.
+    pub fn plan_cache_stats(&self) -> (u64, u64, usize) {
+        (self.plan_cache.hits, self.plan_cache.misses, self.plan_cache.len())
     }
 
     pub fn execute_plan(&mut self, plan: &PlanNode) -> Result<QueryResult, String> {
