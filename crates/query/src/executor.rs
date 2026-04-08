@@ -527,33 +527,44 @@ impl Engine {
             }
 
             PlanNode::Insert { table, assignments } => {
-                let schema = self.catalog.schema(table)
-                    .ok_or_else(|| format!("table '{table}' not found"))?
-                    .clone();
-                let mut values = vec![Value::Empty; schema.columns.len()];
-                for a in assignments {
-                    let idx = schema.column_index(&a.field)
-                        .ok_or_else(|| format!("column '{}' not found", a.field))?;
-                    values[idx] = literal_to_value(&a.value)?;
-                }
+                // Mission C Phase 3: resolve column indices + literals under
+                // a short-lived shared borrow on the catalog, then release
+                // it before calling insert(). The previous code cloned the
+                // full Schema (6+ String allocations on User) just to dodge
+                // the borrow checker — a measurable 200-400ns on every
+                // insert_single call in the bench.
+                let values = {
+                    let schema = self.catalog.schema(table)
+                        .ok_or_else(|| format!("table '{table}' not found"))?;
+                    let mut values = vec![Value::Empty; schema.columns.len()];
+                    for a in assignments {
+                        let idx = schema.column_index(&a.field)
+                            .ok_or_else(|| format!("column '{}' not found", a.field))?;
+                        values[idx] = literal_to_value(&a.value)?;
+                    }
+                    values
+                };
                 self.catalog.insert(table, &values).map_err(|e| e.to_string())?;
                 Ok(QueryResult::Modified(1))
             }
 
             PlanNode::Update { input, table, assignments } => {
-                let schema = self.catalog.schema(table)
-                    .ok_or_else(|| format!("table '{table}' not found"))?
-                    .clone();
-
-                // Resolve assignment column indices and values once.
-                let resolved_assignments: Vec<(usize, Value)> = assignments.iter()
-                    .map(|a| {
-                        let idx = schema.column_index(&a.field)
-                            .ok_or_else(|| format!("column '{}' not found", a.field))?;
-                        let val = literal_to_value(&a.value)?;
-                        Ok::<_, String>((idx, val))
-                    })
-                    .collect::<Result<_, _>>()?;
+                // Mission C Phase 3: resolve assignments against a borrowed
+                // schema, then drop the borrow before the mutation loop.
+                // `collect_rids_for_mutation` now looks up schema internally
+                // so we avoid cloning it at all on this hot path.
+                let resolved_assignments: Vec<(usize, Value)> = {
+                    let schema_ref = self.catalog.schema(table)
+                        .ok_or_else(|| format!("table '{table}' not found"))?;
+                    assignments.iter()
+                        .map(|a| {
+                            let idx = schema_ref.column_index(&a.field)
+                                .ok_or_else(|| format!("column '{}' not found", a.field))?;
+                            let val = literal_to_value(&a.value)?;
+                            Ok::<_, String>((idx, val))
+                        })
+                        .collect::<Result<_, _>>()?
+                };
 
                 // Mission C Phase 2: the hint Table::update_hinted needs to
                 // decide whether to read the old row for index diff.
@@ -562,7 +573,7 @@ impl Engine {
 
                 // Collect matching RowIds in a single pass (fixes the old
                 // O(N*M) value-equality join against a materialised row set).
-                let matching_rids = self.collect_rids_for_mutation(input, table, &schema)?;
+                let matching_rids = self.collect_rids_for_mutation(input, table)?;
 
                 let mut count = 0u64;
                 for rid in matching_rids {
@@ -582,11 +593,10 @@ impl Engine {
             }
 
             PlanNode::Delete { input, table } => {
-                let schema = self.catalog.schema(table)
-                    .ok_or_else(|| format!("table '{table}' not found"))?
-                    .clone();
-
-                let matching_rids = self.collect_rids_for_mutation(input, table, &schema)?;
+                // Mission C Phase 3: no schema clone — collect_rids_for_mutation
+                // looks up schema internally when it needs one, and the mutation
+                // loop doesn't need the schema at all.
+                let matching_rids = self.collect_rids_for_mutation(input, table)?;
                 let count = matching_rids.len() as u64;
                 for rid in matching_rids {
                     self.catalog.delete(table, rid).map_err(|e| e.to_string())?;
@@ -970,11 +980,16 @@ impl Engine {
     /// materialising the full row set. Handles the shapes the planner emits
     /// for update/delete: SeqScan, IndexScan, and Filter(SeqScan). Other
     /// shapes fall back to `generic_rid_match`.
+    ///
+    /// Mission C Phase 3: schema is looked up via `self.catalog.schema(table)`
+    /// inside the branches that actually need it. Previously the caller had
+    /// to clone the full Schema (6+ String allocs) before every mutation just
+    /// so this function could borrow it — a cost the update/delete hot path
+    /// did not need.
     fn collect_rids_for_mutation(
         &mut self,
         input: &PlanNode,
         table: &str,
-        schema: &Schema,
     ) -> Result<Vec<RowId>, String> {
         match input {
             PlanNode::SeqScan { table: t } if t == table => {
@@ -987,28 +1002,36 @@ impl Engine {
             }
             PlanNode::IndexScan { table: t, column, key } if t == table => {
                 let key_value = literal_to_value(key)?;
-                let tbl = self.catalog.get_table(table)
-                    .ok_or_else(|| format!("table '{table}' not found"))?;
 
                 // Indexed case: single lookup, 0 or 1 rows.
                 // Mission D7: int-specialized fast path on int-keyed indexes
                 // (primary keys, created_at, etc.) — the common case for
                 // `update_by_pk` / `delete where id = ?`.
-                if let Some(btree) = tbl.indexes.get(column) {
-                    let hit = match &key_value {
-                        Value::Int(k) => btree.lookup_int(*k),
-                        other => btree.lookup(other),
-                    };
-                    return Ok(match hit {
-                        Some(rid) => vec![rid],
-                        None => Vec::new(),
-                    });
+                //
+                // Scope the `tbl` borrow so it's released before we fall
+                // through to the scan-based paths below (which reborrow
+                // `self.catalog`).
+                {
+                    let tbl = self.catalog.get_table(table)
+                        .ok_or_else(|| format!("table '{table}' not found"))?;
+                    if let Some(btree) = tbl.indexes.get(column) {
+                        let hit = match &key_value {
+                            Value::Int(k) => btree.lookup_int(*k),
+                            other => btree.lookup(other),
+                        };
+                        return Ok(match hit {
+                            Some(rid) => vec![rid],
+                            None => Vec::new(),
+                        });
+                    }
                 }
 
                 // No index: the planner folds `.col = literal` to IndexScan
                 // regardless of whether the column is actually unique. When
                 // there's no index we must behave like Filter(SeqScan) and
                 // return *all* matching RIDs — not just the first one.
+                let schema = self.catalog.schema(table)
+                    .ok_or_else(|| format!("table '{table}' not found"))?;
                 let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
                 let fast = FastLayout::new(schema);
                 let synth = Expr::BinaryOp(
@@ -1041,6 +1064,8 @@ impl Engine {
                     if t != table {
                         return self.generic_rid_match(input, table);
                     }
+                    let schema = self.catalog.schema(table)
+                        .ok_or_else(|| format!("table '{table}' not found"))?;
                     let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
                     let fast = FastLayout::new(schema);
                     let row_layout = RowLayout::new(schema);
