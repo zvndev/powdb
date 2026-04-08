@@ -68,9 +68,53 @@ impl Table {
         self.heap.delete(rid)
     }
 
+    /// Update a row in place when possible. Falls back to delete+insert only
+    /// if the new encoding doesn't fit in the current slot.
+    ///
+    /// Mission D5: the previous implementation always did `delete + insert`,
+    /// which:
+    ///   1. read+wrote the page twice (once to clear the slot, once to fill it
+    ///      again — usually on a different page),
+    ///   2. did an O(N) scan over `pages_with_space` for every insert,
+    ///   3. mutated every index even when the indexed column hadn't changed.
+    /// On `update_by_filter` (50K matching rows, status-only update, no
+    /// index on status) that turned ~1ms of work into 30 seconds — a
+    /// catastrophic O(N²)-ish gap vs SQLite (6.7ms total). The fix is to
+    /// (a) prefer `heap.update` which tries in-place first and (b) only
+    /// touch indexes whose value actually changed.
     pub fn update(&mut self, rid: RowId, values: &Row) -> io::Result<RowId> {
-        self.delete(rid)?;
-        self.insert(values)
+        // Read the old row once so we can both check which indexed columns
+        // changed AND avoid touching indexes for unchanged columns.
+        let old_row = self.get(rid);
+
+        let encoded = encode_row(&self.schema, values);
+        let new_rid = self.heap.update(rid, &encoded)?;
+
+        // Index maintenance — only re-key columns whose value differs.
+        // For the common "update one non-indexed column" case this is a
+        // no-op walk over a tiny FxHashMap.
+        if !self.indexes.is_empty() {
+            for (col_name, btree) in &mut self.indexes {
+                let Some(idx) = self.schema.column_index(col_name) else { continue };
+                let new_val = &values[idx];
+                let old_val_opt = old_row.as_ref().map(|r| &r[idx]);
+
+                // Skip if column didn't change AND row didn't move.
+                if let Some(old_val) = old_val_opt {
+                    if old_val == new_val && new_rid == rid {
+                        continue;
+                    }
+                    // Remove old entry — even if rid is unchanged, the key may differ.
+                    if !old_val.is_empty() {
+                        btree.delete(old_val);
+                    }
+                }
+                if !new_val.is_empty() {
+                    btree.insert(new_val.clone(), new_rid);
+                }
+            }
+        }
+        Ok(new_rid)
     }
 
     pub fn scan(&self) -> impl Iterator<Item = (RowId, Row)> + '_ {
