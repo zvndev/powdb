@@ -102,7 +102,10 @@ impl Engine {
                     let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
                     let fast = FastLayout::new(&schema);
                     let row_layout = RowLayout::new(&schema);
-                    let mut rows: Vec<Vec<Value>> = Vec::new();
+                    // Mission F: pre-size to skip the first 4 Vec doublings
+                    // (4 → 8 → 16 → 32 → 64). On a 100K-row scan with 30%
+                    // selectivity that's ~4 fewer reallocations + memcpys.
+                    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
 
                     // Try compiled predicate for the filter check (handles
                     // int leaves, string-eq leaves, and And conjunctions).
@@ -535,7 +538,8 @@ impl Engine {
                     Box::new(key.clone()),
                 );
                 if let Some(compiled) = compile_predicate(&synth_pred, &columns, &fast, &schema) {
-                    let mut rows: Vec<Vec<Value>> = Vec::new();
+                    // Mission F: skip the first 4 Vec doublings.
+                    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
                     self.catalog.for_each_row_raw(table, |_rid, data| {
                         if compiled(data) {
                             rows.push(decode_row(&schema, data));
@@ -883,7 +887,8 @@ impl Engine {
                     Box::new(key.clone()),
                 );
                 if let Some(compiled) = compile_predicate(&synth, &columns, &fast, schema) {
-                    let mut rids: Vec<RowId> = Vec::new();
+                    // Mission F: skip the first 4 Vec doublings.
+                    let mut rids: Vec<RowId> = Vec::with_capacity(64);
                     self.catalog.for_each_row_raw(table, |rid, data| {
                         if compiled(data) {
                             rids.push(rid);
@@ -912,7 +917,8 @@ impl Engine {
 
                     // Try compiled predicate first.
                     if let Some(compiled) = compile_predicate(predicate, &columns, &fast, schema) {
-                        let mut rids: Vec<RowId> = Vec::new();
+                        // Mission F: skip the first 4 Vec doublings.
+                        let mut rids: Vec<RowId> = Vec::with_capacity(64);
                         self.catalog.for_each_row_raw(table, |rid, data| {
                             if compiled(data) {
                                 rids.push(rid);
@@ -923,7 +929,7 @@ impl Engine {
 
                     // Fallback: selective decode + eval.
                     let pred_cols = predicate_column_indices(predicate, &columns);
-                    let mut rids: Vec<RowId> = Vec::new();
+                    let mut rids: Vec<RowId> = Vec::with_capacity(64);
                     self.catalog.for_each_row_raw(table, |rid, data| {
                         let pred_row = decode_selective(schema, &row_layout, data, &pred_cols);
                         if eval_predicate(predicate, &pred_row, &columns) {

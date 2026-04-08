@@ -108,11 +108,13 @@ pub struct RowLayout {
 
 impl RowLayout {
     /// Fixed byte offset for a column (None if variable-length).
+    #[inline(always)]
     pub fn fixed_offset(&self, col_idx: usize) -> Option<usize> {
         self.fixed_offsets[col_idx]
     }
 
     /// Size of the null bitmap in bytes.
+    #[inline(always)]
     pub fn bitmap_size(&self) -> usize {
         self.bitmap_size
     }
@@ -150,6 +152,12 @@ impl RowLayout {
 
 /// Decode a single column from the raw row bytes without allocating anything
 /// for other columns.
+///
+/// Mission F: marked `#[inline]` so the compiler can specialise it inside
+/// the per-row scan loops in `executor::project_filter_limit_fast`. With LTO
+/// on, this allows the type-id match to fold away when the caller knows the
+/// column type.
+#[inline]
 pub fn decode_column(schema: &Schema, layout: &RowLayout, data: &[u8], col_idx: usize) -> Value {
     let col = &schema.columns[col_idx];
 
@@ -206,6 +214,10 @@ pub fn decode_column(schema: &Schema, layout: &RowLayout, data: &[u8], col_idx: 
 }
 
 /// Decode a row from its compact binary format back into Values.
+///
+/// Mission F: `#[inline]` (not `always` — function is large) so LTO can fold
+/// it into Filter+SeqScan when the inliner decides it's worth it.
+#[inline]
 pub fn decode_row(schema: &Schema, data: &[u8]) -> Row {
     let n_cols = schema.columns.len();
     let bitmap_size = (n_cols + 7) / 8;

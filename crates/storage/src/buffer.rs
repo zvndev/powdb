@@ -1,6 +1,6 @@
 use crate::disk::DiskManager;
 use crate::page::{Page, PageType};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::io;
 use std::path::Path;
 
@@ -19,7 +19,9 @@ struct Frame {
 pub struct BufferPool {
     disk: DiskManager,
     frames: Vec<Option<Frame>>,
-    page_table: HashMap<u32, usize>, // page_id -> frame_index
+    // Mission F: FxHashMap for u32 page-id keys (SipHash on a 4-byte int is
+    // pure overhead — Fx is dramatically cheaper).
+    page_table: FxHashMap<u32, usize>, // page_id -> frame_index
     capacity: usize,
     clock_hand: usize,
 }
@@ -35,7 +37,7 @@ impl BufferPool {
         Ok(BufferPool {
             disk,
             frames,
-            page_table: HashMap::new(),
+            page_table: FxHashMap::default(),
             capacity,
             clock_hand: 0,
         })

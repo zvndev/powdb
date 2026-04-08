@@ -1,15 +1,20 @@
 use crate::plan::PlanNode;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
+/// LRU-ish plan cache keyed by FNV-1a query hash.
+///
+/// Mission F: uses FxHashMap. The keys are u64 hashes (already pre-hashed by
+/// `hash_query`), so SipHash is pure overhead — Fx is much cheaper for the
+/// integer-keyed lookup.
 pub struct PlanCache {
-    cache: HashMap<u64, PlanNode>,
+    cache: FxHashMap<u64, PlanNode>,
     capacity: usize,
 }
 
 impl PlanCache {
     pub fn new(capacity: usize) -> Self {
         PlanCache {
-            cache: HashMap::new(),
+            cache: FxHashMap::default(),
             capacity,
         }
     }

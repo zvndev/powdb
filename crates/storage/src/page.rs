@@ -205,6 +205,11 @@ impl Page {
 
 /// Iterate live slots directly from a page-sized byte slice without copying.
 /// Used by mmap-based scans to avoid the 4KB memcpy in `Page::from_bytes`.
+///
+/// Mission F: `#[inline]` so the slot-walking closure can fold into the
+/// `for_each_row` mmap loop in heap.rs. With LTO this becomes a tight loop
+/// over `entry_off` with no function call per slot.
+#[inline]
 pub fn iter_page_slots(page_bytes: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
     let slot_count = u16::from_le_bytes(
         page_bytes[PAGE_SIZE - 2..PAGE_SIZE].try_into().unwrap(),

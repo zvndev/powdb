@@ -2,22 +2,26 @@ use crate::btree::BTree;
 use crate::heap::HeapFile;
 use crate::row::{encode_row, decode_row};
 use crate::types::*;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::io;
 use std::path::Path;
 
 /// A table combines a heap file, schema, and optional indexes.
+///
+/// Mission F: indexes use FxHashMap. Per-row index lookup happens inside
+/// every insert/delete/update — even one HashMap probe per row matters at
+/// 200ns/op tier.
 pub struct Table {
     pub schema: Schema,
     pub heap: HeapFile,
-    pub indexes: HashMap<String, BTree>, // column_name -> index
+    pub indexes: FxHashMap<String, BTree>, // column_name -> index
 }
 
 impl Table {
     pub fn create(schema: Schema, data_dir: &Path) -> io::Result<Self> {
         let heap_path = data_dir.join(format!("{}.heap", schema.table_name));
         let heap = HeapFile::create(&heap_path)?;
-        Ok(Table { schema, heap, indexes: HashMap::new() })
+        Ok(Table { schema, heap, indexes: FxHashMap::default() })
     }
 
     /// Reopen an existing table from disk. Caller supplies the schema (loaded
@@ -26,7 +30,7 @@ impl Table {
     pub fn open(schema: Schema, data_dir: &Path) -> io::Result<Self> {
         let heap_path = data_dir.join(format!("{}.heap", schema.table_name));
         let heap = HeapFile::open(&heap_path)?;
-        Ok(Table { schema, heap, indexes: HashMap::new() })
+        Ok(Table { schema, heap, indexes: FxHashMap::default() })
     }
 
     pub fn insert(&mut self, values: &Row) -> io::Result<RowId> {

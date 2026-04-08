@@ -126,6 +126,12 @@ impl BTree {
     }
 
     /// Point lookup: find the RowId for a given key.
+    ///
+    /// Mission F: `#[inline]` lets LTO fold this into Engine::index_lookup
+    /// fast paths so the call frame doesn't dominate single-row reads.
+    /// (D1 will replace the linear scans with binary search, but inlining
+    /// already helps even in the linear case.)
+    #[inline]
     pub fn lookup(&self, key: &Value) -> Option<RowId> {
         let mut node_id = self.root;
         loop {

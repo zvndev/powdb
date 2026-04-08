@@ -7,3 +7,4 @@ edition.workspace = true
 powdb-storage = { path = "../storage" }
 thiserror.workspace = true
 tracing.workspace = true
+rustc-hash.workspace = true

@@ -13,3 +13,19 @@ bytes = "1"
 crc32fast = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "time"] }
+rustc-hash = "2"
+
+# Mission F: release profile tuned for cross-crate inlining and tight loops.
+# - lto = true: enables cross-crate inlining (executor → storage → page).
+#   This is the load-bearing flag — every fast path crosses crate boundaries.
+# - codegen-units = 1: single codegen unit, slower compile, faster runtime.
+# - panic = "abort": no unwinding tables on hot branches; smaller binary.
+# - strip = "symbols": shrink binary, no impact on perf.
+# Estimated overall impact vs default release: 5-15% across-the-board.
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+opt-level = 3
+debug = false
+strip = "symbols"

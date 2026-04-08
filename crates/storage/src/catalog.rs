@@ -1,6 +1,6 @@
 use crate::table::Table;
 use crate::types::*;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -12,8 +12,12 @@ const CATALOG_MAGIC: &[u8; 4] = b"BCAT";
 const CATALOG_VERSION: u16 = 1;
 
 /// System catalog: registry of all tables.
+///
+/// Uses FxHashMap (Mission F) — table-name lookups happen on EVERY query
+/// (executor.rs Filter/SeqScan/IndexLookup all start with `catalog.get_table`),
+/// and FxHash is ~30% faster than std::HashMap's SipHash for short string keys.
 pub struct Catalog {
-    tables: HashMap<String, Table>,
+    tables: FxHashMap<String, Table>,
     data_dir: PathBuf,
 }
 
@@ -22,7 +26,7 @@ impl Catalog {
     pub fn create(data_dir: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         let cat = Catalog {
-            tables: HashMap::new(),
+            tables: FxHashMap::default(),
             data_dir: data_dir.to_path_buf(),
         };
         cat.persist()?;
@@ -38,7 +42,7 @@ impl Catalog {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no catalog file"));
         }
         let schemas = read_catalog_file(&cat_path)?;
-        let mut tables = HashMap::with_capacity(schemas.len());
+        let mut tables = FxHashMap::with_capacity_and_hasher(schemas.len(), Default::default());
         for schema in schemas {
             let name = schema.table_name.clone();
             let table = Table::open(schema, data_dir)?;

@@ -92,6 +92,11 @@ impl HeapFile {
     }
 
     /// Read row data by RowId.
+    ///
+    /// Mission F: `#[inline]` so the mmap-fast-path branch can fold into
+    /// `Catalog::get → Table::get → HeapFile::get` callsites. The hot path
+    /// is the mmap branch — inlining lets LTO collapse the whole chain.
+    #[inline]
     pub fn get(&self, rid: RowId) -> Option<Vec<u8>> {
         // Fast path: mmap — read directly from mapped memory
         if let Some((ptr, len)) = self.mmap_ptr {
