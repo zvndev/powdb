@@ -1,0 +1,41 @@
+version: "3.8"
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: powdb
+      POSTGRES_DB: powdb_bench
+    ports:
+      - "5432:5432"
+    volumes:
+      - powdb_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d powdb_bench"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  mysql:
+    image: mysql:8
+    restart: unless-stopped
+    command: >
+      --local-infile=1
+      --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_ROOT_PASSWORD: powdb
+      MYSQL_DATABASE: powdb_bench
+    ports:
+      - "3306:3306"
+    volumes:
+      - powdb_mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -ppowdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  powdb_pg_data:
+  powdb_mysql_data:

@@ -5,3 +5,10 @@
 batadb_data/
 node_modules/
 clients/ts/dist/
+
+# Worker worktrees and tooling state
+.claude/
+.playwright-mcp/
+
+# Bench artifacts
+crates/compare/results.csv

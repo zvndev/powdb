@@ -93,10 +93,20 @@ fn plan_insert(ins: InsertExpr) -> Result<PlanNode, PlanError> {
 }
 
 fn plan_update(upd: UpdateExpr) -> Result<PlanNode, PlanError> {
-    let mut source = PlanNode::SeqScan { table: upd.source.clone() };
-    if let Some(pred) = upd.filter {
-        source = PlanNode::Filter { input: Box::new(source), predicate: pred };
-    }
+    // Mirror the read-side IndexScan fold: when the update filter is a simple
+    // `.col = literal`, emit `Update(IndexScan)` so the executor's index-lookup
+    // mutation fast path fires. The executor falls back to a scan if the
+    // column happens to lack an index, so this is always safe.
+    let source = match upd.filter {
+        Some(pred) => match try_extract_eq_index_key(&upd.source, &pred) {
+            Some(index_scan) => index_scan,
+            None => PlanNode::Filter {
+                input: Box::new(PlanNode::SeqScan { table: upd.source.clone() }),
+                predicate: pred,
+            },
+        },
+        None => PlanNode::SeqScan { table: upd.source.clone() },
+    };
     Ok(PlanNode::Update {
         input: Box::new(source),
         table: upd.source,
@@ -105,10 +115,16 @@ fn plan_update(upd: UpdateExpr) -> Result<PlanNode, PlanError> {
 }
 
 fn plan_delete(del: DeleteExpr) -> Result<PlanNode, PlanError> {
-    let mut source = PlanNode::SeqScan { table: del.source.clone() };
-    if let Some(pred) = del.filter {
-        source = PlanNode::Filter { input: Box::new(source), predicate: pred };
-    }
+    let source = match del.filter {
+        Some(pred) => match try_extract_eq_index_key(&del.source, &pred) {
+            Some(index_scan) => index_scan,
+            None => PlanNode::Filter {
+                input: Box::new(PlanNode::SeqScan { table: del.source.clone() }),
+                predicate: pred,
+            },
+        },
+        None => PlanNode::SeqScan { table: del.source.clone() },
+    };
     Ok(PlanNode::Delete {
         input: Box::new(source),
         table: del.source,
@@ -238,6 +254,42 @@ mod tests {
                 assert!(matches!(*input, PlanNode::IndexScan { .. }));
             }
             other => panic!("expected Project(IndexScan), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_plan_update_by_pk_becomes_index_scan() {
+        // `.id = literal` update should fold to Update(IndexScan), not
+        // Update(Filter(SeqScan)).
+        let plan = plan("User filter .id = 42 update { age := 31 }").unwrap();
+        match plan {
+            PlanNode::Update { input, .. } => {
+                assert!(matches!(*input, PlanNode::IndexScan { .. }),
+                    "expected Update(IndexScan), got {input:?}");
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_plan_update_range_stays_filter() {
+        let plan = plan("User filter .age > 30 update { age := 31 }").unwrap();
+        match plan {
+            PlanNode::Update { input, .. } => {
+                assert!(matches!(*input, PlanNode::Filter { .. }));
+            }
+            other => panic!("expected Update(Filter), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_plan_delete_by_pk_becomes_index_scan() {
+        let plan = plan("User filter .id = 7 delete").unwrap();
+        match plan {
+            PlanNode::Delete { input, .. } => {
+                assert!(matches!(*input, PlanNode::IndexScan { .. }));
+            }
+            other => panic!("expected Delete, got {other:?}"),
         }
     }
 }

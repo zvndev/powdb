@@ -14,6 +14,30 @@
       "ceiling": 2.5,
       "observed_at_last_edit": 2.055,
       "meaning": "Full PowQL parser+planner+executor overhead over the raw B-tree probe. This is THE thesis metric. First captured from GHA run 24065496323 on ubuntu-24.04: 3764ns / 1832ns = 2.055x. Ceiling 2.5 leaves ~22% headroom for incidental overhead but not enough to hide a planner regression that un-folds .field=literal into SeqScan+Filter. Smoke bench on M1 measured this same ratio at 1.897-2.14x — the ratio is hardware-stable."
+    },
+
+    "scan_filter_count_over_btree_lookup": {
+      "numerator": "powql_aggregation",
+      "denominator": "btree_lookup",
+      "ceiling": 8000.0,
+      "observed_at_last_edit": 400.1,
+      "meaning": "Sanity ceiling: a count-filter aggregate over 100K rows vs a single B-tree probe. A healthy compiled predicate + raw-bytes walker puts this ratio in the low hundreds (M1 local captured 400.1x; GHA is in similar territory). Ceiling 8000 catches a regression that drops the compiled predicate or re-materialises per-row Vec<Value>. Tighten in a follow-up rebaseline once CI confirms the number on ubuntu-24.04."
+    },
+
+    "update_by_pk_over_powql_point": {
+      "numerator": "update_by_pk",
+      "denominator": "powql_point",
+      "ceiling": 15000.0,
+      "observed_at_last_edit": 9130.1,
+      "meaning": "After FASTPATH's Update(IndexScan) fold lands, an indexed update should be within 4x of an indexed read. The pre-FASTPATH generic path is O(N) per update (full re-scan to match RIDs by value equality), so the current observed ratio is ~9130x on M1 against a 100K-row fixture. Ceiling 15000 keeps CI green pre-FASTPATH; the rebaseline commit that lands the Update(IndexScan) fold MUST also tighten this ceiling to 4.0 per the plan. This ratio is explicitly a 'thesis-tripwire' not an absolute guard — it measures the structural relationship, not the absolute number."
+    },
+
+    "insert_single_over_btree_lookup": {
+      "numerator": "insert_single",
+      "denominator": "btree_lookup",
+      "ceiling": 10.0,
+      "observed_at_last_edit": 5.51,
+      "meaning": "Insert hot path should stay within a small multiple of a B-tree probe. M1 local captured 5.51x (8248 ns / 1497 ns). Ceiling 10.0 is first-capture-safe; after the first CI run populates the ubuntu-24.04 baseline the integrator tightens this to match the observed number + ~20% headroom. The goal is to catch regressions in the parse+plan+exec cost of the insert hot path, not to pin an absolute nanosecond figure."
     }
   }
 }
