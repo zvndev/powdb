@@ -455,18 +455,32 @@ impl BenchEngine for PowdbEngine {
         // planning per row. Each call is still independent (PowDB writes
         // are already ACID per-call), which matches SQLite's `prepare_cached`
         // + `execute` pattern in the comparator.
+        //
+        // Mission C Phase 13: use the moving `execute_prepared_take`
+        // variant so the three `String::clone()` calls inside PowDB's
+        // `Literal → Value` conversion collapse into `mem::take`. The
+        // `params` vec is reused across rows — only the string slots
+        // get overwritten each iteration, and those strings are moved
+        // into the row encoder on the next call.
         let prep = self.insert_prepared();
         let mut engine = self.engine.borrow_mut();
+        let mut params: Vec<Literal> = vec![
+            Literal::Int(0),
+            Literal::String(String::new()),
+            Literal::Int(0),
+            Literal::String(String::new()),
+            Literal::String(String::new()),
+            Literal::Int(0),
+        ];
         for (id, name, age, status, email, created_at) in rows {
+            params[0] = Literal::Int(*id);
+            params[1] = Literal::String(name.clone());
+            params[2] = Literal::Int(*age);
+            params[3] = Literal::String(status.clone());
+            params[4] = Literal::String(email.clone());
+            params[5] = Literal::Int(*created_at);
             engine
-                .execute_prepared(&prep, &[
-                    Literal::Int(*id),
-                    Literal::String(name.clone()),
-                    Literal::Int(*age),
-                    Literal::String(status.clone()),
-                    Literal::String(email.clone()),
-                    Literal::Int(*created_at),
-                ])
+                .execute_prepared_take(&prep, &mut params)
                 .expect("insert_batch row failed");
         }
     }

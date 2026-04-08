@@ -25,6 +25,11 @@ pub struct Engine {
     /// hash. Saves the ~3μs parse+plan cost on repeat queries that differ
     /// only in literal values.
     plan_cache: PlanCache,
+    /// Mission C Phase 13: reusable `Vec<Value>` scratch buffer for the
+    /// prepared-insert fast path. `execute_prepared` used to allocate a
+    /// fresh `vec![Value::Empty; n_cols]` on every insert; recycling this
+    /// buffer shaves one heap alloc per row on `insert_batch_1k`.
+    insert_values_scratch: Vec<Value>,
 }
 
 /// Mission C Phase 5: a pre-parsed, pre-planned query. The caller holds
@@ -80,6 +85,7 @@ impl Engine {
         Ok(Engine {
             catalog,
             plan_cache: PlanCache::new(PLAN_CACHE_CAPACITY),
+            insert_values_scratch: Vec::new(),
         })
     }
 
@@ -241,19 +247,33 @@ impl Engine {
         // arm's column-index resolution. Build the Row directly from the
         // caller's literal slice using indices we resolved at prepare time.
         // Saves ~300-500ns per insert on the bench.
+        //
+        // Mission C Phase 13: the scratch `Vec<Value>` is reused across
+        // calls — no fresh allocation per insert. We split the borrow
+        // between `self.catalog` and `self.insert_values_scratch` by
+        // moving the scratch into a local, filling it, passing to the
+        // catalog, and putting it back.
         if let (PlanNode::Insert { table, .. }, Some(col_indices)) =
             (&prep.plan_template, &prep.insert_col_indices)
         {
-            let values = {
+            let n_cols = {
                 let schema = self.catalog.schema(table)
                     .ok_or_else(|| format!("table '{table}' not found"))?;
-                let mut values = vec![Value::Empty; schema.columns.len()];
-                for (pos, lit) in literals.iter().enumerate() {
-                    values[col_indices[pos]] = literal_value_from(lit);
-                }
-                values
+                schema.columns.len()
             };
-            self.catalog.insert(table, &values).map_err(|e| e.to_string())?;
+            let mut values = std::mem::take(&mut self.insert_values_scratch);
+            values.clear();
+            values.resize(n_cols, Value::Empty);
+            for (pos, lit) in literals.iter().enumerate() {
+                values[col_indices[pos]] = literal_value_from(lit);
+            }
+            let res = self.catalog.insert(table, &values).map_err(|e| e.to_string());
+            // Clear strings before returning the scratch — don't keep
+            // dangling allocations from the previous row alive across
+            // calls. `clear()` drops the Value::Str entries.
+            values.clear();
+            self.insert_values_scratch = values;
+            res?;
             return Ok(QueryResult::Modified(1));
         }
 
@@ -262,6 +282,60 @@ impl Engine {
         crate::plan_cache::substitute_plan(&mut plan, literals, &mut idx);
         debug_assert_eq!(idx, literals.len());
         self.execute_plan(&plan)
+    }
+
+    /// Mission C Phase 13: moving variant of [`Engine::execute_prepared`]
+    /// for the insert fast path. Takes `literals` by mutable reference
+    /// so that each `Literal::String` can be consumed via `mem::take`
+    /// instead of cloned into a `Value::Str`. On `insert_batch_1k` that
+    /// removes three per-row heap allocations (name, status, email),
+    /// bringing the workload over the line vs SQLite's amortized
+    /// prepare+execute loop.
+    ///
+    /// The caller's `Literal::String` entries are replaced with empty
+    /// strings on successful inserts — the `literals` slice is *not*
+    /// left in a valid-for-reuse state except for `Int`/`Float`/`Bool`
+    /// values. Non-insert templates fall through to the standard
+    /// substitute-and-execute path.
+    pub fn execute_prepared_take(
+        &mut self,
+        prep: &PreparedQuery,
+        literals: &mut [Literal],
+    ) -> Result<QueryResult, String> {
+        if literals.len() != prep.param_count {
+            return Err(format!(
+                "prepared query expects {} literal(s), got {}",
+                prep.param_count,
+                literals.len(),
+            ));
+        }
+
+        if let (PlanNode::Insert { table, .. }, Some(col_indices)) =
+            (&prep.plan_template, &prep.insert_col_indices)
+        {
+            let n_cols = {
+                let schema = self.catalog.schema(table)
+                    .ok_or_else(|| format!("table '{table}' not found"))?;
+                schema.columns.len()
+            };
+            let mut values = std::mem::take(&mut self.insert_values_scratch);
+            values.clear();
+            values.resize(n_cols, Value::Empty);
+            for (pos, lit) in literals.iter_mut().enumerate() {
+                values[col_indices[pos]] = literal_value_take(lit);
+            }
+            let res = self.catalog.insert(table, &values).map_err(|e| e.to_string());
+            values.clear();
+            self.insert_values_scratch = values;
+            res?;
+            return Ok(QueryResult::Modified(1));
+        }
+
+        // Non-insert templates — fall back to the standard path. We
+        // can't usefully move the literals because `substitute_plan`
+        // still expects an immutable slice, and the non-insert hot
+        // paths are dominated by plan walks anyway.
+        self.execute_prepared(prep, literals)
     }
 
     pub fn execute_plan(&mut self, plan: &PlanNode) -> Result<QueryResult, String> {
@@ -1472,6 +1546,22 @@ fn literal_value_from(lit: &Literal) -> Value {
         Literal::Int(v)    => Value::Int(*v),
         Literal::Float(v)  => Value::Float(*v),
         Literal::String(v) => Value::Str(v.clone()),
+        Literal::Bool(v)   => Value::Bool(*v),
+    }
+}
+
+/// Mission C Phase 13: moving companion to [`literal_value_from`] used
+/// by [`Engine::execute_prepared_take`]. Pulls the `String` out of a
+/// `Literal::String` via `mem::take`, leaving an empty string behind
+/// so the caller's slice remains valid (but with blanked-out strings).
+/// On the insert fast path this removes one heap alloc per string
+/// column per row.
+#[inline]
+fn literal_value_take(lit: &mut Literal) -> Value {
+    match lit {
+        Literal::Int(v)    => Value::Int(*v),
+        Literal::Float(v)  => Value::Float(*v),
+        Literal::String(v) => Value::Str(std::mem::take(v)),
         Literal::Bool(v)   => Value::Bool(*v),
     }
 }
