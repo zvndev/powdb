@@ -13,11 +13,24 @@ const CATALOG_VERSION: u16 = 1;
 
 /// System catalog: registry of all tables.
 ///
-/// Uses FxHashMap (Mission F) — table-name lookups happen on EVERY query
-/// (executor.rs Filter/SeqScan/IndexLookup all start with `catalog.get_table`),
-/// and FxHash is ~30% faster than std::HashMap's SipHash for short string keys.
+/// Mission C Phase 18: tables live in a `Vec<Table>` addressed by a
+/// stable `slot` index, with a parallel `FxHashMap<String, usize>` for
+/// name-based resolution. Append-only (PowDB has no DROP TABLE yet), so
+/// slots are stable for the lifetime of the `Catalog` — callers like
+/// `PreparedQuery::insert_fast` cache a slot at prepare time and skip
+/// the name probe on every subsequent `execute_prepared_take`.
+///
+/// Earlier design (pre-Phase 18) held tables in a `FxHashMap<String, Table>`
+/// directly. That meant the `insert_batch_1k` hot path paid an
+/// `FxHash("User")` + bucket walk per row just to dispatch into the
+/// table — about 20-40ns out of a 233ns budget.
 pub struct Catalog {
-    tables: FxHashMap<String, Table>,
+    /// All tables, in insertion order. Indexed by `slot: usize`. A table's
+    /// slot is assigned by `create_table`/`open` and never reused.
+    tables: Vec<Table>,
+    /// Name → slot index. Populated in sync with `tables` on every
+    /// `create_table` / `open`.
+    name_to_slot: FxHashMap<String, usize>,
     data_dir: PathBuf,
 }
 
@@ -26,7 +39,8 @@ impl Catalog {
     pub fn create(data_dir: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         let cat = Catalog {
-            tables: FxHashMap::default(),
+            tables: Vec::new(),
+            name_to_slot: FxHashMap::default(),
             data_dir: data_dir.to_path_buf(),
         };
         cat.persist()?;
@@ -42,25 +56,30 @@ impl Catalog {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no catalog file"));
         }
         let schemas = read_catalog_file(&cat_path)?;
-        let mut tables = FxHashMap::with_capacity_and_hasher(schemas.len(), Default::default());
+        let mut tables: Vec<Table> = Vec::with_capacity(schemas.len());
+        let mut name_to_slot = FxHashMap::with_capacity_and_hasher(schemas.len(), Default::default());
         for schema in schemas {
             let name = schema.table_name.clone();
             let table = Table::open(schema, data_dir)?;
-            tables.insert(name, table);
+            name_to_slot.insert(name, tables.len());
+            tables.push(table);
         }
         Ok(Catalog {
             tables,
+            name_to_slot,
             data_dir: data_dir.to_path_buf(),
         })
     }
 
     pub fn create_table(&mut self, schema: Schema) -> io::Result<()> {
         let name = schema.table_name.clone();
-        if self.tables.contains_key(&name) {
+        if self.name_to_slot.contains_key(&name) {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("table '{name}' already exists")));
         }
         let table = Table::create(schema, &self.data_dir)?;
-        self.tables.insert(name, table);
+        let slot = self.tables.len();
+        self.tables.push(table);
+        self.name_to_slot.insert(name, slot);
         // Persist the updated catalog so the new schema survives a crash/restart.
         self.persist()?;
         Ok(())
@@ -70,43 +89,79 @@ impl Catalog {
     fn persist(&self) -> io::Result<()> {
         let cat_path = self.data_dir.join(CATALOG_FILE);
         let tmp_path = self.data_dir.join(format!("{CATALOG_FILE}.tmp"));
-        let schemas: Vec<&Schema> = self.tables.values().map(|t| &t.schema).collect();
+        let schemas: Vec<&Schema> = self.tables.iter().map(|t| &t.schema).collect();
         write_catalog_file(&tmp_path, &schemas)?;
         fs::rename(&tmp_path, &cat_path)?;
         Ok(())
     }
 
+    /// Resolve a table name to its stable slot index. Prepared-query
+    /// fast paths cache this once and skip the hash probe on every
+    /// subsequent execution. Slots never shift once assigned.
+    #[inline]
+    pub fn table_slot(&self, name: &str) -> Option<usize> {
+        self.name_to_slot.get(name).copied()
+    }
+
+    /// O(1) slot-indexed table access. Panics on an out-of-range slot
+    /// — callers must have obtained the slot via `table_slot()`.
+    #[inline]
+    pub fn table_by_slot(&self, slot: usize) -> &Table {
+        &self.tables[slot]
+    }
+
+    /// Mutable counterpart to [`Self::table_by_slot`].
+    #[inline]
+    pub fn table_by_slot_mut(&mut self, slot: usize) -> &mut Table {
+        &mut self.tables[slot]
+    }
+
     pub fn get_table(&self, name: &str) -> Option<&Table> {
-        self.tables.get(name)
+        let slot = *self.name_to_slot.get(name)?;
+        Some(&self.tables[slot])
     }
 
     pub fn get_table_mut(&mut self, name: &str) -> Option<&mut Table> {
-        self.tables.get_mut(name)
+        let slot = *self.name_to_slot.get(name)?;
+        Some(&mut self.tables[slot])
+    }
+
+    /// Private helper: resolve a table name to `&Table`, or return an
+    /// `io::Error` with the same "table '<name>' not found" message the
+    /// older `get_mut().ok_or_else(...)` callers produced. Phase 18
+    /// consolidates ~14 copies of that idiom into this one place.
+    #[inline]
+    fn by_name(&self, table: &str) -> io::Result<&Table> {
+        let slot = *self.name_to_slot.get(table)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
+        Ok(&self.tables[slot])
+    }
+
+    /// Mutable counterpart to [`Self::by_name`].
+    #[inline]
+    fn by_name_mut(&mut self, table: &str) -> io::Result<&mut Table> {
+        let slot = *self.name_to_slot.get(table)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
+        Ok(&mut self.tables[slot])
     }
 
     pub fn insert(&mut self, table: &str, values: &Row) -> io::Result<RowId> {
-        let t = self.tables.get_mut(table)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
-        t.insert(values)
+        self.by_name_mut(table)?.insert(values)
     }
 
     pub fn get(&self, table: &str, rid: RowId) -> Option<Row> {
-        self.tables.get(table)?.get(rid)
+        self.get_table(table)?.get(rid)
     }
 
     pub fn delete(&mut self, table: &str, rid: RowId) -> io::Result<()> {
-        let t = self.tables.get_mut(table)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
-        t.delete(rid)
+        self.by_name_mut(table)?.delete(rid)
     }
 
     /// Mission C Phase 12: bulk delete a list of rids, batching btree
     /// maintenance. See [`Table::delete_many`] for the full explanation
     /// and fall-through rules. Returns the number of rows removed.
     pub fn delete_many(&mut self, table: &str, rids: &[RowId]) -> io::Result<u64> {
-        let t = self.tables.get_mut(table)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
-        t.delete_many(rids)
+        self.by_name_mut(table)?.delete_many(rids)
     }
 
     /// Mission C Phase 16: single-pass scan-and-delete driven by a
@@ -116,15 +171,11 @@ impl Catalog {
     where
         P: FnMut(&[u8]) -> bool,
     {
-        let t = self.tables.get_mut(table)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
-        t.scan_delete_matching(pred)
+        self.by_name_mut(table)?.scan_delete_matching(pred)
     }
 
     pub fn update(&mut self, table: &str, rid: RowId, values: &Row) -> io::Result<RowId> {
-        let t = self.tables.get_mut(table)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
-        t.update(rid, values)
+        self.by_name_mut(table)?.update(rid, values)
     }
 
     /// Mission C Phase 2: update with a hint about which columns actually
@@ -137,9 +188,7 @@ impl Catalog {
         values: &Row,
         changed_col_indices: Option<&[usize]>,
     ) -> io::Result<RowId> {
-        let t = self.tables.get_mut(table)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
-        t.update_hinted(rid, values, changed_col_indices)
+        self.by_name_mut(table)?.update_hinted(rid, values, changed_col_indices)
     }
 
     /// Mission C Phase 4: fast-path update that patches a row's raw bytes
@@ -156,9 +205,7 @@ impl Catalog {
     where
         F: FnOnce(&mut [u8]),
     {
-        let t = self.tables.get_mut(table)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
-        t.with_row_bytes_mut(rid, f)
+        self.by_name_mut(table)?.with_row_bytes_mut(rid, f)
     }
 
     /// Mission C Phase 10: var-column in-place update fast path. Patches
@@ -177,15 +224,11 @@ impl Catalog {
         col_idx: usize,
         new_value: Option<&[u8]>,
     ) -> io::Result<bool> {
-        let t = self.tables.get_mut(table)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
-        t.patch_var_col_in_place(rid, col_idx, new_value)
+        self.by_name_mut(table)?.patch_var_col_in_place(rid, col_idx, new_value)
     }
 
     pub fn scan(&self, table: &str) -> io::Result<impl Iterator<Item = (RowId, Row)> + '_> {
-        let t = self.tables.get(table)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
-        Ok(t.scan())
+        Ok(self.by_name(table)?.scan())
     }
 
     /// Zero-copy scan: passes raw row bytes to the callback without any
@@ -194,9 +237,7 @@ impl Catalog {
     where
         F: FnMut(RowId, &[u8]),
     {
-        let t = self.tables.get(table)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
-        t.for_each_row_raw(f);
+        self.by_name(table)?.for_each_row_raw(f);
         Ok(())
     }
 
@@ -208,31 +249,29 @@ impl Catalog {
     where
         F: FnMut(RowId, &[u8]) -> std::ops::ControlFlow<()>,
     {
-        let t = self.tables.get(table)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
-        t.try_for_each_row_raw(f);
+        self.by_name(table)?.try_for_each_row_raw(f);
         Ok(())
     }
 
     pub fn create_index(&mut self, table: &str, column: &str) -> io::Result<()> {
         let data_dir = self.data_dir.clone();
-        let t = self.tables.get_mut(table)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
-        t.create_index(column, &data_dir)
+        self.by_name_mut(table)?.create_index(column, &data_dir)
     }
 
     pub fn index_lookup(&self, table: &str, column: &str, key: &Value) -> io::Result<Option<Row>> {
-        let t = self.tables.get(table)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
-        Ok(t.index_lookup(column, key).map(|(_, row)| row))
+        Ok(self.by_name(table)?.index_lookup(column, key).map(|(_, row)| row))
     }
 
     pub fn list_tables(&self) -> Vec<&str> {
-        self.tables.keys().map(|s| s.as_str()).collect()
+        // Phase 18: iterate the Vec directly — schema.table_name is
+        // the source of truth, and Vec order is insertion order (more
+        // deterministic than the old FxHashMap keys).
+        self.tables.iter().map(|t| t.schema.table_name.as_str()).collect()
     }
 
     pub fn schema(&self, table: &str) -> Option<&Schema> {
-        self.tables.get(table).map(|t| &t.schema)
+        let slot = *self.name_to_slot.get(table)?;
+        Some(&self.tables[slot].schema)
     }
 }
 

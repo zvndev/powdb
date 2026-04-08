@@ -84,8 +84,12 @@ pub struct PreparedQuery {
 /// `col_indices` directly — no catalog schema lookup needed.
 #[derive(Clone)]
 struct InsertFast {
-    /// Target table name.
-    table: String,
+    /// Mission C Phase 18: cached slot index into `Catalog::tables`.
+    /// Resolved once at `prepare` time and stable for the lifetime of
+    /// the catalog (PowDB has no DROP TABLE). Lets the hot path dispatch
+    /// through `catalog.table_by_slot_mut(slot)` — a pure Vec index,
+    /// no hash, no bucket walk, no string compare.
+    table_slot: usize,
     /// Schema column index for each positional literal, in the order the
     /// caller passes them.
     col_indices: Vec<usize>,
@@ -100,12 +104,16 @@ struct InsertFast {
 /// `execute_prepared` call.
 #[derive(Clone)]
 struct UpdatePkFast {
-    /// Target table name.
-    table: String,
-    /// Name of the key column (the `.id = ?` side). We look this up in the
-    /// table's index map at execute time rather than caching a raw
-    /// `&BTree` — the engine owns the catalog and can't hand out long-lived
-    /// borrows anyway, and the FxHashMap lookup is a few ns.
+    /// Mission C Phase 18: cached slot index into `Catalog::tables`.
+    /// Resolved once at `prepare` time and stable for the lifetime of
+    /// the catalog. At a 52ns total budget the swap from FxHashMap
+    /// probe to a Vec index is measurable.
+    table_slot: usize,
+    /// Name of the key column (the `.id = ?` side). We look this up in
+    /// the owning table's `indexed_cols` at execute time rather than
+    /// caching a raw `&BTree` — the engine owns the catalog and can't
+    /// hand out long-lived borrows anyway, and the n≤5 linear scan is
+    /// a handful of ns.
     key_col: String,
     /// Byte offset of the target fixed column in the row encoding:
     /// `2 + bitmap_size + layout.fixed_offsets[target_col]`.
@@ -273,15 +281,16 @@ impl Engine {
                 if assignments.iter().all(|a| matches!(a.value, Expr::Literal(_)))
                    && param_count == assignments.len() =>
             {
-                let schema = self.catalog.schema(table)
+                let table_slot = self.catalog.table_slot(table)
                     .ok_or_else(|| format!("table '{table}' not found"))?;
+                let schema = &self.catalog.table_by_slot(table_slot).schema;
                 let n_cols = schema.columns.len();
                 let indices: Result<Vec<usize>, String> = assignments.iter()
                     .map(|a| schema.column_index(&a.field)
                         .ok_or_else(|| format!("column '{}' not found", a.field)))
                     .collect();
                 Some(InsertFast {
-                    table: table.clone(),
+                    table_slot,
                     col_indices: indices?,
                     n_cols,
                 })
@@ -346,8 +355,10 @@ impl Engine {
             return None;
         }
 
-        // Look up schema + index state from the live catalog.
-        let tbl = catalog.get_table(table)?;
+        // Look up schema + index state from the live catalog, caching
+        // the slot so the execute path skips the name probe.
+        let table_slot = catalog.table_slot(table)?;
+        let tbl = catalog.table_by_slot(table_slot);
         let schema = &tbl.schema;
 
         // Key column must have an index (the btree.lookup path is what
@@ -380,7 +391,7 @@ impl Engine {
         // assignments). The filter key is literal 0, the assignment RHS
         // is literal 1.
         Some(UpdatePkFast {
-            table: table.clone(),
+            table_slot,
             key_col,
             field_off,
             bitmap_byte_off,
@@ -446,8 +457,9 @@ impl Engine {
             for (pos, lit) in literals.iter().enumerate() {
                 values[fast.col_indices[pos]] = literal_value_from(lit);
             }
-            let tbl = self.catalog.get_table_mut(&fast.table)
-                .ok_or_else(|| format!("table '{}' not found", fast.table))?;
+            // Mission C Phase 18: direct O(1) slot index — no
+            // catalog hash probe. Slot was resolved at prepare time.
+            let tbl = self.catalog.table_by_slot_mut(fast.table_slot);
             let res = tbl.insert(&values).map_err(|e| e.to_string());
             // Clear strings before returning the scratch — don't keep
             // dangling allocations from the previous row alive across
@@ -506,10 +518,11 @@ impl Engine {
         };
 
         // 3) Look up the table + btree, do the int lookup, patch the row
-        //    in place. Single HashMap lookup + single btree.lookup_int +
-        //    one `with_row_bytes_mut` call. No Vec allocations at all.
-        let tbl = self.catalog.get_table_mut(&fast.table)
-            .ok_or_else(|| format!("table '{}' not found", fast.table))?;
+        //    in place. Phase 18: table dispatch is a direct slot index;
+        //    the btree lookup is the linear scan over `indexed_cols`.
+        //    Single btree.lookup_int + one `with_row_bytes_mut` call.
+        //    No Vec allocations at all.
+        let tbl = self.catalog.table_by_slot_mut(fast.table_slot);
         let Some(btree) = tbl.index(&fast.key_col) else {
             // Index dropped since prepare — bail to the generic path.
             return Ok(None);
@@ -563,8 +576,10 @@ impl Engine {
             for (pos, lit) in literals.iter_mut().enumerate() {
                 values[fast.col_indices[pos]] = literal_value_take(lit);
             }
-            let tbl = self.catalog.get_table_mut(&fast.table)
-                .ok_or_else(|| format!("table '{}' not found", fast.table))?;
+            // Mission C Phase 18: direct O(1) slot index — see
+            // `execute_prepared` for rationale. This is the hot path
+            // for `insert_batch_1k`.
+            let tbl = self.catalog.table_by_slot_mut(fast.table_slot);
             let res = tbl.insert(&values).map_err(|e| e.to_string());
             values.clear();
             self.insert_values_scratch = values;
