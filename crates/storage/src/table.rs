@@ -1,6 +1,6 @@
 use crate::btree::BTree;
 use crate::heap::HeapFile;
-use crate::row::{encode_row_into, decode_row};
+use crate::row::{decode_column, decode_row, encode_row_into, RowLayout};
 use crate::types::*;
 use rustc_hash::FxHashMap;
 use std::io;
@@ -25,18 +25,24 @@ pub struct Table {
     /// Precomputed set of schema column indices that have an index. Kept
     /// in sync with `indexes` — updated by `create_index`.
     indexed_col_indices: Vec<usize>,
+    /// Mission C Phase 7: cached row layout so `delete` can decode only
+    /// the indexed columns out of the raw page bytes without running the
+    /// full per-row offset calculation every call.
+    row_layout: RowLayout,
 }
 
 impl Table {
     pub fn create(schema: Schema, data_dir: &Path) -> io::Result<Self> {
         let heap_path = data_dir.join(format!("{}.heap", schema.table_name));
         let heap = HeapFile::create(&heap_path)?;
+        let row_layout = RowLayout::new(&schema);
         Ok(Table {
             schema,
             heap,
             indexes: FxHashMap::default(),
             encode_scratch: Vec::new(),
             indexed_col_indices: Vec::new(),
+            row_layout,
         })
     }
 
@@ -46,12 +52,14 @@ impl Table {
     pub fn open(schema: Schema, data_dir: &Path) -> io::Result<Self> {
         let heap_path = data_dir.join(format!("{}.heap", schema.table_name));
         let heap = HeapFile::open(&heap_path)?;
+        let row_layout = RowLayout::new(&schema);
         Ok(Table {
             schema,
             heap,
             indexes: FxHashMap::default(),
             encode_scratch: Vec::new(),
             indexed_col_indices: Vec::new(),
+            row_layout,
         })
     }
 
@@ -75,18 +83,38 @@ impl Table {
         Some(decode_row(&self.schema, &data))
     }
 
+    /// Delete a row. Mission C Phase 7: if the table has indexes, we used to
+    /// call `decode_row` here — allocating `Row` + every column's `Value`
+    /// just to read the two or three columns that actually feed the index.
+    /// Now we borrow the raw page bytes once and call `decode_column` for
+    /// exactly the indexed columns, skipping the rest of the row entirely.
     pub fn delete(&mut self, rid: RowId) -> io::Result<()> {
-        // Remove from indexes
-        if let Some(data) = self.heap.get(rid) {
-            let row = decode_row(&self.schema, &data);
-            for (col_name, btree) in &mut self.indexes {
-                if let Some(idx) = self.schema.column_index(col_name) {
-                    if !row[idx].is_empty() {
-                        btree.delete(&row[idx]);
-                    }
+        if self.indexes.is_empty() {
+            return self.heap.delete(rid);
+        }
+
+        // Collect (col_idx, Value) for indexed columns under a short
+        // borrow of the hot page, then drop it before touching the btrees.
+        let schema = &self.schema;
+        let layout = &self.row_layout;
+        let indexed = &self.indexed_col_indices;
+        let mut index_values: Vec<(usize, Value)> = Vec::with_capacity(indexed.len());
+        self.heap.with_row_bytes(rid, |data| {
+            for &col_idx in indexed {
+                let val = decode_column(schema, layout, data, col_idx);
+                if !val.is_empty() {
+                    index_values.push((col_idx, val));
                 }
             }
+        })?;
+
+        for (col_idx, val) in index_values {
+            let col_name = &self.schema.columns[col_idx].name;
+            if let Some(btree) = self.indexes.get_mut(col_name) {
+                btree.delete(&val);
+            }
         }
+
         self.heap.delete(rid)
     }
 

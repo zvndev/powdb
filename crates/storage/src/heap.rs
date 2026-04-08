@@ -281,6 +281,30 @@ impl HeapFile {
         Ok(false)
     }
 
+    /// Apply a borrowed read to a row's raw bytes. Like
+    /// [`with_row_bytes_mut`] but without the mutable-access path — the
+    /// closure sees the row slice, runs, and returns. No `Vec<u8>` is
+    /// allocated, so callers that only want to decode a few columns
+    /// (e.g. the index-maintenance side of `Table::delete`) can skip the
+    /// per-row clone that `HeapFile::get` would otherwise force.
+    ///
+    /// Mission C Phase 7: this is the read-side counterpart to the
+    /// write-side primitive that backs the Mission C Phase 4 update fast
+    /// path. Same rationale — avoid allocating a whole row buffer just
+    /// to read a handful of bytes out of it.
+    #[inline]
+    pub fn with_row_bytes<R, F>(&mut self, rid: RowId, f: F) -> io::Result<Option<R>>
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        self.ensure_hot(rid.page_id)?;
+        let hot = self.hot_page.as_ref().unwrap();
+        if let Some(bytes) = hot.page.get(rid.slot_index) {
+            return Ok(Some(f(bytes)));
+        }
+        Ok(None)
+    }
+
     /// Update a row. Returns new RowId (may change if row moves).
     ///
     /// Mission C Phase 1: in-place updates land on the hot page directly.
