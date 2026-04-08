@@ -64,6 +64,45 @@ pub struct PreparedQuery {
     /// The `Vec<usize>` holds the schema column index for each assignment
     /// in the same order the caller passes literals.
     insert_col_indices: Option<Vec<usize>>,
+    /// Mission C Phase 14: fast-path metadata for point updates by primary
+    /// key — `T filter .pk = <lit> update { col := <lit> }` where `pk` is
+    /// an indexed column and `col` is fixed-size and not indexed. At
+    /// execute time we skip plan clone, substitute walk, schema re-lookup,
+    /// `resolved_assignments` + `FastPatch` + `matching_rids` Vec allocs,
+    /// and the whole `PlanNode::Update` arm. Just a btree lookup and a
+    /// byte patch.
+    update_pk_fast: Option<UpdatePkFast>,
+}
+
+/// Mission C Phase 14: precomputed fast-path for `update_by_pk` shaped
+/// prepared queries. Built once in [`Engine::prepare`] and reused on every
+/// `execute_prepared` call.
+#[derive(Clone)]
+struct UpdatePkFast {
+    /// Target table name.
+    table: String,
+    /// Name of the key column (the `.id = ?` side). We look this up in the
+    /// table's index map at execute time rather than caching a raw
+    /// `&BTree` — the engine owns the catalog and can't hand out long-lived
+    /// borrows anyway, and the FxHashMap lookup is a few ns.
+    key_col: String,
+    /// Byte offset of the target fixed column in the row encoding:
+    /// `2 + bitmap_size + layout.fixed_offsets[target_col]`.
+    field_off: usize,
+    /// Byte offset of the bitmap byte containing the target column's null
+    /// bit (`2 + target_col / 8`).
+    bitmap_byte_off: usize,
+    /// Bit mask for the target column's null bit.
+    bit_mask: u8,
+    /// Type of the target fixed column — drives the literal-to-bytes
+    /// encoding at execute time.
+    target_type: TypeId,
+    /// Index into the caller's `literals` slice that holds the filter key.
+    /// Always 0 today (filter literal is visited before the assignment
+    /// RHS), but stored explicitly so the contract is obvious.
+    key_literal_idx: usize,
+    /// Index into the caller's `literals` slice that holds the new value.
+    value_literal_idx: usize,
 }
 
 impl Engine {
@@ -220,7 +259,106 @@ impl Engine {
             _ => None,
         };
 
-        Ok(PreparedQuery { plan_template: plan, param_count, insert_col_indices })
+        // Mission C Phase 14: update-by-pk fast path. Match on the shape
+        // planner::plan_update builds for `T filter .pk = ? update
+        // { col := ? }` — `Update { input: IndexScan(pk), assignments:
+        // [{col, Literal}] }` — and only if every precondition holds:
+        //   * `pk` is an indexed column (so the executor would take the
+        //     btree.lookup path at run time regardless)
+        //   * there's exactly one assignment
+        //   * the assigned column is fixed-size and *not* indexed (so we
+        //     don't have to maintain any secondary index on write)
+        //   * both literal slots are already `Expr::Literal` (no computed
+        //     expressions)
+        // If any of these fail we fall through to the standard substitute
+        // + execute path.
+        let update_pk_fast = Self::try_build_update_pk_fast(&self.catalog, &plan);
+
+        Ok(PreparedQuery {
+            plan_template: plan,
+            param_count,
+            insert_col_indices,
+            update_pk_fast,
+        })
+    }
+
+    /// Mission C Phase 14: inspect a planned tree and, if it matches the
+    /// `update_by_pk` fast-path shape, return the precomputed byte-patch
+    /// metadata. Returns `None` on any mismatch — the caller falls through
+    /// to the substitute-and-execute path, which is always correct.
+    fn try_build_update_pk_fast(
+        catalog: &Catalog,
+        plan: &PlanNode,
+    ) -> Option<UpdatePkFast> {
+        // Top level must be `Update { input: IndexScan(...), ... }`.
+        let (table, input, assignments) = match plan {
+            PlanNode::Update { table, input, assignments } => (table, input.as_ref(), assignments),
+            _ => return None,
+        };
+        // Exactly one assignment — the bench hot path and the only case
+        // where a single byte-patch covers the whole mutation.
+        if assignments.len() != 1 {
+            return None;
+        }
+        let assn = &assignments[0];
+        // Assignment RHS must be a raw literal, not a computed expr.
+        if !matches!(assn.value, Expr::Literal(_)) {
+            return None;
+        }
+        // Input must be an IndexScan on the same table with a literal key.
+        let (key_col, key_table) = match input {
+            PlanNode::IndexScan { table: t, column, key: Expr::Literal(_) } => {
+                (column.clone(), t.clone())
+            }
+            _ => return None,
+        };
+        if &key_table != table {
+            return None;
+        }
+
+        // Look up schema + index state from the live catalog.
+        let tbl = catalog.get_table(table)?;
+        let schema = &tbl.schema;
+
+        // Key column must have an index (the btree.lookup path is what
+        // makes the fast path worth building).
+        if !tbl.indexes.contains_key(&key_col) {
+            return None;
+        }
+
+        // Target column must exist, be fixed-size, and NOT be indexed (so
+        // we don't have to maintain any secondary index here).
+        let target_col_idx = schema.column_index(&assn.field)?;
+        let target_type = schema.columns[target_col_idx].type_id;
+        if !is_fixed_size(target_type) {
+            return None;
+        }
+        if tbl.indexed_col_indices().contains(&target_col_idx) {
+            return None;
+        }
+
+        // Precompute byte offsets from the cached row layout.
+        let layout = tbl.row_layout();
+        let fixed_off = layout.fixed_offset(target_col_idx)?;
+        let bitmap_size = layout.bitmap_size();
+        let field_off = 2 + bitmap_size + fixed_off;
+        let bitmap_byte_off = 2 + target_col_idx / 8;
+        let bit_mask = 1u8 << (target_col_idx % 8);
+
+        // Literal walk order for `Update { IndexScan(key), [{value}] }`
+        // (see `plan_cache::substitute_plan` — input first, then the
+        // assignments). The filter key is literal 0, the assignment RHS
+        // is literal 1.
+        Some(UpdatePkFast {
+            table: table.clone(),
+            key_col,
+            field_off,
+            bitmap_byte_off,
+            bit_mask,
+            target_type,
+            key_literal_idx: 0,
+            value_literal_idx: 1,
+        })
     }
 
     /// Execute a [`PreparedQuery`] with the given literal values.
@@ -241,6 +379,18 @@ impl Engine {
                 prep.param_count,
                 literals.len(),
             ));
+        }
+
+        // Mission C Phase 14: update-by-pk fast path. Skip plan clone,
+        // substitute walk, resolved_assignments, FastPatch, Vec<RowId>,
+        // RowLayout::new — straight to btree.lookup_int + byte patch.
+        // On rare mismatches (wrong literal type, index dropped after
+        // prepare) the helper returns `Ok(None)` and we fall through to
+        // the generic substitute-and-execute path below.
+        if let Some(fast) = &prep.update_pk_fast {
+            if let Some(result) = self.try_execute_update_pk_fast(fast, literals)? {
+                return Ok(result);
+            }
         }
 
         // Insert fast path: skip plan-clone + substitute walk + PlanNode::Insert
@@ -282,6 +432,71 @@ impl Engine {
         crate::plan_cache::substitute_plan(&mut plan, literals, &mut idx);
         debug_assert_eq!(idx, literals.len());
         self.execute_plan(&plan)
+    }
+
+    /// Mission C Phase 14: point-update fast path for prepared
+    /// `T filter .pk = ? update { col := ? }` queries. The caller has
+    /// already verified this is an int-indexed pk with a fixed-size,
+    /// non-indexed target column; all we do here is pluck the two
+    /// literals out of the caller's slice, run one `btree.lookup_int`,
+    /// and patch 1–8 bytes of the row. No plan clone, no allocations.
+    ///
+    /// Returns:
+    ///   * `Ok(Some(result))` — fast path took the mutation.
+    ///   * `Ok(None)` — can't take the fast path this call (wrong
+    ///     literal type, index dropped since prepare, etc.). Caller
+    ///     falls through to the generic substitute-and-execute path.
+    ///   * `Err(_)` — real error (table gone, I/O, etc.).
+    #[inline]
+    fn try_execute_update_pk_fast(
+        &mut self,
+        fast: &UpdatePkFast,
+        literals: &[Literal],
+    ) -> Result<Option<QueryResult>, String> {
+        // 1) Extract the key literal. The fast path is only built for
+        //    int key columns; any other literal type means the caller
+        //    is violating the prepared-query contract or the schema
+        //    changed — either way, fall back.
+        let key_int = match &literals[fast.key_literal_idx] {
+            Literal::Int(v) => *v,
+            _ => return Ok(None),
+        };
+
+        // 2) Encode the new value as little-endian bytes matching the
+        //    target column's fixed encoding.
+        let bytes: FixedBytes = match (fast.target_type, &literals[fast.value_literal_idx]) {
+            (TypeId::Int, Literal::Int(v))         => FixedBytes::I64(v.to_le_bytes()),
+            (TypeId::DateTime, Literal::Int(v))    => FixedBytes::I64(v.to_le_bytes()),
+            (TypeId::Float, Literal::Float(v))     => FixedBytes::F64(v.to_le_bytes()),
+            (TypeId::Bool, Literal::Bool(v))       => FixedBytes::Bool(if *v { 1 } else { 0 }),
+            // Type mismatch — fall back to the generic path for a
+            // consistent error shape.
+            _ => return Ok(None),
+        };
+
+        // 3) Look up the table + btree, do the int lookup, patch the row
+        //    in place. Single HashMap lookup + single btree.lookup_int +
+        //    one `with_row_bytes_mut` call. No Vec allocations at all.
+        let tbl = self.catalog.get_table_mut(&fast.table)
+            .ok_or_else(|| format!("table '{}' not found", fast.table))?;
+        let Some(btree) = tbl.indexes.get(&fast.key_col) else {
+            // Index dropped since prepare — bail to the generic path.
+            return Ok(None);
+        };
+        let Some(rid) = btree.lookup_int(key_int) else {
+            return Ok(Some(QueryResult::Modified(0)));
+        };
+
+        let ok = tbl.with_row_bytes_mut(rid, |row| {
+            // Idempotent null-bit clear — safe even when the column was
+            // already non-null (the overwhelmingly common case).
+            row[fast.bitmap_byte_off] &= !fast.bit_mask;
+            let field_bytes = bytes.as_slice();
+            row[fast.field_off..fast.field_off + field_bytes.len()]
+                .copy_from_slice(field_bytes);
+        }).map_err(|e| e.to_string())?;
+
+        Ok(Some(QueryResult::Modified(if ok { 1 } else { 0 })))
     }
 
     /// Mission C Phase 13: moving variant of [`Engine::execute_prepared`]
