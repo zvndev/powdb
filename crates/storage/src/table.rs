@@ -88,32 +88,52 @@ impl Table {
     /// just to read the two or three columns that actually feed the index.
     /// Now we borrow the raw page bytes once and call `decode_column` for
     /// exactly the indexed columns, skipping the rest of the row entirely.
+    ///
+    /// Mission C Phase 11: the Phase 7 version still allocated a
+    /// `Vec<(usize, Value)>` per row so the btree mutations could happen
+    /// after the hot-page borrow closed. That's 3300 heap allocations per
+    /// 100K-row `delete_by_filter` iteration — gone in Phase 11 via
+    /// struct-field borrow splitting, so the btree lives alongside the
+    /// page borrow inside the closure.
     pub fn delete(&mut self, rid: RowId) -> io::Result<()> {
         if self.indexes.is_empty() {
             return self.heap.delete(rid);
         }
 
-        // Collect (col_idx, Value) for indexed columns under a short
-        // borrow of the hot page, then drop it before touching the btrees.
-        let schema = &self.schema;
-        let layout = &self.row_layout;
-        let indexed = &self.indexed_col_indices;
-        let mut index_values: Vec<(usize, Value)> = Vec::with_capacity(indexed.len());
-        self.heap.with_row_bytes(rid, |data| {
-            for &col_idx in indexed {
+        // Split the borrow so `indexes` (mutable) can be captured by the
+        // closure alongside `heap` (also mutable). Rust's disjoint-field
+        // borrowing lets this compile without cloning anything.
+        let Table {
+            heap,
+            indexes,
+            schema,
+            row_layout: layout,
+            indexed_col_indices: indexed,
+            ..
+        } = self;
+
+        heap.with_row_bytes(rid, |data| {
+            for &col_idx in indexed.iter() {
                 let val = decode_column(schema, layout, data, col_idx);
-                if !val.is_empty() {
-                    index_values.push((col_idx, val));
+                if val.is_empty() {
+                    continue;
+                }
+                let col_name = &schema.columns[col_idx].name;
+                if let Some(btree) = indexes.get_mut(col_name) {
+                    // Mission C Phase 11: dispatch to delete_int when the
+                    // indexed key is an integer — skips Value::Ord dispatch
+                    // in the btree binary search and partition_point walk.
+                    match &val {
+                        Value::Int(i) => {
+                            btree.delete_int(*i);
+                        }
+                        _ => {
+                            btree.delete(&val);
+                        }
+                    }
                 }
             }
         })?;
-
-        for (col_idx, val) in index_values {
-            let col_name = &self.schema.columns[col_idx].name;
-            if let Some(btree) = self.indexes.get_mut(col_name) {
-                btree.delete(&val);
-            }
-        }
 
         self.heap.delete(rid)
     }

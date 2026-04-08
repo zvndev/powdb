@@ -247,6 +247,51 @@ impl BTree {
         }
     }
 
+    /// Mission C Phase 11: specialised int-keyed delete.
+    ///
+    /// Same rationale as `lookup_int`: the generic `delete` path runs every
+    /// key comparison through `<Value as Ord>::cmp`, which matches on the
+    /// discriminant of **both** sides before forwarding to `i64::cmp`. On
+    /// `delete_by_filter` (~3300 rows per iteration × 3 iterations × ~12
+    /// comparisons per descent = ~120K dispatch-heavy comparisons) that's a
+    /// measurable fraction of the total. This fast path takes the key as a
+    /// raw `i64` and uses single-sided discriminant matching so LLVM can
+    /// compile the binary-search loop down to a straight `i64::cmp`.
+    ///
+    /// Returns `true` if the key was found and removed.
+    #[inline]
+    pub fn delete_int(&mut self, key: i64) -> bool {
+        let mut node_id = self.root;
+        loop {
+            // Walk internal nodes via single-sided comparison.
+            match &self.nodes[node_id] {
+                Node::Internal { keys, children } => {
+                    let pos = keys.partition_point(|k| match k {
+                        Value::Int(i) => *i <= key,
+                        _ => false,
+                    });
+                    node_id = children[pos];
+                    continue;
+                }
+                Node::Leaf { .. } => {}
+            }
+            // Leaf: binary search then remove.
+            if let Node::Leaf { keys, values, .. } = &mut self.nodes[node_id] {
+                let result = keys.binary_search_by(|k| match k {
+                    Value::Int(i) => i.cmp(&key),
+                    _ => std::cmp::Ordering::Less,
+                });
+                if let Ok(pos) = result {
+                    keys.remove(pos);
+                    values.remove(pos);
+                    return true;
+                }
+                return false;
+            }
+            unreachable!();
+        }
+    }
+
     /// Delete a key from the tree. Returns true if the key was found and removed.
     pub fn delete(&mut self, key: &Value) -> bool {
         // Simple deletion: find leaf and remove (no rebalancing for now — acceptable
