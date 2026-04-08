@@ -860,11 +860,19 @@ impl Engine {
                 // Mission C Phase 3: no schema clone — collect_rids_for_mutation
                 // looks up schema internally when it needs one, and the mutation
                 // loop doesn't need the schema at all.
+                //
+                // Mission C Phase 12: route bulk deletes through
+                // `Catalog::delete_many`, which batches the btree leaf
+                // compaction and shares one `ensure_hot` per row between
+                // the index-key extraction and the slot delete. On
+                // `delete_by_filter` (100K fixture, ~20K matches) that
+                // removes ~4ms of pure `Vec::remove` memmove from the btree
+                // maintenance phase.
                 let matching_rids = self.collect_rids_for_mutation(input, table)?;
-                let count = matching_rids.len() as u64;
-                for rid in matching_rids {
-                    self.catalog.delete(table, rid).map_err(|e| e.to_string())?;
-                }
+                let count = self
+                    .catalog
+                    .delete_many(table, &matching_rids)
+                    .map_err(|e| e.to_string())?;
                 Ok(QueryResult::Modified(count))
             }
 

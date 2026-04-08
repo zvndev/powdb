@@ -170,6 +170,11 @@ impl HeapFile {
     /// Make `page_id` the hot page. If a different page is currently hot,
     /// park it into the deferred-write buffer first. If `page_id` is
     /// already in the buffer, reclaim it instead of re-reading from disk.
+    ///
+    /// Mission C Phase 12: if `mmap_ptr` is set and covers the page, copy
+    /// the bytes directly from the mapped region instead of issuing a
+    /// `pread` syscall. On `delete_by_filter` this removes ~1.7ms of
+    /// scattered syscall overhead (3000+ pages × ~500ns each).
     fn ensure_hot(&mut self, page_id: u32) -> io::Result<()> {
         if let Some(hot) = &self.hot_page {
             if hot.page_id == page_id {
@@ -185,6 +190,24 @@ impl HeapFile {
         if let Some(page) = self.dirty_buffer.remove(&page_id) {
             self.hot_page = Some(HotPage { page_id, page, dirty: true });
             return Ok(());
+        }
+
+        // Mission C Phase 12: zero-syscall read via mmap. The mmap was
+        // created from a consistent on-disk snapshot after populate; as
+        // long as the page hasn't been mutated since (i.e., not in hot/
+        // dirty_buffer — already checked above), the bytes we see are
+        // what `disk.read_page` would return without the syscall.
+        if let Some((ptr, len)) = self.mmap_ptr {
+            let offset = page_id as usize * PAGE_SIZE;
+            if offset + PAGE_SIZE <= len {
+                let page_bytes = unsafe {
+                    std::slice::from_raw_parts(ptr.add(offset), PAGE_SIZE)
+                };
+                if let Some(page) = Page::from_bytes(page_bytes) {
+                    self.hot_page = Some(HotPage { page_id, page, dirty: false });
+                    return Ok(());
+                }
+            }
         }
 
         let buf = self.disk.read_page(page_id)?;
@@ -366,6 +389,49 @@ impl HeapFile {
             self.mark_free(rid.page_id);
         }
         Ok(())
+    }
+
+    /// Delete a row while giving the caller access to the old bytes in a
+    /// single `ensure_hot` pass. The closure runs against the live row
+    /// bytes *before* the slot is marked deleted — callers use this to
+    /// pull out index keys for secondary-index maintenance without
+    /// paying for a second `ensure_hot` round-trip.
+    ///
+    /// Mission C Phase 12: `Table::delete_many` threads the index-key
+    /// extraction through this primitive, so a bulk delete does one
+    /// ensure_hot per row instead of two. For a 20K-row
+    /// `delete_by_filter` that saves ~800μs of redundant hot-slot lookups.
+    ///
+    /// Returns `Ok(true)` if the slot was found and deleted, `Ok(false)`
+    /// if the slot was already missing (caller should treat as a no-op).
+    #[inline]
+    pub fn delete_with_hook<F>(&mut self, rid: RowId, hook: F) -> io::Result<bool>
+    where
+        F: FnOnce(&[u8]),
+    {
+        self.ensure_hot(rid.page_id)?;
+        let found = {
+            let hot = self.hot_page.as_mut().unwrap();
+            // Run the hook under a scoped immutable borrow of the page,
+            // then drop that borrow before re-borrowing mutably for
+            // `delete`.
+            let has_slot = if let Some(bytes) = hot.page.get(rid.slot_index) {
+                hook(bytes);
+                true
+            } else {
+                false
+            };
+            if has_slot {
+                hot.page.delete(rid.slot_index);
+                hot.dirty = true;
+            }
+            has_slot
+        };
+        if found && !self.is_in_free_list(rid.page_id) {
+            self.pages_with_space.push(rid.page_id);
+            self.mark_free(rid.page_id);
+        }
+        Ok(found)
     }
 
     /// Apply an in-place mutation to a row's raw bytes. The closure

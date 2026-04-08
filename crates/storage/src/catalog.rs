@@ -100,6 +100,15 @@ impl Catalog {
         t.delete(rid)
     }
 
+    /// Mission C Phase 12: bulk delete a list of rids, batching btree
+    /// maintenance. See [`Table::delete_many`] for the full explanation
+    /// and fall-through rules. Returns the number of rows removed.
+    pub fn delete_many(&mut self, table: &str, rids: &[RowId]) -> io::Result<u64> {
+        let t = self.tables.get_mut(table)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
+        t.delete_many(rids)
+    }
+
     pub fn update(&mut self, table: &str, rid: RowId, values: &Row) -> io::Result<RowId> {
         let t = self.tables.get_mut(table)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;

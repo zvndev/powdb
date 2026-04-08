@@ -138,6 +138,96 @@ impl Table {
         self.heap.delete(rid)
     }
 
+    /// Mission C Phase 12: bulk delete a list of rids, batching the
+    /// secondary-index maintenance.
+    ///
+    /// For a 100K-row `delete_by_filter` that removes ~20% of the rows,
+    /// the per-row `Table::delete` path pays ~4ms of pure `Vec::remove`
+    /// memmove inside the btree: every call shifts up to 4KB of leaf
+    /// entries. This helper collects the indexed-column keys first,
+    /// deletes the heap slots one by one (hot-page writes), then compacts
+    /// each btree in a single pass via [`BTree::delete_many_int`].
+    ///
+    /// Restrictions / fall-through:
+    /// - If the table has no indexes, this is equivalent to looping over
+    ///   `heap.delete`.
+    /// - If any indexed column is not `TypeId::Int`, this falls back to
+    ///   the per-row `delete` path. The int-only constraint matches the
+    ///   only btree batch primitive we have (`delete_many_int`) and
+    ///   covers the overwhelmingly common case (primary keys,
+    ///   `created_at`, foreign keys).
+    ///
+    /// Returns the number of rows removed.
+    pub fn delete_many(&mut self, rids: &[RowId]) -> io::Result<u64> {
+        if rids.is_empty() {
+            return Ok(0);
+        }
+        if self.indexes.is_empty() {
+            for &rid in rids {
+                self.heap.delete(rid)?;
+            }
+            return Ok(rids.len() as u64);
+        }
+
+        // All indexed cols must be int for the batch btree path to apply.
+        let all_int = self
+            .indexed_col_indices
+            .iter()
+            .all(|&idx| self.schema.columns[idx].type_id == TypeId::Int);
+        if !all_int {
+            // Mixed index types — defer to the generic per-row path.
+            let mut count = 0u64;
+            for &rid in rids {
+                self.delete(rid)?;
+                count += 1;
+            }
+            return Ok(count);
+        }
+
+        // Split the borrow so the closure can capture `schema`/`layout`/
+        // `indexed` + `keys_per_index` while `heap` is borrowed mutably by
+        // `delete_with_hook`.
+        let Table {
+            heap,
+            indexes,
+            schema,
+            row_layout: layout,
+            indexed_col_indices: indexed,
+            ..
+        } = self;
+
+        let n_indexed = indexed.len();
+        let mut keys_per_index: Vec<Vec<i64>> = (0..n_indexed)
+            .map(|_| Vec::with_capacity(rids.len()))
+            .collect();
+
+        let mut count = 0u64;
+        for &rid in rids {
+            let found = heap.delete_with_hook(rid, |data| {
+                for (slot_i, &col_idx) in indexed.iter().enumerate() {
+                    if let Value::Int(i) = decode_column(schema, layout, data, col_idx) {
+                        keys_per_index[slot_i].push(i);
+                    }
+                }
+            })?;
+            if found {
+                count += 1;
+            }
+        }
+
+        // Batch-compact each btree in a single leaf-chain walk.
+        for (slot_i, &col_idx) in indexed.iter().enumerate() {
+            let keys = &mut keys_per_index[slot_i];
+            keys.sort_unstable();
+            let col_name = &schema.columns[col_idx].name;
+            if let Some(btree) = indexes.get_mut(col_name) {
+                btree.delete_many_int(keys);
+            }
+        }
+
+        Ok(count)
+    }
+
     /// Update a row in place when possible. Falls back to delete+insert only
     /// if the new encoding doesn't fit in the current slot.
     ///

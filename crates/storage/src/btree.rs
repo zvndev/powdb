@@ -292,6 +292,104 @@ impl BTree {
         }
     }
 
+    /// Mission C Phase 12: batch-delete many int keys in a single tree walk.
+    ///
+    /// Given a **sorted ascending** list of int keys to remove, walks the
+    /// leaf chain in order and compacts each affected leaf in a single pass.
+    ///
+    /// For a bulk delete of ~20% of rows, this replaces ~20K individual
+    /// `Vec::remove` operations (each O(n) memmove of up to 4KB of `Value`
+    /// entries) with a single compact per affected leaf (one pass of
+    /// swap-and-truncate). On a 100K-row `delete_by_filter` bench that
+    /// collapses ~80MB of pure memmove work down to ~3MB — the difference
+    /// between losing to SQLite and winning.
+    ///
+    /// Keys not present in the tree are silently skipped. Returns the
+    /// number of keys actually removed.
+    ///
+    /// Caller contract: `sorted_keys` must be sorted ascending. Duplicates
+    /// are tolerated (the first removes, subsequent see nothing to remove).
+    pub fn delete_many_int(&mut self, sorted_keys: &[i64]) -> usize {
+        if sorted_keys.is_empty() {
+            return 0;
+        }
+
+        // Walk to the leftmost leaf. From there we can follow `next_leaf`
+        // to visit every leaf in order — matching the sorted-key cursor.
+        let mut node_id = self.root;
+        loop {
+            match &self.nodes[node_id] {
+                Node::Internal { children, .. } => {
+                    node_id = children[0];
+                }
+                Node::Leaf { .. } => break,
+            }
+        }
+
+        let mut total_removed = 0usize;
+        let mut key_cursor = 0usize;
+        let mut current = Some(node_id);
+
+        while let Some(nid) = current {
+            // Early exit: no more keys to delete.
+            if key_cursor >= sorted_keys.len() {
+                break;
+            }
+
+            let next_leaf = if let Node::Leaf { keys, values, next_leaf } = &mut self.nodes[nid] {
+                let mut write = 0usize;
+                for read in 0..keys.len() {
+                    // Pull the int key out of the Value wrapper. Non-int
+                    // keys shouldn't appear on an int index, but keep them
+                    // defensively — they're impossible to match against an
+                    // `i64` cursor anyway.
+                    let k_opt = match &keys[read] {
+                        Value::Int(i) => Some(*i),
+                        _ => None,
+                    };
+
+                    // Advance cursor past any delete-keys smaller than the
+                    // current leaf key. Those were either in a previous
+                    // leaf or not present in the tree at all.
+                    if let Some(k) = k_opt {
+                        while key_cursor < sorted_keys.len()
+                            && sorted_keys[key_cursor] < k
+                        {
+                            key_cursor += 1;
+                        }
+                        if key_cursor < sorted_keys.len() && sorted_keys[key_cursor] == k {
+                            // Match — skip this entry from the output.
+                            // Duplicates in sorted_keys still only drop one
+                            // btree entry; advance cursor once, then let
+                            // any further duplicates drop through to the
+                            // "< k" advance on the next iteration.
+                            key_cursor += 1;
+                            total_removed += 1;
+                            continue;
+                        }
+                    }
+
+                    // Keep this entry. Move it down to the write index if
+                    // we've already dropped anything.
+                    if read != write {
+                        keys.swap(read, write);
+                        values.swap(read, write);
+                    }
+                    write += 1;
+                }
+                keys.truncate(write);
+                values.truncate(write);
+                *next_leaf
+            } else {
+                break;
+            };
+
+            current = next_leaf;
+        }
+
+        total_removed
+    }
+
     /// Delete a key from the tree. Returns true if the key was found and removed.
     pub fn delete(&mut self, key: &Value) -> bool {
         // Simple deletion: find leaf and remove (no rebalancing for now — acceptable
@@ -508,6 +606,84 @@ mod tests {
             let generic = bt.lookup(&Value::Int(i));
             let specialized = bt.lookup_int(i);
             assert_eq!(generic, specialized, "divergence at key {i}");
+        }
+    }
+
+    #[test]
+    fn test_delete_many_int_matches_per_key_delete() {
+        // Mission C Phase 12: batch delete must agree with repeated
+        // per-key `delete_int` calls on every lookup across the full tree.
+        let mut bt_batch = temp_btree("delete_many_batch");
+        let mut bt_refn = temp_btree("delete_many_refn");
+        for i in 0..5000i64 {
+            let rid = RowId {
+                page_id: (i / 256) as u32,
+                slot_index: (i % 256) as u16,
+            };
+            bt_batch.insert(Value::Int(i), rid);
+            bt_refn.insert(Value::Int(i), rid);
+        }
+
+        // Delete every 3rd key, plus some missing keys for good measure.
+        let mut to_delete: Vec<i64> = (0..5000).filter(|i| i % 3 == 0).collect();
+        // Inject missing keys that shouldn't affect anything.
+        to_delete.push(7000);
+        to_delete.push(-5);
+        to_delete.sort();
+
+        let removed = bt_batch.delete_many_int(&to_delete);
+        // 5000 / 3 rounded up = 1667 present keys deleted; the two missing
+        // keys should be silently skipped.
+        let expected_removed = to_delete.iter().filter(|k| **k >= 0 && **k < 5000).count();
+        assert_eq!(removed, expected_removed);
+
+        for k in &to_delete {
+            bt_refn.delete_int(*k);
+        }
+
+        // Cross-check every key 0..5000 (present or absent).
+        for i in 0..5000i64 {
+            let a = bt_batch.lookup_int(i);
+            let b = bt_refn.lookup_int(i);
+            assert_eq!(a, b, "divergence at key {i}");
+        }
+        assert_eq!(bt_batch.len(), bt_refn.len());
+    }
+
+    #[test]
+    fn test_delete_many_int_empty_slice() {
+        let mut bt = temp_btree("delete_many_empty");
+        for i in 0..100 {
+            bt.insert(Value::Int(i), RowId { page_id: 0, slot_index: i as u16 });
+        }
+        let removed = bt.delete_many_int(&[]);
+        assert_eq!(removed, 0);
+        assert_eq!(bt.len(), 100);
+    }
+
+    #[test]
+    fn test_delete_many_int_all_missing() {
+        let mut bt = temp_btree("delete_many_missing");
+        for i in 0..100 {
+            bt.insert(Value::Int(i), RowId { page_id: 0, slot_index: i as u16 });
+        }
+        let removed = bt.delete_many_int(&[1000, 2000, 3000]);
+        assert_eq!(removed, 0);
+        assert_eq!(bt.len(), 100);
+    }
+
+    #[test]
+    fn test_delete_many_int_all_keys() {
+        let mut bt = temp_btree("delete_many_all");
+        let keys: Vec<i64> = (0..500).collect();
+        for &i in &keys {
+            bt.insert(Value::Int(i), RowId { page_id: 0, slot_index: i as u16 });
+        }
+        let removed = bt.delete_many_int(&keys);
+        assert_eq!(removed, 500);
+        assert_eq!(bt.len(), 0);
+        for i in &keys {
+            assert_eq!(bt.lookup_int(*i), None);
         }
     }
 
