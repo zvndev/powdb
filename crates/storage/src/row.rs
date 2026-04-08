@@ -265,6 +265,101 @@ pub fn decode_column(schema: &Schema, layout: &RowLayout, data: &[u8], col_idx: 
     }
 }
 
+/// Patch a single variable-length column in-place inside an already-encoded
+/// row's raw bytes, shrinking the row if the new value is smaller than the
+/// old one. Returns the new total row length on success, or `None` if the
+/// new value would grow the row (caller must fall back to the full re-encode
+/// path).
+///
+/// Mission C Phase 10: `update_by_filter` on the Mission A bench changes
+/// `status` from one of `"active"/"inactive"/"pending"` (6-8 bytes) to
+/// `"senior"` (6 bytes) for ~50K matching rows per iteration. Every single
+/// row shrinks or matches — the old slow path still paid for a full
+/// `decode_row` (3 String allocations per row) and `encode_row_into` (fresh
+/// bitmap + fixed region + offset table walk) on every call. This helper
+/// does the whole patch with 0 allocations by:
+///   1. reading the old var offset pair from the offset table,
+///   2. writing the new bytes directly over the old ones,
+///   3. shifting any trailing var data back by `delta`,
+///   4. decrementing every offset after the patched column by `delta`,
+///   5. clearing the null bit (or setting it, if the new value is `None`),
+///   6. rewriting the 2-byte length prefix.
+///
+/// Assumes `col_idx` is a variable-length column. The caller is expected to
+/// check this (via `layout.var_index[col_idx]`) before calling; a panic in
+/// the `unwrap` path is a caller bug.
+#[inline]
+pub fn patch_var_column_in_place(
+    bytes: &mut [u8],
+    layout: &RowLayout,
+    col_idx: usize,
+    new_value: Option<&[u8]>,
+) -> Option<u16> {
+    let var_idx = layout.var_index[col_idx].expect("not a var column");
+    let n_var = layout.n_var;
+
+    let offset_table_start = 2 + layout.bitmap_size + layout.fixed_region_size;
+    let var_data_start = offset_table_start + (n_var + 1) * 2;
+
+    // Read old offsets for this var column from the offset table.
+    let off_pos = offset_table_start + var_idx * 2;
+    let next_off_pos = offset_table_start + (var_idx + 1) * 2;
+    let old_var_offset =
+        u16::from_le_bytes(bytes[off_pos..off_pos + 2].try_into().unwrap()) as usize;
+    let old_var_next =
+        u16::from_le_bytes(bytes[next_off_pos..next_off_pos + 2].try_into().unwrap()) as usize;
+    let old_var_len = old_var_next - old_var_offset;
+
+    let new_var_len = new_value.map(|v| v.len()).unwrap_or(0);
+    if new_var_len > old_var_len {
+        return None; // grow path — let the caller fall back to re-encode
+    }
+    let delta = old_var_len - new_var_len;
+
+    // Absolute byte positions inside the row.
+    let old_var_abs_start = var_data_start + old_var_offset;
+    let old_var_abs_end = var_data_start + old_var_next;
+    let old_row_len = bytes.len();
+
+    // Write new bytes (if any) over the old payload.
+    if let Some(v) = new_value {
+        bytes[old_var_abs_start..old_var_abs_start + new_var_len].copy_from_slice(v);
+    }
+
+    // Shift trailing var data back by `delta` (no-op when same-size).
+    if delta > 0 {
+        bytes.copy_within(
+            old_var_abs_end..old_row_len,
+            old_var_abs_start + new_var_len,
+        );
+
+        // Decrement every offset AFTER this var column. The entry at
+        // var_idx stays the same (it's the start of our patched column);
+        // entries var_idx+1..=n_var slide back by `delta`.
+        for vi in (var_idx + 1)..=n_var {
+            let pos = offset_table_start + vi * 2;
+            let old_off = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+            let new_off = old_off - delta as u16;
+            bytes[pos..pos + 2].copy_from_slice(&new_off.to_le_bytes());
+        }
+    }
+
+    // Null bitmap: clear or set the bit depending on new value.
+    let bitmap_byte = 2 + col_idx / 8;
+    let bit_mask = 1u8 << (col_idx % 8);
+    if new_value.is_none() {
+        bytes[bitmap_byte] |= bit_mask;
+    } else {
+        bytes[bitmap_byte] &= !bit_mask;
+    }
+
+    // Update the 2-byte length prefix.
+    let new_row_len = old_row_len - delta;
+    bytes[0..2].copy_from_slice(&(new_row_len as u16).to_le_bytes());
+
+    Some(new_row_len as u16)
+}
+
 /// Decode a row from its compact binary format back into Values.
 ///
 /// Mission F: `#[inline]` (not `always` — function is large) so LTO can fold
@@ -463,6 +558,131 @@ mod tests {
             let decoded = decode_row(&schema, &encoded);
             assert_eq!(decoded, row, "roundtrip failed for i={i}");
         }
+    }
+
+    #[test]
+    fn test_patch_var_column_same_size() {
+        let schema = user_schema();
+        let row = vec![
+            Value::Str("Alice".into()),
+            Value::Str("alice@example.com".into()),
+            Value::Int(30),
+            Value::Bool(true),
+        ];
+        let mut encoded = encode_row(&schema, &row);
+        let layout = RowLayout::new(&schema);
+        // name: "Alice" (5) → "Bobby" (5) — same size, trivial overwrite.
+        let new_len = patch_var_column_in_place(&mut encoded, &layout, 0, Some(b"Bobby")).unwrap();
+        encoded.truncate(new_len as usize);
+        let decoded = decode_row(&schema, &encoded);
+        assert_eq!(decoded[0], Value::Str("Bobby".into()));
+        assert_eq!(decoded[1], Value::Str("alice@example.com".into()));
+        assert_eq!(decoded[2], Value::Int(30));
+        assert_eq!(decoded[3], Value::Bool(true));
+    }
+
+    #[test]
+    fn test_patch_var_column_shrink_first() {
+        let schema = user_schema();
+        let row = vec![
+            Value::Str("Alexandra".into()),              // 9 bytes
+            Value::Str("alice@example.com".into()),
+            Value::Int(42),
+            Value::Bool(false),
+        ];
+        let mut encoded = encode_row(&schema, &row);
+        let layout = RowLayout::new(&schema);
+        // Patch `name` from 9 bytes → 3 bytes; trailing var data must shift back.
+        let new_len = patch_var_column_in_place(&mut encoded, &layout, 0, Some(b"Eve")).unwrap();
+        encoded.truncate(new_len as usize);
+        let decoded = decode_row(&schema, &encoded);
+        assert_eq!(decoded[0], Value::Str("Eve".into()));
+        assert_eq!(decoded[1], Value::Str("alice@example.com".into()));
+        assert_eq!(decoded[2], Value::Int(42));
+        assert_eq!(decoded[3], Value::Bool(false));
+    }
+
+    #[test]
+    fn test_patch_var_column_shrink_middle() {
+        // Mirrors the Mission A bench: middle var col changes, trailing var
+        // col must stay intact and its offset must slide back by `delta`.
+        let schema = Schema {
+            table_name: "U".into(),
+            columns: vec![
+                ColumnDef { name: "name".into(),   type_id: TypeId::Str, required: true,  position: 0 },
+                ColumnDef { name: "status".into(), type_id: TypeId::Str, required: true,  position: 1 },
+                ColumnDef { name: "email".into(),  type_id: TypeId::Str, required: true,  position: 2 },
+                ColumnDef { name: "age".into(),    type_id: TypeId::Int, required: false, position: 3 },
+            ],
+        };
+        let row = vec![
+            Value::Str("user_42".into()),
+            Value::Str("inactive".into()),              // 8 bytes
+            Value::Str("user_42@example.com".into()),
+            Value::Int(55),
+        ];
+        let mut encoded = encode_row(&schema, &row);
+        let layout = RowLayout::new(&schema);
+        let new_len = patch_var_column_in_place(&mut encoded, &layout, 1, Some(b"senior")).unwrap();
+        encoded.truncate(new_len as usize);
+        let decoded = decode_row(&schema, &encoded);
+        assert_eq!(decoded[0], Value::Str("user_42".into()));
+        assert_eq!(decoded[1], Value::Str("senior".into()));
+        assert_eq!(decoded[2], Value::Str("user_42@example.com".into()));
+        assert_eq!(decoded[3], Value::Int(55));
+    }
+
+    #[test]
+    fn test_patch_var_column_grow_rejects() {
+        let schema = user_schema();
+        let row = vec![
+            Value::Str("Al".into()),                    // 2 bytes
+            Value::Str("alice@example.com".into()),
+            Value::Int(30),
+            Value::Bool(true),
+        ];
+        let mut encoded = encode_row(&schema, &row);
+        let layout = RowLayout::new(&schema);
+        assert!(patch_var_column_in_place(&mut encoded, &layout, 0, Some(b"Alexandra")).is_none());
+    }
+
+    #[test]
+    fn test_patch_var_column_to_null() {
+        let schema = user_schema();
+        let row = vec![
+            Value::Str("Alice".into()),
+            Value::Str("alice@example.com".into()),
+            Value::Int(30),
+            Value::Bool(true),
+        ];
+        let mut encoded = encode_row(&schema, &row);
+        let layout = RowLayout::new(&schema);
+        // Set `name` to null.
+        let new_len = patch_var_column_in_place(&mut encoded, &layout, 0, None).unwrap();
+        encoded.truncate(new_len as usize);
+        let decoded = decode_row(&schema, &encoded);
+        assert_eq!(decoded[0], Value::Empty);
+        assert_eq!(decoded[1], Value::Str("alice@example.com".into()));
+    }
+
+    #[test]
+    fn test_patch_var_column_clears_null_bit() {
+        let schema = Schema {
+            table_name: "U".into(),
+            columns: vec![
+                ColumnDef { name: "label".into(), type_id: TypeId::Str, required: false, position: 0 },
+                ColumnDef { name: "fill".into(),  type_id: TypeId::Str, required: false, position: 1 },
+            ],
+        };
+        // Start with label = null; we need enough room in the (currently
+        // 0-length) label slot to fit new content — which we don't have.
+        // So this should reject.
+        let row = vec![Value::Empty, Value::Str("data".into())];
+        let mut encoded = encode_row(&schema, &row);
+        let layout = RowLayout::new(&schema);
+        // Attempting to write "x" into a currently 0-length var col should
+        // be a grow → rejected.
+        assert!(patch_var_column_in_place(&mut encoded, &layout, 0, Some(b"x")).is_none());
     }
 
     #[test]

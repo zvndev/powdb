@@ -1,6 +1,6 @@
 use crate::btree::BTree;
 use crate::heap::HeapFile;
-use crate::row::{decode_column, decode_row, encode_row_into, RowLayout};
+use crate::row::{decode_column, decode_row, encode_row_into, patch_var_column_in_place, RowLayout};
 use crate::types::*;
 use rustc_hash::FxHashMap;
 use std::io;
@@ -203,6 +203,36 @@ impl Table {
         F: FnOnce(&mut [u8]),
     {
         self.heap.with_row_bytes_mut(rid, f)
+    }
+
+    /// Patch a single var-length column in place, shrinking the row when
+    /// the new value is smaller than the old one. Returns `Ok(true)` on
+    /// success, `Ok(false)` when the new value would grow the row or the
+    /// slot is gone (caller should fall back to the full update path).
+    ///
+    /// The caller is responsible for ensuring no indexed column is
+    /// touched by this patch — indexes are NOT maintained here.
+    ///
+    /// Mission C Phase 10: backs the executor's `update_by_filter` fast
+    /// path for var-length single-column assignments.
+    #[inline]
+    pub fn patch_var_col_in_place(
+        &mut self,
+        rid: RowId,
+        col_idx: usize,
+        new_value: Option<&[u8]>,
+    ) -> io::Result<bool> {
+        let layout = &self.row_layout;
+        self.heap.patch_row_shrink(rid, |bytes| {
+            patch_var_column_in_place(bytes, layout, col_idx, new_value)
+        })
+    }
+
+    /// Cached row layout for this table. Used by the executor to plan
+    /// the byte-patch fast paths without re-walking the schema.
+    #[inline]
+    pub fn row_layout(&self) -> &RowLayout {
+        &self.row_layout
     }
 
     /// Schema column indices that currently have an index. Used by the

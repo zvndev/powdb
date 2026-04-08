@@ -771,6 +771,74 @@ impl Engine {
                     return Ok(QueryResult::Modified(count));
                 }
 
+                // Mission C Phase 10: var-column in-place shrink fast path.
+                // If the update is a single assignment targeting a var-length
+                // Str/Bytes column that isn't indexed, try to patch the row's
+                // raw bytes directly via `patch_var_col_in_place`. The helper
+                // returns false when the new value would grow the row — those
+                // rids get collected and processed by the generic slow path
+                // below. For `update_by_filter status := "senior"` on the
+                // Mission A bench every row either matches (6→6) or shrinks
+                // (7→6, 8→6), so the fast path claims ~100% of rows.
+                let var_fast: Option<(usize, Option<Vec<u8>>)> = {
+                    let tbl = self.catalog.get_table(table)
+                        .ok_or_else(|| format!("table '{table}' not found"))?;
+                    let schema = &tbl.schema;
+                    let is_single = resolved_assignments.len() == 1;
+                    let is_var_col = is_single
+                        && !is_fixed_size(schema.columns[resolved_assignments[0].0].type_id);
+                    let no_indexed = !resolved_assignments.iter()
+                        .any(|(idx, _)| tbl.indexed_col_indices().contains(idx));
+
+                    if is_single && is_var_col && no_indexed {
+                        let (idx, val) = &resolved_assignments[0];
+                        let bytes_opt: Option<Vec<u8>> = match val {
+                            Value::Str(s) => Some(s.as_bytes().to_vec()),
+                            Value::Bytes(b) => Some(b.clone()),
+                            Value::Empty => None,
+                            _ => return Err(format!(
+                                "type mismatch: cannot assign non-var value to var column '{}'",
+                                schema.columns[*idx].name
+                            )),
+                        };
+                        Some((*idx, bytes_opt))
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some((col_idx, new_bytes_opt)) = var_fast {
+                    let new_bytes_ref: Option<&[u8]> = new_bytes_opt.as_deref();
+                    let mut count = 0u64;
+                    let mut fallback_rids: Vec<RowId> = Vec::new();
+                    for rid in &matching_rids {
+                        let ok = self.catalog
+                            .patch_var_col_in_place(table, *rid, col_idx, new_bytes_ref)
+                            .map_err(|e| e.to_string())?;
+                        if ok {
+                            count += 1;
+                        } else {
+                            fallback_rids.push(*rid);
+                        }
+                    }
+                    // Handle rids that needed to grow (or have been
+                    // concurrently deleted — cheap extra `get` call).
+                    for rid in fallback_rids {
+                        let mut row = match self.catalog.get(table, rid) {
+                            Some(r) => r,
+                            None => continue,
+                        };
+                        for (idx, val) in &resolved_assignments {
+                            row[*idx] = val.clone();
+                        }
+                        self.catalog
+                            .update_hinted(table, rid, &row, Some(&changed_cols))
+                            .map_err(|e| e.to_string())?;
+                        count += 1;
+                    }
+                    return Ok(QueryResult::Modified(count));
+                }
+
                 let mut count = 0u64;
                 for rid in matching_rids {
                     let mut row = match self.catalog.get(table, rid) {

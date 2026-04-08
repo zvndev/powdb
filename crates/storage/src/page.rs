@@ -182,6 +182,34 @@ impl Page {
         Some(&mut self.data[start..end])
     }
 
+    /// Shrink an existing slot's recorded length. The caller has already
+    /// written the new bytes into the first `new_len` bytes of the slot —
+    /// this call only updates the slot-directory entry. Returns `false` if
+    /// the slot is deleted, out of range, or `new_len` > current length
+    /// (growth is not supported by this primitive).
+    ///
+    /// Mission C Phase 10: backs the var-column in-place update fast path.
+    /// For `update { status := "senior" }` over a 50K-row filter, the old
+    /// values cycle through "active"/"inactive"/"pending" (≥ 6 bytes) and
+    /// the new value is 6 bytes — every row shrinks or matches, so we can
+    /// patch the slot bytes directly and then truncate via this method
+    /// instead of re-encoding the whole row.
+    #[inline]
+    pub fn shrink_slot(&mut self, slot: u16, new_len: u16) -> bool {
+        if slot >= self.slot_count() {
+            return false;
+        }
+        let (offset, old_length) = self.read_slot_entry(slot);
+        if old_length == DELETED_MARKER {
+            return false;
+        }
+        if new_len > old_length {
+            return false;
+        }
+        self.write_slot_entry(slot, offset, new_len);
+        true
+    }
+
     /// Mark a slot as deleted. Does not reclaim space (compaction is separate).
     pub fn delete(&mut self, slot: u16) {
         if slot < self.slot_count() {
@@ -340,6 +368,19 @@ mod tests {
         assert!(page.update(0, b"hello world much longer")); // larger — appends
         assert_eq!(page.get(0).unwrap(), b"hello world much longer");
         assert!(page.free_space() < free_before);
+    }
+
+    #[test]
+    fn test_shrink_slot() {
+        let mut page = Page::new(1, PageType::Data);
+        page.insert(b"hello world!!").unwrap();
+        assert!(page.shrink_slot(0, 5));
+        assert_eq!(page.get(0).unwrap(), b"hello");
+        // Growing is rejected.
+        assert!(!page.shrink_slot(0, 100));
+        // Deleted slot is rejected.
+        page.delete(0);
+        assert!(!page.shrink_slot(0, 1));
     }
 
     #[test]

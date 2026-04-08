@@ -140,6 +140,27 @@ impl Catalog {
         t.with_row_bytes_mut(rid, f)
     }
 
+    /// Mission C Phase 10: var-column in-place update fast path. Patches
+    /// a single variable-length column's bytes directly into the row's
+    /// slot, shrinking the row if the new value is smaller. Returns
+    /// `Ok(false)` if the new value would grow the row (caller must fall
+    /// back to the full encode path) or the row is gone.
+    ///
+    /// Caller guarantees no indexed column is touched — indexes are NOT
+    /// maintained by this primitive.
+    #[inline]
+    pub fn patch_var_col_in_place(
+        &mut self,
+        table: &str,
+        rid: RowId,
+        col_idx: usize,
+        new_value: Option<&[u8]>,
+    ) -> io::Result<bool> {
+        let t = self.tables.get_mut(table)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
+        t.patch_var_col_in_place(rid, col_idx, new_value)
+    }
+
     pub fn scan(&self, table: &str) -> io::Result<impl Iterator<Item = (RowId, Row)> + '_> {
         let t = self.tables.get(table)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;

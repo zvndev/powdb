@@ -394,6 +394,48 @@ impl HeapFile {
         Ok(false)
     }
 
+    /// Apply an in-place mutation that may SHRINK a row. The closure
+    /// receives `&mut [u8]` of the current row and returns `Some(new_len)`
+    /// if the mutation succeeded (with `new_len <= current len`), or
+    /// `None` to signal "doesn't fit in place, caller should fall back".
+    /// On success the slot directory is updated so the row is now
+    /// `new_len` bytes long.
+    ///
+    /// Mission C Phase 10: backs the var-column update fast path for
+    /// `update_by_filter`. The closure uses
+    /// [`crate::row::patch_var_column_in_place`] to rewrite the single
+    /// changed var column in the row's raw bytes without invoking
+    /// `decode_row` / `encode_row_into`.
+    ///
+    /// Returns `Ok(true)` if the patch landed, `Ok(false)` if the row is
+    /// deleted/missing OR the closure returned `None`.
+    #[inline]
+    pub fn patch_row_shrink<F>(&mut self, rid: RowId, f: F) -> io::Result<bool>
+    where
+        F: FnOnce(&mut [u8]) -> Option<u16>,
+    {
+        self.ensure_hot(rid.page_id)?;
+        let hot = self.hot_page.as_mut().unwrap();
+        let Some(bytes) = hot.page.slot_bytes_mut(rid.slot_index) else {
+            return Ok(false);
+        };
+        let old_len = bytes.len();
+        let Some(new_len) = f(bytes) else {
+            return Ok(false);
+        };
+        // Defence in depth: the helper's contract says new_len <= old_len,
+        // but if a bug upstream lies to us we don't want to silently corrupt
+        // the slot directory.
+        if (new_len as usize) > old_len {
+            return Ok(false);
+        }
+        if (new_len as usize) != old_len {
+            hot.page.shrink_slot(rid.slot_index, new_len);
+        }
+        hot.dirty = true;
+        Ok(true)
+    }
+
     /// Apply a borrowed read to a row's raw bytes. Like
     /// [`with_row_bytes_mut`] but without the mutable-access path — the
     /// closure sees the row slice, runs, and returns. No `Vec<u8>` is
