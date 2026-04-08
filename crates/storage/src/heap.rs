@@ -526,6 +526,79 @@ impl HeapFile {
         Ok(None)
     }
 
+    /// Single-pass scan-and-delete. Walks every page in order, running
+    /// `pred` on each live row's raw bytes. When `pred` returns `true`,
+    /// `hook` is called with the same bytes (caller uses this to extract
+    /// index keys before the slot is cleared) and the slot is marked
+    /// deleted in place. Returns the total number of rows removed.
+    ///
+    /// Mission C Phase 16: fuses `collect_rids_for_mutation` +
+    /// `delete_many` into one traversal. The old path did two walks over
+    /// the heap — first building a `Vec<RowId>` via `for_each_row` (reads
+    /// from mmap), then visiting each rid via `delete_with_hook` which
+    /// called `ensure_hot(rid.page_id)` per row. Even when the rids were
+    /// already sorted by page_id, every page boundary cost a
+    /// `park_hot_page` + `Page::from_bytes` (4KB memcpy from the dirty
+    /// buffer or mmap). For a 100K-row `delete_by_filter` with ~20K
+    /// matches spread across ~3000 pages, that was ~3000 redundant page
+    /// installs worth ~500-800ns each — meaningful slice of a ~1.9ms
+    /// query. This primitive does exactly one `ensure_hot` per page and
+    /// mutates in place under the single pinned borrow.
+    #[inline]
+    pub fn scan_delete_matching<P, H>(
+        &mut self,
+        mut pred: P,
+        mut hook: H,
+    ) -> io::Result<u64>
+    where
+        P: FnMut(&[u8]) -> bool,
+        H: FnMut(&[u8]),
+    {
+        let num_pages = self.disk.num_pages();
+        if num_pages == 0 {
+            return Ok(0);
+        }
+        let mut count = 0u64;
+        for page_id in 0..num_pages {
+            self.ensure_hot(page_id)?;
+            let mut any_deleted = false;
+            {
+                let hot = self.hot_page.as_mut().unwrap();
+                let slot_count = hot.page.slot_count();
+                for slot in 0..slot_count {
+                    // Scoped immutable borrow for the pred/hook invocation,
+                    // then a separate mutable call to `delete`. The borrow
+                    // checker is happy because each borrow ends inside the
+                    // same iteration.
+                    let should_delete = match hot.page.get(slot) {
+                        Some(bytes) => {
+                            if pred(bytes) {
+                                hook(bytes);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        None => false,
+                    };
+                    if should_delete {
+                        hot.page.delete(slot);
+                        any_deleted = true;
+                        count += 1;
+                    }
+                }
+                if any_deleted {
+                    hot.dirty = true;
+                }
+            }
+            if any_deleted && !self.is_in_free_list(page_id) {
+                self.pages_with_space.push(page_id);
+                self.mark_free(page_id);
+            }
+        }
+        Ok(count)
+    }
+
     /// Update a row. Returns new RowId (may change if row moves).
     ///
     /// Mission C Phase 1: in-place updates land on the hot page directly.
@@ -982,6 +1055,75 @@ mod tests {
         let new_rid = heap.update(rid, &encode_row(&schema, &new_row)).unwrap();
         let decoded = decode_row(&schema, &heap.get(new_rid).unwrap());
         assert_eq!(decoded[1], Value::Int(31));
+        drop(heap);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_scan_delete_matching_basic() {
+        let (mut heap, path) = temp_heap("sdm_basic");
+        let schema = user_schema();
+        // Insert enough rows to span multiple pages so the per-page
+        // ensure_hot loop is actually exercised.
+        let mut inserted = Vec::new();
+        for i in 0..500 {
+            let row = vec![Value::Str(format!("user_{i:04}")), Value::Int(i)];
+            inserted.push(heap.insert(&encode_row(&schema, &row)).unwrap());
+        }
+
+        // Delete every row whose age is even via raw-bytes predicate.
+        // The age column is at schema position 1 (after the name str).
+        let layout = crate::row::RowLayout::new(&schema);
+        let mut deleted_keys: Vec<i64> = Vec::new();
+        let count = heap.scan_delete_matching(
+            |data| {
+                match crate::row::decode_column(&schema, &layout, data, 1) {
+                    Value::Int(i) => i % 2 == 0,
+                    _ => false,
+                }
+            },
+            |data| {
+                if let Value::Int(i) = crate::row::decode_column(&schema, &layout, data, 1) {
+                    deleted_keys.push(i);
+                }
+            },
+        ).unwrap();
+
+        assert_eq!(count, 250); // half the rows
+        assert_eq!(deleted_keys.len(), 250);
+        deleted_keys.sort_unstable();
+        let expected: Vec<i64> = (0..500).step_by(2).collect();
+        assert_eq!(deleted_keys, expected);
+        // Remaining rows should all be odd.
+        let remaining: Vec<_> = heap.scan().collect();
+        assert_eq!(remaining.len(), 250);
+        for (_, data) in &remaining {
+            let row = decode_row(&schema, data);
+            if let Value::Int(i) = &row[1] {
+                assert_eq!(i % 2, 1);
+            }
+        }
+        drop(heap);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_scan_delete_matching_all_or_none() {
+        let (mut heap, path) = temp_heap("sdm_edge");
+        let schema = user_schema();
+        for i in 0..50 {
+            let row = vec![Value::Str(format!("u{i}")), Value::Int(i)];
+            heap.insert(&encode_row(&schema, &row)).unwrap();
+        }
+        // Predicate never matches — zero deletions, scan count unchanged.
+        let c = heap.scan_delete_matching(|_| false, |_| {}).unwrap();
+        assert_eq!(c, 0);
+        assert_eq!(heap.scan().count(), 50);
+
+        // Predicate always matches — everything gone.
+        let c = heap.scan_delete_matching(|_| true, |_| {}).unwrap();
+        assert_eq!(c, 50);
+        assert_eq!(heap.scan().count(), 0);
         drop(heap);
         std::fs::remove_file(&path).ok();
     }

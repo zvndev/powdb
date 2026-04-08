@@ -1183,6 +1183,41 @@ impl Engine {
                 // `delete_by_filter` (100K fixture, ~20K matches) that
                 // removes ~4ms of pure `Vec::remove` memmove from the btree
                 // maintenance phase.
+                //
+                // Mission C Phase 16: for the common `delete where ...`
+                // shape (Filter(SeqScan)) — and the rarer "delete
+                // everything" shape (SeqScan) — skip the two-pass
+                // `collect_rids_for_mutation` + `delete_many` flow entirely.
+                // The fused `scan_delete_matching` primitive walks the
+                // heap exactly once, paying one `ensure_hot` per page
+                // instead of per-row. That closes the last major gap on
+                // the bench's `delete_by_filter` workload.
+                if let PlanNode::Filter { input: inner, predicate } = input.as_ref() {
+                    if let PlanNode::SeqScan { table: t } = inner.as_ref() {
+                        if t == table {
+                            let schema = self.catalog.schema(table)
+                                .ok_or_else(|| format!("table '{table}' not found"))?;
+                            let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+                            let fast = FastLayout::new(schema);
+                            if let Some(compiled) = compile_predicate(predicate, &columns, &fast, schema) {
+                                let count = self.catalog
+                                    .scan_delete_matching(table, |data| compiled(data))
+                                    .map_err(|e| e.to_string())?;
+                                return Ok(QueryResult::Modified(count));
+                            }
+                        }
+                    }
+                } else if let PlanNode::SeqScan { table: t } = input.as_ref() {
+                    if t == table {
+                        // `delete from T` with no predicate — every live
+                        // row matches. One pass is still the right shape.
+                        let count = self.catalog
+                            .scan_delete_matching(table, |_| true)
+                            .map_err(|e| e.to_string())?;
+                        return Ok(QueryResult::Modified(count));
+                    }
+                }
+
                 let matching_rids = self.collect_rids_for_mutation(input, table)?;
                 let count = self
                     .catalog

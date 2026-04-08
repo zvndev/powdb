@@ -109,6 +109,18 @@ impl Catalog {
         t.delete_many(rids)
     }
 
+    /// Mission C Phase 16: single-pass scan-and-delete driven by a
+    /// raw-bytes predicate. See [`Table::scan_delete_matching`] and
+    /// [`HeapFile::scan_delete_matching`] for the fusion rationale.
+    pub fn scan_delete_matching<P>(&mut self, table: &str, pred: P) -> io::Result<u64>
+    where
+        P: FnMut(&[u8]) -> bool,
+    {
+        let t = self.tables.get_mut(table)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
+        t.scan_delete_matching(pred)
+    }
+
     pub fn update(&mut self, table: &str, rid: RowId, values: &Row) -> io::Result<RowId> {
         let t = self.tables.get_mut(table)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;

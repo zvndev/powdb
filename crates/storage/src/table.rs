@@ -273,6 +273,87 @@ impl Table {
         Ok(count)
     }
 
+    /// Single-pass scan-and-delete driven by a raw-bytes predicate. Walks
+    /// the heap once, marks matching rows deleted in place, and updates
+    /// any int-keyed secondary indexes in a single batched
+    /// `delete_many_int` per index at the end. Non-int secondary indexes
+    /// fall back to per-key `btree.delete`, but still ride the same
+    /// single heap pass.
+    ///
+    /// Mission C Phase 16: this is the Table-level hook for
+    /// [`HeapFile::scan_delete_matching`]. See that method for the
+    /// fusion rationale. The executor's `Delete` fast path routes
+    /// `Filter(SeqScan)` / `SeqScan`-shaped delete plans here when the
+    /// predicate compiles.
+    pub fn scan_delete_matching<P>(&mut self, pred: P) -> io::Result<u64>
+    where
+        P: FnMut(&[u8]) -> bool,
+    {
+        if self.indexes.is_empty() {
+            return self.heap.scan_delete_matching(pred, |_| {});
+        }
+
+        // Split the borrow so the hook closure can capture schema /
+        // layout / indexed_cols while `heap` is mutably borrowed by
+        // `scan_delete_matching`.
+        let Table {
+            heap,
+            indexes,
+            schema,
+            row_layout: layout,
+            indexed_cols,
+            ..
+        } = self;
+
+        let n_indexed = indexed_cols.len();
+        let all_int = indexed_cols.iter().all(|c| c.is_int);
+
+        if all_int {
+            let mut keys_per_index: Vec<Vec<i64>> =
+                (0..n_indexed).map(|_| Vec::with_capacity(1024)).collect();
+
+            let count = heap.scan_delete_matching(pred, |data| {
+                for (slot_i, entry) in indexed_cols.iter().enumerate() {
+                    if let Value::Int(i) = decode_column(schema, layout, data, entry.col_idx) {
+                        keys_per_index[slot_i].push(i);
+                    }
+                }
+            })?;
+
+            for (slot_i, entry) in indexed_cols.iter().enumerate() {
+                let keys = &mut keys_per_index[slot_i];
+                keys.sort_unstable();
+                if let Some(btree) = indexes.get_mut(&entry.col_name) {
+                    btree.delete_many_int(keys);
+                }
+            }
+            return Ok(count);
+        }
+
+        // Mixed / non-int secondary indexes: still do the single heap
+        // pass, but fall back to per-key btree deletes at the end.
+        let mut values_per_index: Vec<Vec<Value>> =
+            (0..n_indexed).map(|_| Vec::with_capacity(256)).collect();
+
+        let count = heap.scan_delete_matching(pred, |data| {
+            for (slot_i, entry) in indexed_cols.iter().enumerate() {
+                let v = decode_column(schema, layout, data, entry.col_idx);
+                if !v.is_empty() {
+                    values_per_index[slot_i].push(v);
+                }
+            }
+        })?;
+
+        for (slot_i, entry) in indexed_cols.iter().enumerate() {
+            if let Some(btree) = indexes.get_mut(&entry.col_name) {
+                for v in &values_per_index[slot_i] {
+                    btree.delete(v);
+                }
+            }
+        }
+        Ok(count)
+    }
+
     /// Update a row in place when possible. Falls back to delete+insert only
     /// if the new encoding doesn't fit in the current slot.
     ///
