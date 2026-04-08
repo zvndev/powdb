@@ -178,6 +178,10 @@ impl HeapFile {
     /// circuited the *body* of the closure, not the iteration itself, so
     /// the inner loop kept paying decode_column / pred / call-frame cost
     /// for the trailing 99,900 rows.
+    ///
+    /// Mission D6: prefer the persistent mmap set by `enable_mmap()` instead
+    /// of doing mmap+munmap on every call. The bench's per-query mmap pair
+    /// was a syscall pair we paid on every read query.
     #[inline]
     pub fn try_for_each_row<F>(&self, mut f: F)
     where
@@ -190,7 +194,25 @@ impl HeapFile {
             return;
         }
 
-        // Try mmap for zero-syscall scanning (same fast path as for_each_row).
+        // Fast path: persistent mmap activated by `enable_mmap()`. Zero
+        // syscalls per query — we just slice the existing mapping.
+        if let Some((ptr, len)) = self.mmap_ptr {
+            let mapped = unsafe { std::slice::from_raw_parts(ptr, len) };
+            let pages_in_map = len / PAGE_SIZE;
+            let limit = num_pages.min(pages_in_map as u32);
+            'outer: for page_id in 0..limit {
+                let offset = page_id as usize * PAGE_SIZE;
+                let page_bytes = &mapped[offset..offset + PAGE_SIZE];
+                for (slot, data) in iter_page_slots(page_bytes) {
+                    if let ControlFlow::Break(()) = f(RowId { page_id, slot_index: slot }, data) {
+                        break 'outer;
+                    }
+                }
+            }
+            return;
+        }
+
+        // No persistent mmap — try a per-call mmap as a one-shot best effort.
         use std::os::unix::io::AsRawFd;
         let fd = self.disk.file_ref().as_raw_fd();
         let file_len = (num_pages as usize) * PAGE_SIZE;
@@ -236,7 +258,12 @@ impl HeapFile {
     }
 
     /// Zero-copy scan: calls `f` for every live row without allocating a
-    /// `Vec<u8>` per row. Uses mmap when available to avoid per-page syscalls.
+    /// `Vec<u8>` per row. Uses the persistent mmap activated by
+    /// `enable_mmap()` when available, otherwise falls back to a per-call
+    /// mmap or page-by-page read.
+    ///
+    /// Mission D6: same persistent-mmap fix as `try_for_each_row`.
+    #[inline]
     pub fn for_each_row<F>(&self, mut f: F)
     where
         F: FnMut(RowId, &[u8]),
@@ -246,7 +273,22 @@ impl HeapFile {
             return;
         }
 
-        // Try mmap for zero-syscall scanning
+        // Fast path: persistent mmap.
+        if let Some((ptr, len)) = self.mmap_ptr {
+            let mapped = unsafe { std::slice::from_raw_parts(ptr, len) };
+            let pages_in_map = len / PAGE_SIZE;
+            let limit = num_pages.min(pages_in_map as u32);
+            for page_id in 0..limit {
+                let offset = page_id as usize * PAGE_SIZE;
+                let page_bytes = &mapped[offset..offset + PAGE_SIZE];
+                for (slot, data) in iter_page_slots(page_bytes) {
+                    f(RowId { page_id, slot_index: slot }, data);
+                }
+            }
+            return;
+        }
+
+        // No persistent mmap — try a per-call mmap as a one-shot best effort.
         use std::os::unix::io::AsRawFd;
         let fd = self.disk.file_ref().as_raw_fd();
         let file_len = (num_pages as usize) * PAGE_SIZE;
@@ -262,7 +304,6 @@ impl HeapFile {
         };
 
         if ptr != libc::MAP_FAILED {
-            // mmap succeeded — iterate pages from mapped memory, zero-copy
             let mapped = unsafe { std::slice::from_raw_parts(ptr as *const u8, file_len) };
             for page_id in 0..num_pages {
                 let offset = page_id as usize * PAGE_SIZE;
