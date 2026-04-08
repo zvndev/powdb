@@ -121,6 +121,25 @@ impl Catalog {
         t.update_hinted(rid, values, changed_col_indices)
     }
 
+    /// Mission C Phase 4: fast-path update that patches a row's raw bytes
+    /// in place, skipping decode/encode. Caller guarantees the mutation
+    /// preserves the row length and touches no indexed column. Returns
+    /// `Ok(true)` if the patch landed, `Ok(false)` if the row is gone.
+    #[inline]
+    pub fn with_row_bytes_mut<F>(
+        &mut self,
+        table: &str,
+        rid: RowId,
+        f: F,
+    ) -> io::Result<bool>
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        let t = self.tables.get_mut(table)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
+        t.with_row_bytes_mut(rid, f)
+    }
+
     pub fn scan(&self, table: &str) -> io::Result<impl Iterator<Item = (RowId, Row)> + '_> {
         let t = self.tables.get(table)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;

@@ -159,6 +159,29 @@ impl Page {
         Some(&self.data[start..end])
     }
 
+    /// Mutable view into an existing slot's raw bytes. The returned slice is
+    /// exactly as long as the current row encoding — the caller MUST NOT
+    /// resize it. Used by fixed-size column update fast paths that patch a
+    /// field in place without re-encoding the whole row.
+    ///
+    /// Mission C Phase 4: the old update path went through decode_row +
+    /// Vec<Value> allocation + encode_row_into + page.update, even when the
+    /// change was a single 8-byte int. This primitive lets the executor skip
+    /// all of that by writing the new bytes directly into the page.
+    #[inline]
+    pub fn slot_bytes_mut(&mut self, slot: u16) -> Option<&mut [u8]> {
+        if slot >= self.slot_count() {
+            return None;
+        }
+        let (offset, length) = self.read_slot_entry(slot);
+        if length == DELETED_MARKER {
+            return None;
+        }
+        let start = offset as usize;
+        let end = start + length as usize;
+        Some(&mut self.data[start..end])
+    }
+
     /// Mark a slot as deleted. Does not reclaim space (compaction is separate).
     pub fn delete(&mut self, slot: u16) {
         if slot < self.slot_count() {

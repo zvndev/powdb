@@ -571,9 +571,76 @@ impl Engine {
                 let changed_cols: Vec<usize> =
                     resolved_assignments.iter().map(|(i, _)| *i).collect();
 
+                // Mission C Phase 4: in-place byte-patch fast path. If every
+                // assignment targets a fixed-size non-null column AND none of
+                // them is indexed, we can skip decode_row / Vec<Value> /
+                // encode_row_into entirely and patch the row's raw bytes on
+                // the hot page. For `update_by_pk age := N` on a 6-col User
+                // row this drops ~700ns of per-row work down to a handful of
+                // copies. Precomputed patch metadata is reused across every
+                // matching rid.
+                let fast_patch: Option<Vec<FastPatch>> = {
+                    let tbl = self.catalog.get_table(table)
+                        .ok_or_else(|| format!("table '{table}' not found"))?;
+                    let schema = &tbl.schema;
+                    let all_fixed_nonnull = resolved_assignments.iter().all(|(idx, val)| {
+                        is_fixed_size(schema.columns[*idx].type_id) && !val.is_empty()
+                    });
+                    let no_indexed = !resolved_assignments.iter()
+                        .any(|(idx, _)| tbl.indexed_col_indices().contains(idx));
+
+                    if all_fixed_nonnull && no_indexed {
+                        let layout = RowLayout::new(schema);
+                        let bitmap_size = layout.bitmap_size();
+                        let patches: Vec<FastPatch> = resolved_assignments.iter().map(|(idx, val)| {
+                            let fixed_off = layout.fixed_offset(*idx)
+                                .expect("is_fixed_size already checked");
+                            let field_off = 2 + bitmap_size + fixed_off;
+                            let bytes: FixedBytes = match val {
+                                Value::Int(v)      => FixedBytes::I64(v.to_le_bytes()),
+                                Value::Float(v)    => FixedBytes::F64(v.to_le_bytes()),
+                                Value::Bool(v)     => FixedBytes::Bool(if *v { 1 } else { 0 }),
+                                Value::DateTime(v) => FixedBytes::I64(v.to_le_bytes()),
+                                Value::Uuid(v)     => FixedBytes::Uuid(*v),
+                                _ => unreachable!("all_fixed_nonnull guard lied"),
+                            };
+                            FastPatch {
+                                field_off,
+                                bitmap_byte_off: 2 + idx / 8,
+                                bit_mask: 1u8 << (idx % 8),
+                                bytes,
+                            }
+                        }).collect();
+                        Some(patches)
+                    } else {
+                        None
+                    }
+                };
+
                 // Collect matching RowIds in a single pass (fixes the old
                 // O(N*M) value-equality join against a materialised row set).
                 let matching_rids = self.collect_rids_for_mutation(input, table)?;
+
+                if let Some(patches) = fast_patch {
+                    let mut count = 0u64;
+                    for rid in matching_rids {
+                        let ok = self.catalog.with_row_bytes_mut(table, rid, |row| {
+                            for p in &patches {
+                                // Idempotent null-bit clear — safe even when
+                                // the column was already non-null, which is
+                                // the overwhelmingly common case.
+                                row[p.bitmap_byte_off] &= !p.bit_mask;
+                                let field_bytes = p.bytes.as_slice();
+                                row[p.field_off..p.field_off + field_bytes.len()]
+                                    .copy_from_slice(field_bytes);
+                            }
+                        }).map_err(|e| e.to_string())?;
+                        if ok {
+                            count += 1;
+                        }
+                    }
+                    return Ok(QueryResult::Modified(count));
+                }
 
                 let mut count = 0u64;
                 for rid in matching_rids {
@@ -1126,6 +1193,44 @@ impl Engine {
 
     pub fn catalog_mut(&mut self) -> &mut Catalog {
         &mut self.catalog
+    }
+}
+
+/// Mission C Phase 4: precomputed byte-patch for the in-place update fast
+/// path. Built once per `Update` query (outside the rid loop) and reused on
+/// every matching row.
+#[derive(Clone, Copy)]
+struct FastPatch {
+    /// Byte offset of the fixed column within the row encoding:
+    /// `2 + bitmap_size + layout.fixed_offsets[col]`.
+    field_off: usize,
+    /// Byte offset of the bitmap byte containing this column's null bit
+    /// (`2 + col/8`). We read-modify-write this byte to force the column
+    /// non-null, so the idempotent clear is safe for already-non-null rows.
+    bitmap_byte_off: usize,
+    /// Bit mask for this column's null bit within `bitmap_byte_off`.
+    bit_mask: u8,
+    /// The new fixed-width value encoded as little-endian bytes.
+    bytes: FixedBytes,
+}
+
+#[derive(Clone, Copy)]
+enum FixedBytes {
+    I64([u8; 8]),
+    F64([u8; 8]),
+    Bool(u8),
+    Uuid([u8; 16]),
+}
+
+impl FixedBytes {
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            FixedBytes::I64(b)  => b.as_slice(),
+            FixedBytes::F64(b)  => b.as_slice(),
+            FixedBytes::Bool(b) => std::slice::from_ref(b),
+            FixedBytes::Uuid(b) => b.as_slice(),
+        }
     }
 }
 

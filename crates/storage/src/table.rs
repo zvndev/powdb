@@ -162,6 +162,29 @@ impl Table {
         Ok(new_rid)
     }
 
+    /// Patch a row's raw bytes in place. Caller guarantees the mutation
+    /// does not change the row's total length and does not touch any
+    /// indexed column — indexes are NOT updated by this path.
+    ///
+    /// Mission C Phase 4: see `HeapFile::with_row_bytes_mut`. This is the
+    /// primitive that backs the executor's single-column fixed-width
+    /// update fast path.
+    #[inline]
+    pub fn with_row_bytes_mut<F>(&mut self, rid: RowId, f: F) -> io::Result<bool>
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        self.heap.with_row_bytes_mut(rid, f)
+    }
+
+    /// Schema column indices that currently have an index. Used by the
+    /// executor's update fast-path planner to decide whether a byte-patch
+    /// update is safe (no index to maintain).
+    #[inline]
+    pub fn indexed_col_indices(&self) -> &[usize] {
+        &self.indexed_col_indices
+    }
+
     pub fn scan(&self) -> impl Iterator<Item = (RowId, Row)> + '_ {
         self.heap.scan().map(|(rid, data)| {
             (rid, decode_row(&self.schema, &data))

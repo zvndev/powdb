@@ -255,6 +255,32 @@ impl HeapFile {
         Ok(())
     }
 
+    /// Apply an in-place mutation to a row's raw bytes. The closure
+    /// receives a `&mut [u8]` of exactly the current row size and MUST NOT
+    /// change the slice length. Returns `Ok(true)` if the mutation was
+    /// applied, `Ok(false)` if the row is deleted or gone.
+    ///
+    /// Mission C Phase 4: lets the executor's update-by-pk fast path
+    /// patch a fixed-width column (e.g. `age := 42`) directly on the hot
+    /// page without allocating a `Vec<Value>`, calling `decode_row`, or
+    /// re-running `encode_row_into`. For a 6-column User row that was
+    /// ~700ns of work per update; this primitive replaces it with a
+    /// single in-memory copy plus a branch.
+    #[inline]
+    pub fn with_row_bytes_mut<F>(&mut self, rid: RowId, f: F) -> io::Result<bool>
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        self.ensure_hot(rid.page_id)?;
+        let hot = self.hot_page.as_mut().unwrap();
+        if let Some(bytes) = hot.page.slot_bytes_mut(rid.slot_index) {
+            f(bytes);
+            hot.dirty = true;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Update a row. Returns new RowId (may change if row moves).
     ///
     /// Mission C Phase 1: in-place updates land on the hot page directly.
