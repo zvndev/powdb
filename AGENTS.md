@@ -279,6 +279,63 @@ together) so it doesn't need tuning when noise widens.
 
 ---
 
+## Wide bench
+
+The wide bench compares PowDB against SQLite, Postgres, and MySQL across all
+15 Mission A workloads. It is NOT gated by CI — it's the human-run wide proof,
+separate from the criterion regression gate. Run it locally before any
+thesis-claiming commit.
+
+### Running
+
+```sh
+# 1. Start Postgres + MySQL (PowDB and SQLite are in-process, no server needed)
+docker compose up -d
+
+# 2. Wait for health checks to pass (~10s)
+docker compose ps
+
+# 3. Run the full comparison bench
+cargo run -p powdb-compare --release
+
+# 4. Results are printed to stdout AND written to crates/compare/results.csv
+```
+
+### Output format
+
+The printed table has one row per engine and one column per workload,
+formatted as ns/op with `ns`, `us`, `ms` units. A ratio table follows showing
+each non-PowDB engine as a multiple of PowDB. `sqlite/powdb = 3.1x` means
+SQLite takes 3.1x longer.
+
+### CSV
+
+`crates/compare/results.csv` has columns `engine,workload,ns_per_op,ops_per_sec`.
+15 workloads × N engines = N × 15 rows plus the header.
+
+### Skipping engines
+
+- `docker compose down` disables both Postgres and MySQL.
+- `POWDB_BENCH_PG_URL=skip` forces the Postgres engine to return None.
+- MySQL similarly respects `POWDB_BENCH_MYSQL_URL=skip`.
+- PowDB and SQLite always run.
+
+### When to re-run
+
+After any change to `crates/query/**` or `crates/storage/**`, re-run the wide
+bench locally and verify PowDB still wins every workload ≥2x vs SQLite.
+Regressions here should block merge even though CI doesn't enforce it.
+
+### Relationship to the criterion regression gate
+
+The criterion gate (`.github/workflows/bench.yml`) enforces per-workload
+absolute thresholds and thesis ratios against
+`crates/bench/baseline/main.json`. It runs on every PR. The wide bench is the
+human-run complement: it includes the SQL engine comparisons that CI can't
+run reproducibly.
+
+---
+
 ## Repo layout
 
 ```

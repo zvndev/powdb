@@ -5,12 +5,22 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# MySQL is gated so isolated-worktree builds stay green even when the
+# `engines/mysql.rs` file is not yet present (MYSQL worker owns that file).
+# Enable with `--features mysql` once the file lands, or flip the default
+# once the MYSQL worker's branch has merged.
+default = []
+mysql = ["dep:mysql"]
+
 [dependencies]
 powdb-storage = { path = "../storage" }
 powdb-query = { path = "../query" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 postgres = "0.19"
 tempfile = "3"
+# Optional — only compiled in when the `mysql` feature is enabled.
+mysql = { version = "25", default-features = false, features = ["default-rustls"], optional = true }
 
 [[bin]]
 name = "compare-engines"

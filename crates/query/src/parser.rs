@@ -249,7 +249,27 @@ impl Parser {
         // the first non-pipeline token, which here must be RParen.
         let mut query = self.parse_query_tail(source)?;
         self.expect(&Token::RParen)?;
-        query.aggregation = Some(AggregateExpr { function: func, field: None });
+
+        // For non-count aggregates, the caller typically writes the target
+        // column via the trailing projection form:
+        //     sum(User filter .age > 30 { .age })
+        // We lift that single unaliased `.field` into AggregateExpr.field so
+        // the executor's aggregate fast paths can see it. count() keeps its
+        // projection if present (projection under count is silly but legal).
+        let mut agg_field: Option<String> = None;
+        if func != AggFunc::Count {
+            if let Some(proj) = &query.projection {
+                if proj.len() == 1 && proj[0].alias.is_none() {
+                    if let Expr::Field(name) = &proj[0].expr {
+                        agg_field = Some(name.clone());
+                    }
+                }
+            }
+            if agg_field.is_some() {
+                query.projection = None;
+            }
+        }
+        query.aggregation = Some(AggregateExpr { function: func, field: agg_field });
         Ok(Statement::Query(query))
     }
 
@@ -552,6 +572,58 @@ mod tests {
                 assert!(!ct.fields[1].required);
             }
             _ => panic!("expected create type"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sum_with_field_projection() {
+        // `sum(... { .age })` should lift `.age` into AggregateExpr.field and
+        // clear the projection so the executor's aggregate fast path fires.
+        let stmt = parse("sum(User filter .age > 30 { .age })").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let agg = q.aggregation.expect("aggregate");
+                assert_eq!(agg.function, AggFunc::Sum);
+                assert_eq!(agg.field.as_deref(), Some("age"));
+                assert!(q.projection.is_none(), "projection should be lifted into agg.field");
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_avg_min_max_with_field() {
+        for (src, expected) in [
+            ("avg(User { .age })", AggFunc::Avg),
+            ("min(User { .age })", AggFunc::Min),
+            ("max(User { .age })", AggFunc::Max),
+        ] {
+            let stmt = parse(src).unwrap();
+            match stmt {
+                Statement::Query(q) => {
+                    let agg = q.aggregation.unwrap();
+                    assert_eq!(agg.function, expected, "func mismatch for {src}");
+                    assert_eq!(agg.field.as_deref(), Some("age"), "field mismatch for {src}");
+                    assert!(q.projection.is_none(), "projection should be cleared for {src}");
+                }
+                _ => panic!("expected query for {src}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_count_leaves_projection_alone() {
+        // count() doesn't need a target field, so the projection (if any)
+        // stays intact. It's silly to project inside a count, but it's legal.
+        let stmt = parse("count(User { .age })").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let agg = q.aggregation.unwrap();
+                assert_eq!(agg.function, AggFunc::Count);
+                assert!(agg.field.is_none());
+                assert!(q.projection.is_some(), "count must not eat projection");
+            }
+            _ => panic!("expected query"),
         }
     }
 }

@@ -1,12 +1,23 @@
 //! Bench regression gate comparator.
 //!
 //! Reads the most recent criterion run from `target/criterion/<workload>/new/estimates.json`
-//! for each of the seven workloads listed in
-//! `docs/superpowers/specs/2026-04-07-bench-regression-gate-design.md`, then
-//! compares against two checked-in baseline files:
+//! for every workload in `WORKLOADS`, then compares against two checked-in
+//! baseline files:
 //!
-//! 1. `crates/bench/baseline/main.json`         — per-workload absolute (±7%)
+//! 1. `crates/bench/baseline/main.json`         — per-workload absolute (±7% default, ±10% for noisy)
 //! 2. `crates/bench/baseline/thesis-ratios.json` — ratio ceilings (e.g. 2.5x)
+//!
+//! The workload list covers:
+//!   - Storage-layer guards (insert_10k, btree_lookup, seq_scan_filter).
+//!   - Legacy PowQL guards (powql_point, powql_filter_only,
+//!     powql_filter_projection, powql_aggregation) — workloads 1 and 3 of
+//!     PLAN-MISSION-A.md §1 reuse `powql_point` and `powql_aggregation`
+//!     respectively for gate continuity.
+//!   - Mission A expansion workloads 2, 4-15 from PLAN-MISSION-A.md §1
+//!     (point_lookup_nonindexed, scan_filter_project_top100,
+//!     scan_filter_sort_limit10, agg_sum/avg/min/max, multi_col_and_filter,
+//!     insert_single, insert_batch_1k, update_by_pk, update_by_filter,
+//!     delete_by_filter).
 //!
 //! Exits 0 on pass, 1 on regression. Tolerates `null` baseline values for
 //! the absolute gate so the very first run on a fresh runner can capture
@@ -26,17 +37,62 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-const ABSOLUTE_THRESHOLD: f64 = 0.07; // 7% per-workload tolerance
+/// Default ±7% per-workload tolerance. Matches the storage-layer and legacy
+/// PowQL bench noise floor observed on ubuntu-24.04 and M1.
+const DEFAULT_ABSOLUTE_THRESHOLD: f64 = 0.07;
+
+/// Relaxed ±10% tolerance for the Mission A workloads that run a tight
+/// per-iteration setup or hit paths with more jitter (insert/update/delete
+/// loops, sort+limit over a filtered scan). These workloads have been
+/// measured to fluctuate 3-8% across identical local runs on M1 — the extra
+/// margin keeps the gate honest without flapping.
+const NOISY_ABSOLUTE_THRESHOLD: f64 = 0.10;
 
 const WORKLOADS: &[&str] = &[
+    // ── Storage layer (ratio denominator + existing guards) ──
     "insert_10k",
     "btree_lookup",
     "seq_scan_filter",
-    "powql_point",
-    "powql_filter_only",
-    "powql_filter_projection",
-    "powql_aggregation",
+    // ── Legacy PowQL guards + Mission A workloads 1 & 3 ──
+    "powql_point",               // MA#1 point_lookup_indexed
+    "powql_filter_only",         // legacy 5a
+    "powql_filter_projection",   // legacy 5b
+    "powql_aggregation",         // MA#3 scan_filter_count
+    // ── Mission A reads (workloads 2, 4-10) ──
+    "point_lookup_nonindexed",   // MA#2
+    "scan_filter_project_top100",// MA#4
+    "scan_filter_sort_limit10",  // MA#5
+    "agg_sum",                   // MA#6
+    "agg_avg",                   // MA#7
+    "agg_min",                   // MA#8
+    "agg_max",                   // MA#9
+    "multi_col_and_filter",      // MA#10
+    // ── Mission A writes (workloads 11-15) ──
+    "insert_single",             // MA#11
+    "insert_batch_1k",           // MA#12
+    "update_by_pk",              // MA#13
+    "update_by_filter",          // MA#14
+    "delete_by_filter",          // MA#15
 ];
+
+/// Return the absolute-threshold that applies to a workload. Most workloads
+/// use the ±7% default; a handful of write-heavy or sort-heavy workloads
+/// get ±10% because their per-iter work is chunkier and the variance wider.
+fn threshold_for(workload: &str) -> f64 {
+    match workload {
+        // Sort over a filtered scan + top-N limit: mixed allocation path,
+        // noisier than pure scans.
+        "scan_filter_sort_limit10"
+        // Bulk writes: fixture growth, WAL sync, btree splits — naturally
+        // more variance than point reads.
+        | "insert_single"
+        | "insert_batch_1k"
+        | "update_by_pk"
+        | "update_by_filter"
+        | "delete_by_filter" => NOISY_ABSOLUTE_THRESHOLD,
+        _ => DEFAULT_ABSOLUTE_THRESHOLD,
+    }
+}
 
 #[derive(Debug)]
 struct WorkloadResult {
@@ -52,6 +108,11 @@ struct RatioCheck {
     denominator: String,
     ceiling: f64,
     observed: Option<f64>,
+    /// False when either endpoint has a null baseline entry. Used to keep the
+    /// CRITERION→FASTPATH race quiet during FIRST-RUN CAPTURE: if the
+    /// baseline can't tell us what "good" looks like yet, we print the
+    /// current ratio for humans but don't fail the gate.
+    enforced: bool,
 }
 
 fn main() -> ExitCode {
@@ -121,10 +182,10 @@ fn main() -> ExitCode {
 
     // ── Print absolute gate table ──────────────────────────────────────────
     println!(
-        "{:<28} {:>14} {:>14} {:>10} {:>8}",
-        "workload", "baseline", "current", "delta", "gate"
+        "{:<28} {:>14} {:>14} {:>10} {:>6} {:>8}",
+        "workload", "baseline", "current", "delta", "thr", "gate"
     );
-    println!("{}", "─".repeat(78));
+    println!("{}", "─".repeat(86));
 
     let mut absolute_failed = false;
     let mut first_run_capture = false;
@@ -138,11 +199,14 @@ fn main() -> ExitCode {
             .map(|ns| format!("{:>10.0} ns", ns))
             .unwrap_or_else(|| "        n/a".to_string());
 
+        let threshold = threshold_for(&r.name);
+        let threshold_str = format!("{:>4.0}%", threshold * 100.0);
+
         let (delta_str, gate_str) = match (r.baseline_ns, r.current_ns) {
             (Some(b), Some(c)) => {
                 let delta = (c - b) / b;
                 let pct = format!("{:+>9.2}%", delta * 100.0);
-                if delta > ABSOLUTE_THRESHOLD {
+                if delta > threshold {
                     absolute_failed = true;
                     (pct, "FAIL".to_string())
                 } else {
@@ -157,8 +221,8 @@ fn main() -> ExitCode {
         };
 
         println!(
-            "{:<28} {:>14} {:>14} {:>10} {:>8}",
-            r.name, baseline_str, current_str, delta_str, gate_str
+            "{:<28} {:>14} {:>14} {:>10} {:>6} {:>8}",
+            r.name, baseline_str, current_str, delta_str, threshold_str, gate_str
         );
     }
     println!();
@@ -169,15 +233,27 @@ fn main() -> ExitCode {
         Json::Null
     });
 
-    let ratio_checks = parse_ratios(&ratio_json, &current);
+    // Build the baseline-ns map keyed by workload name for the ratio gate's
+    // "only enforce when both endpoints have non-null baselines" rule. This
+    // keeps the CRITERION→FASTPATH race (§4) quiet: pre-FASTPATH, any ratio
+    // whose endpoints are still null in main.json will CAPTURE rather than
+    // FAIL, even if the observed ratio exceeds the ceiling. Once FASTPATH
+    // lands and the rebaseline commit populates the baseline numbers, the
+    // ratio switches to enforcing mode automatically.
+    let baseline_ns_map: BTreeMap<String, Option<f64>> = results
+        .iter()
+        .map(|r| (r.name.clone(), r.baseline_ns))
+        .collect();
+
+    let ratio_checks = parse_ratios(&ratio_json, &current, &baseline_ns_map);
 
     let mut ratio_failed = false;
     if !ratio_checks.is_empty() {
         println!(
-            "{:<32} {:>10} {:>12} {:>8}",
+            "{:<36} {:>10} {:>12} {:>10}",
             "ratio", "ceiling", "current", "gate"
         );
-        println!("{}", "─".repeat(70));
+        println!("{}", "─".repeat(74));
         for check in &ratio_checks {
             let observed_str = check
                 .observed
@@ -185,14 +261,22 @@ fn main() -> ExitCode {
                 .unwrap_or_else(|| "          —".to_string());
             let gate_str = match check.observed {
                 Some(v) if v > check.ceiling => {
-                    ratio_failed = true;
-                    "FAIL"
+                    if check.enforced {
+                        ratio_failed = true;
+                        "FAIL"
+                    } else {
+                        // Endpoint baselines still null: CAPTURE mode.
+                        first_run_capture = true;
+                        "CAPTURE"
+                    }
                 }
-                Some(_) => "PASS",
+                Some(_) => {
+                    if check.enforced { "PASS" } else { "CAPTURE" }
+                }
                 None => "—",
             };
             println!(
-                "{:<32} {:>9.3}x {:>12} {:>8}",
+                "{:<36} {:>9.3}x {:>12} {:>10}",
                 check.name, check.ceiling, observed_str, gate_str
             );
             println!(
@@ -207,7 +291,11 @@ fn main() -> ExitCode {
     if absolute_failed || ratio_failed {
         eprintln!("REGRESSION: gate failed.");
         if absolute_failed {
-            eprintln!("  - one or more workloads exceeded {:.0}% absolute threshold", ABSOLUTE_THRESHOLD * 100.0);
+            eprintln!(
+                "  - one or more workloads exceeded their absolute threshold ({:.0}% default, {:.0}% for noisy write/sort workloads)",
+                DEFAULT_ABSOLUTE_THRESHOLD * 100.0,
+                NOISY_ABSOLUTE_THRESHOLD * 100.0,
+            );
         }
         if ratio_failed {
             eprintln!("  - one or more thesis ratios exceeded their ceiling");
@@ -257,6 +345,7 @@ fn read_estimate_median(criterion_dir: &Path, workload: &str) -> Result<f64, Str
 fn parse_ratios(
     ratio_json: &Json,
     current: &BTreeMap<&'static str, f64>,
+    baseline_ns_map: &BTreeMap<String, Option<f64>>,
 ) -> Vec<RatioCheck> {
     let Some(ratios) = ratio_json.get("ratios").and_then(Json::as_object) else {
         return vec![];
@@ -276,12 +365,28 @@ fn parse_ratios(
                 _ => None,
             };
 
+            // Enforce only when BOTH endpoints have non-null baselines. This
+            // implements the CRITERION→FASTPATH race resolution from
+            // PLAN-MISSION-A.md §4: pre-FASTPATH, ratios with null endpoints
+            // CAPTURE rather than FAIL, and the rebaseline commit flips them
+            // to enforcing mode by populating the baseline values.
+            let num_baseline = baseline_ns_map
+                .get(&numerator)
+                .copied()
+                .unwrap_or(None);
+            let den_baseline = baseline_ns_map
+                .get(&denominator)
+                .copied()
+                .unwrap_or(None);
+            let enforced = num_baseline.is_some() && den_baseline.is_some();
+
             Some(RatioCheck {
                 name: name.clone(),
                 numerator,
                 denominator,
                 ceiling,
                 observed,
+                enforced,
             })
         })
         .collect()
