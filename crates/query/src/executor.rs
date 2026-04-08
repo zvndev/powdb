@@ -352,7 +352,7 @@ impl Engine {
 
         // Key column must have an index (the btree.lookup path is what
         // makes the fast path worth building).
-        if !tbl.indexes.contains_key(&key_col) {
+        if !tbl.has_index(&key_col) {
             return None;
         }
 
@@ -510,7 +510,7 @@ impl Engine {
         //    one `with_row_bytes_mut` call. No Vec allocations at all.
         let tbl = self.catalog.get_table_mut(&fast.table)
             .ok_or_else(|| format!("table '{}' not found", fast.table))?;
-        let Some(btree) = tbl.indexes.get(&fast.key_col) else {
+        let Some(btree) = tbl.index(&fast.key_col) else {
             // Index dropped since prepare — bail to the generic path.
             return Ok(None);
         };
@@ -672,12 +672,11 @@ impl Engine {
                         }
                     }).collect();
 
-                    if tbl.indexes.contains_key(column) {
+                    if let Some(btree) = tbl.index(column) {
                         let layout = RowLayout::new(&schema);
                         // Mission D7: int-specialized lookup skips the
                         // `<Value as Ord>::cmp` discriminant dispatch on
                         // int-keyed indexes (the vast majority).
-                        let btree = tbl.indexes.get(column).unwrap();
                         let lookup_result = match &key_value {
                             Value::Int(k) => btree.lookup_int(*k),
                             other => btree.lookup(other),
@@ -1259,7 +1258,7 @@ impl Engine {
                 // generic `tbl.index_lookup` helper can't do this without
                 // lying about the key type, so we inline the index+heap
                 // touch here.
-                if let Some(btree) = tbl.indexes.get(column) {
+                if let Some(btree) = tbl.index(column) {
                     let hit = match &key_value {
                         Value::Int(k) => btree.lookup_int(*k),
                         other => btree.lookup(other),
@@ -1636,7 +1635,7 @@ impl Engine {
                 {
                     let tbl = self.catalog.get_table(table)
                         .ok_or_else(|| format!("table '{table}' not found"))?;
-                    if let Some(btree) = tbl.indexes.get(column) {
+                    if let Some(btree) = tbl.index(column) {
                         let hit = match &key_value {
                             Value::Int(k) => btree.lookup_int(*k),
                             other => btree.lookup(other),

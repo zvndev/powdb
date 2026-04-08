@@ -2,32 +2,45 @@ use crate::btree::BTree;
 use crate::heap::HeapFile;
 use crate::row::{decode_column, decode_row, encode_row_into, patch_var_column_in_place, RowLayout};
 use crate::types::*;
-use rustc_hash::FxHashMap;
 use std::io;
 use std::path::Path;
 
-/// Mission C Phase 15: per-indexed-column metadata, precomputed in
-/// `create_index` so the hot `Table::insert` path can look up the btree
-/// without walking the schema column list by name. Every field here is a
-/// derived projection over `schema` + `indexes`, kept in lockstep.
-#[derive(Clone)]
+/// Per-indexed-column metadata owning the BTree inline.
+///
+/// Mission C Phase 15 introduced this struct as a cache of `col_idx`,
+/// `col_name`, and `is_int` so the hot `Table::insert` path could skip
+/// the schema column-name linear scan. Mission C Phase 17 folds the
+/// BTree itself into this struct, retiring the parallel
+/// `FxHashMap<String, BTree>` that the hot write paths were otherwise
+/// forced to probe every single call. Everything the write paths need
+/// is now in a single tight `Vec<IndexedCol>` — no hash, no string
+/// compare, no out-of-line allocation.
 pub(crate) struct IndexedCol {
     /// Schema column index of the indexed column.
     pub col_idx: usize,
-    /// Column name — still needed to look the btree out of the
-    /// name-keyed `indexes` map on the write paths.
+    /// Column name — still needed to resolve name-based lookups from the
+    /// executor (`tbl.index("id")`, etc.). Cost is only paid on the
+    /// rarer name-keyed read paths.
     pub col_name: String,
     /// `true` when the column type is `TypeId::Int`. Lets `insert` /
     /// `delete` take the `insert_int` / `delete_int` fast paths without
     /// re-matching the schema every call.
     pub is_int: bool,
+    /// The B+ tree. Lives inline alongside the metadata so the hot
+    /// insert/delete/update loops can touch a single cache line per
+    /// index entry instead of chasing a separate HashMap probe.
+    pub btree: BTree,
 }
 
 /// A table combines a heap file, schema, and optional indexes.
 ///
-/// Mission F: indexes use FxHashMap. Per-row index lookup happens inside
-/// every insert/delete/update — even one HashMap probe per row matters at
-/// 200ns/op tier.
+/// Mission C Phase 17: indexes used to live in a `FxHashMap<String,
+/// BTree>` alongside a parallel `Vec<IndexedCol>` of metadata. Every row
+/// insert paid an FxHash of the index column name to look the btree back
+/// out of the map. This phase collapses both data structures into a
+/// single `Vec<IndexedCol>` where each entry owns its btree inline —
+/// the hot write path walks one small vec and calls straight through to
+/// `insert_int`.
 ///
 /// Mission C Phase 2: holds `encode_scratch`, a reusable buffer for
 /// [`crate::row::encode_row_into`]. Bench loops that push thousands of
@@ -36,15 +49,13 @@ pub(crate) struct IndexedCol {
 pub struct Table {
     pub schema: Schema,
     pub heap: HeapFile,
-    pub indexes: FxHashMap<String, BTree>, // column_name -> index
     /// Reusable scratch buffer for row encoding. Cleared on every call.
     encode_scratch: Vec<u8>,
-    /// Mission C Phase 15: precomputed per-indexed-column metadata. Lets
-    /// the hot insert/delete/update paths iterate `(col_idx, col_name,
-    /// is_int)` tuples directly instead of walking the HashMap and
-    /// re-resolving names per row. Kept in lockstep with `indexes` —
-    /// updated by `create_index`.
-    indexed_cols: Vec<IndexedCol>,
+    /// Per-indexed-column metadata, each entry owning its BTree inline.
+    /// Public to the crate so the query executor's IndexScan fast paths
+    /// can reach in via the `index()` / `index_mut()` helpers instead
+    /// of probing a separate hash map.
+    pub(crate) indexed_cols: Vec<IndexedCol>,
     /// Mission C Phase 7: cached row layout so `delete` can decode only
     /// the indexed columns out of the raw page bytes without running the
     /// full per-row offset calculation every call.
@@ -59,7 +70,6 @@ impl Table {
         Ok(Table {
             schema,
             heap,
-            indexes: FxHashMap::default(),
             encode_scratch: Vec::new(),
             indexed_cols: Vec::new(),
             row_layout,
@@ -76,11 +86,43 @@ impl Table {
         Ok(Table {
             schema,
             heap,
-            indexes: FxHashMap::default(),
             encode_scratch: Vec::new(),
             indexed_cols: Vec::new(),
             row_layout,
         })
+    }
+
+    /// Look up an index by column name. Returns `None` if no index on
+    /// this column. Used by the read-side executor paths (IndexScan,
+    /// Project(IndexScan), etc.) that still need name-based resolution;
+    /// the write-side hot paths iterate `indexed_cols` directly.
+    #[inline]
+    pub fn index(&self, col_name: &str) -> Option<&BTree> {
+        self.indexed_cols
+            .iter()
+            .find(|c| c.col_name == col_name)
+            .map(|c| &c.btree)
+    }
+
+    /// Mutable counterpart to [`Self::index`].
+    #[inline]
+    pub fn index_mut(&mut self, col_name: &str) -> Option<&mut BTree> {
+        self.indexed_cols
+            .iter_mut()
+            .find(|c| c.col_name == col_name)
+            .map(|c| &mut c.btree)
+    }
+
+    /// `true` if this table has an index on the named column.
+    #[inline]
+    pub fn has_index(&self, col_name: &str) -> bool {
+        self.indexed_cols.iter().any(|c| c.col_name == col_name)
+    }
+
+    /// `true` if this table has no secondary indexes at all.
+    #[inline]
+    pub fn indexes_is_empty(&self) -> bool {
+        self.indexed_cols.is_empty()
     }
 
     /// Mission C Phase 15: the hot insert path used to do two wasted
@@ -107,21 +149,23 @@ impl Table {
             return Ok(rid);
         }
 
-        for entry in &self.indexed_cols {
+        // Mission C Phase 17: the btree lives inline in IndexedCol now,
+        // so this loop does zero hash lookups. For a 1-index table
+        // (bench's `User.id` case) the body compiles down to one
+        // bounds-checked vec access + one `insert_int` call, no
+        // FxHash(col_name) / HashMap probe at all.
+        for entry in &mut self.indexed_cols {
             let val = &values[entry.col_idx];
             if val.is_empty() {
                 continue;
             }
-            let Some(btree) = self.indexes.get_mut(&entry.col_name) else {
-                continue;
-            };
             if entry.is_int {
                 if let Value::Int(i) = val {
-                    btree.insert_int(*i, rid);
+                    entry.btree.insert_int(*i, rid);
                     continue;
                 }
             }
-            btree.insert(val.clone(), rid);
+            entry.btree.insert(val.clone(), rid);
         }
         Ok(rid)
     }
@@ -144,16 +188,16 @@ impl Table {
     /// struct-field borrow splitting, so the btree lives alongside the
     /// page borrow inside the closure.
     pub fn delete(&mut self, rid: RowId) -> io::Result<()> {
-        if self.indexes.is_empty() {
+        if self.indexed_cols.is_empty() {
             return self.heap.delete(rid);
         }
 
-        // Split the borrow so `indexes` (mutable) can be captured by the
-        // closure alongside `heap` (also mutable). Rust's disjoint-field
-        // borrowing lets this compile without cloning anything.
+        // Split the borrow so `indexed_cols` (mutable — the btree lives
+        // inside each entry now) can be captured by the closure alongside
+        // `heap` (also mutable). Rust's disjoint-field borrowing lets
+        // this compile without cloning anything.
         let Table {
             heap,
-            indexes,
             schema,
             row_layout: layout,
             indexed_cols,
@@ -161,22 +205,20 @@ impl Table {
         } = self;
 
         heap.with_row_bytes(rid, |data| {
-            for entry in indexed_cols.iter() {
+            for entry in indexed_cols.iter_mut() {
                 let val = decode_column(schema, layout, data, entry.col_idx);
                 if val.is_empty() {
                     continue;
                 }
-                if let Some(btree) = indexes.get_mut(&entry.col_name) {
-                    // Mission C Phase 11: dispatch to delete_int when the
-                    // indexed key is an integer — skips Value::Ord dispatch
-                    // in the btree binary search and partition_point walk.
-                    match &val {
-                        Value::Int(i) => {
-                            btree.delete_int(*i);
-                        }
-                        _ => {
-                            btree.delete(&val);
-                        }
+                // Mission C Phase 11: dispatch to delete_int when the
+                // indexed key is an integer — skips Value::Ord dispatch
+                // in the btree binary search and partition_point walk.
+                match &val {
+                    Value::Int(i) => {
+                        entry.btree.delete_int(*i);
+                    }
+                    _ => {
+                        entry.btree.delete(&val);
                     }
                 }
             }
@@ -209,7 +251,7 @@ impl Table {
         if rids.is_empty() {
             return Ok(0);
         }
-        if self.indexes.is_empty() {
+        if self.indexed_cols.is_empty() {
             for &rid in rids {
                 self.heap.delete(rid)?;
             }
@@ -231,11 +273,10 @@ impl Table {
         }
 
         // Split the borrow so the closure can capture `schema`/`layout`/
-        // `indexed_cols` + `keys_per_index` while `heap` is borrowed mutably
-        // by `delete_with_hook`.
+        // `indexed_cols` while `heap` is borrowed mutably by
+        // `delete_with_hook`.
         let Table {
             heap,
-            indexes,
             schema,
             row_layout: layout,
             indexed_cols,
@@ -261,13 +302,14 @@ impl Table {
             }
         }
 
-        // Batch-compact each btree in a single leaf-chain walk.
-        for (slot_i, entry) in indexed_cols.iter().enumerate() {
+        // Batch-compact each btree in a single leaf-chain walk. Mission C
+        // Phase 17: btrees now live inline in indexed_cols, so this is a
+        // direct `iter_mut()` over the same slice the hook above borrowed
+        // immutably — no HashMap probe required.
+        for (slot_i, entry) in indexed_cols.iter_mut().enumerate() {
             let keys = &mut keys_per_index[slot_i];
             keys.sort_unstable();
-            if let Some(btree) = indexes.get_mut(&entry.col_name) {
-                btree.delete_many_int(keys);
-            }
+            entry.btree.delete_many_int(keys);
         }
 
         Ok(count)
@@ -289,16 +331,18 @@ impl Table {
     where
         P: FnMut(&[u8]) -> bool,
     {
-        if self.indexes.is_empty() {
+        if self.indexed_cols.is_empty() {
             return self.heap.scan_delete_matching(pred, |_| {});
         }
 
         // Split the borrow so the hook closure can capture schema /
-        // layout / indexed_cols while `heap` is mutably borrowed by
-        // `scan_delete_matching`.
+        // layout / indexed_cols (immutably for reads) while `heap` is
+        // mutably borrowed by `scan_delete_matching`. After the scan
+        // completes, the closure is dropped, freeing the shared borrow
+        // of `indexed_cols` so we can flip to `iter_mut()` for the
+        // batch btree compaction.
         let Table {
             heap,
-            indexes,
             schema,
             row_layout: layout,
             indexed_cols,
@@ -320,12 +364,12 @@ impl Table {
                 }
             })?;
 
-            for (slot_i, entry) in indexed_cols.iter().enumerate() {
+            // Mission C Phase 17: btrees live inline in indexed_cols,
+            // so this direct iter_mut replaces the old HashMap probe.
+            for (slot_i, entry) in indexed_cols.iter_mut().enumerate() {
                 let keys = &mut keys_per_index[slot_i];
                 keys.sort_unstable();
-                if let Some(btree) = indexes.get_mut(&entry.col_name) {
-                    btree.delete_many_int(keys);
-                }
+                entry.btree.delete_many_int(keys);
             }
             return Ok(count);
         }
@@ -344,11 +388,9 @@ impl Table {
             }
         })?;
 
-        for (slot_i, entry) in indexed_cols.iter().enumerate() {
-            if let Some(btree) = indexes.get_mut(&entry.col_name) {
-                for v in &values_per_index[slot_i] {
-                    btree.delete(v);
-                }
+        for (slot_i, entry) in indexed_cols.iter_mut().enumerate() {
+            for v in &values_per_index[slot_i] {
+                entry.btree.delete(v);
             }
         }
         Ok(count)
@@ -388,7 +430,7 @@ impl Table {
         values: &Row,
         changed_col_indices: Option<&[usize]>,
     ) -> io::Result<RowId> {
-        let touches_index = if self.indexes.is_empty() {
+        let touches_index = if self.indexed_cols.is_empty() {
             false
         } else if let Some(changed) = changed_col_indices {
             self.indexed_cols
@@ -405,21 +447,23 @@ impl Table {
         let new_rid = self.heap.update(rid, &self.encode_scratch)?;
 
         if touches_index {
-            for (col_name, btree) in &mut self.indexes {
-                let Some(idx) = self.schema.column_index(col_name) else { continue };
-                let new_val = &values[idx];
-                let old_val_opt = old_row.as_ref().map(|r| &r[idx]);
+            // Mission C Phase 17: walk the Vec<IndexedCol> directly.
+            // `col_idx` is already precomputed on each entry, so we
+            // don't even re-probe schema.column_index here.
+            for entry in self.indexed_cols.iter_mut() {
+                let new_val = &values[entry.col_idx];
+                let old_val_opt = old_row.as_ref().map(|r| &r[entry.col_idx]);
 
                 if let Some(old_val) = old_val_opt {
                     if old_val == new_val && new_rid == rid {
                         continue;
                     }
                     if !old_val.is_empty() {
-                        btree.delete(old_val);
+                        entry.btree.delete(old_val);
                     }
                 }
                 if !new_val.is_empty() {
-                    btree.insert(new_val.clone(), new_rid);
+                    entry.btree.insert(new_val.clone(), new_rid);
                 }
             }
         }
@@ -507,38 +551,43 @@ impl Table {
     }
 
     pub fn index_lookup(&self, col_name: &str, key: &Value) -> Option<(RowId, Row)> {
-        let btree = self.indexes.get(col_name)?;
+        let btree = self.index(col_name)?;
         let rid = btree.lookup(key)?;
         let row = self.get(rid)?;
         Some((rid, row))
     }
 
     pub fn create_index(&mut self, col_name: &str, data_dir: &Path) -> io::Result<()> {
+        let col_idx = self.schema.column_index(col_name)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "column not found"))?;
+
+        // Mission C Phase 17: if this column already has an index,
+        // no-op (matches the prior map.insert semantics of silently
+        // replacing a duplicate, minus the wasted work).
+        if self.indexed_cols.iter().any(|c| c.col_idx == col_idx) {
+            return Ok(());
+        }
+
         let idx_path = data_dir.join(format!("{}_{}.idx", self.schema.table_name, col_name));
         let mut btree = BTree::create(&idx_path)?;
 
         // Build index from existing data
-        let col_idx = self.schema.column_index(col_name)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "column not found"))?;
         for (rid, row) in self.scan() {
             if !row[col_idx].is_empty() {
                 btree.insert(row[col_idx].clone(), rid);
             }
         }
 
-        self.indexes.insert(col_name.to_string(), btree);
-        // Mission C Phase 15: keep the precomputed per-indexed-column
-        // metadata in sync. We store col_idx, owned col_name, and an
-        // `is_int` cache so the hot insert/delete paths don't have to
-        // re-resolve any of it per row.
-        if !self.indexed_cols.iter().any(|c| c.col_idx == col_idx) {
-            let is_int = self.schema.columns[col_idx].type_id == TypeId::Int;
-            self.indexed_cols.push(IndexedCol {
-                col_idx,
-                col_name: col_name.to_string(),
-                is_int,
-            });
-        }
+        // Mission C Phase 17: store the btree inline alongside the
+        // cached col_idx / col_name / is_int metadata — single tight
+        // entry per index, walked directly by the hot write paths.
+        let is_int = self.schema.columns[col_idx].type_id == TypeId::Int;
+        self.indexed_cols.push(IndexedCol {
+            col_idx,
+            col_name: col_name.to_string(),
+            is_int,
+            btree,
+        });
         Ok(())
     }
 }

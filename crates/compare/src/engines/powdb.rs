@@ -282,7 +282,7 @@ impl BenchEngine for PowdbEngine {
         // comparisons per lookup on an order-256 tree).
         let engine = self.engine.borrow();
         let tbl = engine.catalog().get_table("User")?;
-        let rid = tbl.indexes.get("id")?.lookup_int(id)?;
+        let rid = tbl.index("id")?.lookup_int(id)?;
         let data = tbl.heap.get(rid)?;
         // Columns: id=0, name=1, age=2, status=3, email=4, created_at=5
         let layout = self.layout.as_ref().unwrap();
