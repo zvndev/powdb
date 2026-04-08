@@ -56,18 +56,31 @@ impl BTree {
     }
 
     fn insert_recursive(&mut self, node_id: usize, key: Value, rid: RowId) -> Option<(Value, usize)> {
-        let node = self.nodes[node_id].clone();
-        match node {
-            Node::Leaf { mut keys, mut values, next_leaf } => {
-                // Mission D1: binary search for the insertion position. Old
-                // linear scan was O(N); ORDER=256 makes this ~5x faster on
-                // average for the leaf-walk inside every insert.
+        // Mission C Phase 6: in-place insert.
+        //
+        // The previous implementation did `let node = self.nodes[node_id].clone();`
+        // at the top of every recursive call. For the common int-keyed leaf
+        // that's a Vec<Value> of up to 256 entries + a Vec<RowId> of the same
+        // length — roughly 4-6 KB of memcpy per insert recursion. With a
+        // height-3 tree that's 12-18 KB of allocator + memcpy traffic on
+        // every insert, which on a 100K-row bench loop dominates the whole
+        // operation.
+        //
+        // The rewrite below does three things:
+        //   1. **Hot path (leaf, no split):** a single `&mut self.nodes[node_id]`
+        //      match, binary search, `Vec::insert` — zero clones.
+        //   2. **Leaf split:** still in place; the only allocation is the
+        //      new right-leaf Node we push onto `self.nodes`.
+        //   3. **Internal descend:** reads `pos` and `child_id` under a
+        //      short borrow, drops the borrow, recurses, then re-borrows to
+        //      insert the promoted key. No node-level clone anywhere.
+        match &mut self.nodes[node_id] {
+            Node::Leaf { keys, values, .. } => {
                 let pos = keys.partition_point(|k| k < &key);
 
-                // Duplicate key — update in place
+                // Duplicate key — update in place.
                 if pos < keys.len() && keys[pos] == key {
                     values[pos] = rid;
-                    self.nodes[node_id] = Node::Leaf { keys, values, next_leaf };
                     return None;
                 }
 
@@ -75,54 +88,77 @@ impl BTree {
                 values.insert(pos, rid);
 
                 if keys.len() <= ORDER {
-                    self.nodes[node_id] = Node::Leaf { keys, values, next_leaf };
-                    None
-                } else {
-                    // Split leaf
-                    let mid = keys.len() / 2;
-                    let right_keys = keys.split_off(mid);
-                    let right_values = values.split_off(mid);
-                    let right_id = self.nodes.len();
-                    let mid_key = right_keys[0].clone();
-
-                    self.nodes[node_id] = Node::Leaf { keys, values, next_leaf: Some(right_id) };
-                    self.nodes.push(Node::Leaf { keys: right_keys, values: right_values, next_leaf });
-
-                    Some((mid_key, right_id))
+                    return None;
                 }
+
+                // Overflow — split. Do the split work while we still hold
+                // the borrow on the current leaf, capture the right-half
+                // buffers + mid_key, drop the borrow, then push the new
+                // leaf onto `self.nodes` and fix up the left leaf's
+                // `next_leaf` pointer.
+                let mid = keys.len() / 2;
+                let right_keys = keys.split_off(mid);
+                let right_values = values.split_off(mid);
+                let mid_key = right_keys[0].clone();
+                // The borrow on self.nodes[node_id] ends here.
+                let captured_next_leaf = match &self.nodes[node_id] {
+                    Node::Leaf { next_leaf, .. } => *next_leaf,
+                    _ => unreachable!(),
+                };
+
+                let right_id = self.nodes.len();
+                self.nodes.push(Node::Leaf {
+                    keys: right_keys,
+                    values: right_values,
+                    next_leaf: captured_next_leaf,
+                });
+                if let Node::Leaf { next_leaf, .. } = &mut self.nodes[node_id] {
+                    *next_leaf = Some(right_id);
+                }
+
+                Some((mid_key, right_id))
             }
             Node::Internal { keys, children } => {
-                // Mission D1: binary search for child descent.
-                // First child whose separator is strictly greater than `key`.
+                // Pick the child whose separator is strictly greater than
+                // `key`. We only need `pos` and `child_id` — drop the borrow
+                // before recursing.
                 let pos = keys.partition_point(|k| k <= &key);
                 let child_id = children[pos];
+                // Borrow on self.nodes[node_id] ends here.
 
-                if let Some((mid_key, new_child_id)) = self.insert_recursive(child_id, key, rid) {
-                    // Child was split — insert the promoted key here
-                    let node = &mut self.nodes[node_id];
-                    if let Node::Internal { keys, children } = node {
-                        keys.insert(pos, mid_key.clone());
+                let Some((mid_key, new_child_id)) = self.insert_recursive(child_id, key, rid) else {
+                    return None;
+                };
+
+                // Re-borrow to insert the promoted key; possibly split this
+                // internal node. All work that needs the borrow happens
+                // inside the match arm; `self.nodes.push` for the split
+                // right-half runs after the borrow drops.
+                let split_payload = match &mut self.nodes[node_id] {
+                    Node::Internal { keys, children } => {
+                        keys.insert(pos, mid_key);
                         children.insert(pos + 1, new_child_id);
-
                         if keys.len() <= ORDER {
-                            return None;
+                            None
+                        } else {
+                            let mid = keys.len() / 2;
+                            let promote_key = keys[mid].clone();
+                            let right_keys: Vec<Value> = keys.drain(mid + 1..).collect();
+                            keys.truncate(mid);
+                            let right_children: Vec<usize> = children.drain(mid + 1..).collect();
+                            Some((promote_key, right_keys, right_children))
                         }
-
-                        // Split internal node
-                        let mid = keys.len() / 2;
-                        let promote_key = keys[mid].clone();
-                        let right_keys: Vec<Value> = keys.drain(mid + 1..).collect();
-                        keys.truncate(mid);
-                        let right_children: Vec<usize> = children.drain(mid + 1..).collect();
-
-                        let right_id = self.nodes.len();
-                        self.nodes.push(Node::Internal {
-                            keys: right_keys,
-                            children: right_children,
-                        });
-                        return Some((promote_key, right_id));
                     }
-                    unreachable!()
+                    _ => unreachable!(),
+                };
+
+                if let Some((promote_key, right_keys, right_children)) = split_payload {
+                    let right_id = self.nodes.len();
+                    self.nodes.push(Node::Internal {
+                        keys: right_keys,
+                        children: right_children,
+                    });
+                    Some((promote_key, right_id))
                 } else {
                     None
                 }
