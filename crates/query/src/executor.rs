@@ -61,9 +61,13 @@ pub struct PreparedQuery {
     ///   * every assignment RHS is `Expr::Literal(_)` (no computed exprs),
     ///     which means param_count == assignments.len() and the caller's
     ///     literal slice maps 1:1 to schema column indices.
-    /// The `Vec<usize>` holds the schema column index for each assignment
-    /// in the same order the caller passes literals.
-    insert_col_indices: Option<Vec<usize>>,
+    ///
+    /// Mission C Phase 15: upgraded from a bare `Vec<usize>` to a
+    /// dedicated [`InsertFast`] struct so the execute path can skip the
+    /// second `catalog.schema(table)` HashMap lookup just to read
+    /// `n_cols`, and can dispatch through `get_table_mut` + `tbl.insert`
+    /// instead of going via the generic `catalog.insert` wrapper.
+    insert_fast: Option<InsertFast>,
     /// Mission C Phase 14: fast-path metadata for point updates by primary
     /// key — `T filter .pk = <lit> update { col := <lit> }` where `pk` is
     /// an indexed column and `col` is fixed-size and not indexed. At
@@ -72,6 +76,23 @@ pub struct PreparedQuery {
     /// and the whole `PlanNode::Update` arm. Just a btree lookup and a
     /// byte patch.
     update_pk_fast: Option<UpdatePkFast>,
+}
+
+/// Mission C Phase 15: precomputed insert fast-path metadata. Built once
+/// in [`Engine::prepare`] from a `PlanNode::Insert` template whose every
+/// assignment RHS is a raw literal. The execute path reads `n_cols` and
+/// `col_indices` directly — no catalog schema lookup needed.
+#[derive(Clone)]
+struct InsertFast {
+    /// Target table name.
+    table: String,
+    /// Schema column index for each positional literal, in the order the
+    /// caller passes them.
+    col_indices: Vec<usize>,
+    /// Total number of schema columns — the size `insert_values_scratch`
+    /// must be resized to before filling positions via `col_indices`.
+    /// Cached here so the hot loop skips `catalog.schema(table)` entirely.
+    n_cols: usize,
 }
 
 /// Mission C Phase 14: precomputed fast-path for `update_by_pk` shaped
@@ -243,18 +264,27 @@ impl Engine {
         // RHS is a literal, resolve column indices once here and store
         // them. execute_prepared will skip the plan-clone + substitute
         // walk on this path.
-        let insert_col_indices = match &plan {
+        //
+        // Mission C Phase 15: also cache `n_cols` and the target table
+        // name so execute_prepared doesn't need a second HashMap lookup
+        // on `self.catalog.schema(table)` just to size the scratch Vec.
+        let insert_fast = match &plan {
             PlanNode::Insert { table, assignments }
                 if assignments.iter().all(|a| matches!(a.value, Expr::Literal(_)))
                    && param_count == assignments.len() =>
             {
                 let schema = self.catalog.schema(table)
                     .ok_or_else(|| format!("table '{table}' not found"))?;
+                let n_cols = schema.columns.len();
                 let indices: Result<Vec<usize>, String> = assignments.iter()
                     .map(|a| schema.column_index(&a.field)
                         .ok_or_else(|| format!("column '{}' not found", a.field)))
                     .collect();
-                Some(indices?)
+                Some(InsertFast {
+                    table: table.clone(),
+                    col_indices: indices?,
+                    n_cols,
+                })
             }
             _ => None,
         };
@@ -277,7 +307,7 @@ impl Engine {
         Ok(PreparedQuery {
             plan_template: plan,
             param_count,
-            insert_col_indices,
+            insert_fast,
             update_pk_fast,
         })
     }
@@ -333,7 +363,7 @@ impl Engine {
         if !is_fixed_size(target_type) {
             return None;
         }
-        if tbl.indexed_col_indices().contains(&target_col_idx) {
+        if tbl.has_indexed_col(target_col_idx) {
             return None;
         }
 
@@ -403,21 +433,22 @@ impl Engine {
         // between `self.catalog` and `self.insert_values_scratch` by
         // moving the scratch into a local, filling it, passing to the
         // catalog, and putting it back.
-        if let (PlanNode::Insert { table, .. }, Some(col_indices)) =
-            (&prep.plan_template, &prep.insert_col_indices)
-        {
-            let n_cols = {
-                let schema = self.catalog.schema(table)
-                    .ok_or_else(|| format!("table '{table}' not found"))?;
-                schema.columns.len()
-            };
+        //
+        // Mission C Phase 15: the cached `InsertFast` carries `n_cols`
+        // and the table name, so the hot path makes exactly one catalog
+        // HashMap lookup (`get_table_mut`) and dispatches straight into
+        // `tbl.insert` — no intermediate schema lookup, no generic
+        // `Catalog::insert` wrapper.
+        if let Some(fast) = &prep.insert_fast {
             let mut values = std::mem::take(&mut self.insert_values_scratch);
             values.clear();
-            values.resize(n_cols, Value::Empty);
+            values.resize(fast.n_cols, Value::Empty);
             for (pos, lit) in literals.iter().enumerate() {
-                values[col_indices[pos]] = literal_value_from(lit);
+                values[fast.col_indices[pos]] = literal_value_from(lit);
             }
-            let res = self.catalog.insert(table, &values).map_err(|e| e.to_string());
+            let tbl = self.catalog.get_table_mut(&fast.table)
+                .ok_or_else(|| format!("table '{}' not found", fast.table))?;
+            let res = tbl.insert(&values).map_err(|e| e.to_string());
             // Clear strings before returning the scratch — don't keep
             // dangling allocations from the previous row alive across
             // calls. `clear()` drops the Value::Str entries.
@@ -525,21 +556,16 @@ impl Engine {
             ));
         }
 
-        if let (PlanNode::Insert { table, .. }, Some(col_indices)) =
-            (&prep.plan_template, &prep.insert_col_indices)
-        {
-            let n_cols = {
-                let schema = self.catalog.schema(table)
-                    .ok_or_else(|| format!("table '{table}' not found"))?;
-                schema.columns.len()
-            };
+        if let Some(fast) = &prep.insert_fast {
             let mut values = std::mem::take(&mut self.insert_values_scratch);
             values.clear();
-            values.resize(n_cols, Value::Empty);
+            values.resize(fast.n_cols, Value::Empty);
             for (pos, lit) in literals.iter_mut().enumerate() {
-                values[col_indices[pos]] = literal_value_take(lit);
+                values[fast.col_indices[pos]] = literal_value_take(lit);
             }
-            let res = self.catalog.insert(table, &values).map_err(|e| e.to_string());
+            let tbl = self.catalog.get_table_mut(&fast.table)
+                .ok_or_else(|| format!("table '{}' not found", fast.table))?;
+            let res = tbl.insert(&values).map_err(|e| e.to_string());
             values.clear();
             self.insert_values_scratch = values;
             res?;
@@ -1005,7 +1031,7 @@ impl Engine {
                         is_fixed_size(schema.columns[*idx].type_id) && !val.is_empty()
                     });
                     let no_indexed = !resolved_assignments.iter()
-                        .any(|(idx, _)| tbl.indexed_col_indices().contains(idx));
+                        .any(|(idx, _)| tbl.has_indexed_col(*idx));
 
                     if all_fixed_nonnull && no_indexed {
                         let layout = RowLayout::new(schema);
@@ -1077,7 +1103,7 @@ impl Engine {
                     let is_var_col = is_single
                         && !is_fixed_size(schema.columns[resolved_assignments[0].0].type_id);
                     let no_indexed = !resolved_assignments.iter()
-                        .any(|(idx, _)| tbl.indexed_col_indices().contains(idx));
+                        .any(|(idx, _)| tbl.has_indexed_col(*idx));
 
                     if is_single && is_var_col && no_indexed {
                         let (idx, val) = &resolved_assignments[0];

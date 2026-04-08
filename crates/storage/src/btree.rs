@@ -55,6 +55,132 @@ impl BTree {
         }
     }
 
+    /// Mission C Phase 15: specialised int-keyed insert.
+    ///
+    /// Same rationale as `lookup_int` / `delete_int`: every comparison in
+    /// the generic path runs through `<Value as Ord>::cmp`, which matches
+    /// on both sides' discriminants before forwarding to `i64::cmp`. On
+    /// `insert_batch_1k` (1000 rows, one index on `id`, ~8 comparisons
+    /// per descent) that's enough dispatch traffic to show up in the
+    /// bench. This path takes the key as a raw `i64`, does single-sided
+    /// discriminant matching in the binary-search loop, and stores the
+    /// key as `Value::Int(i64)` so the on-disk representation stays
+    /// compatible with the generic `insert` / `lookup` paths.
+    #[inline]
+    pub fn insert_int(&mut self, key: i64, rid: RowId) {
+        let root = self.root;
+        if let Some((mid_key, new_node_id)) = self.insert_recursive_int(root, key, rid) {
+            let new_root = Node::Internal {
+                keys: vec![Value::Int(mid_key)],
+                children: vec![self.root, new_node_id],
+            };
+            let new_root_id = self.nodes.len();
+            self.nodes.push(new_root);
+            self.root = new_root_id;
+        }
+    }
+
+    fn insert_recursive_int(&mut self, node_id: usize, key: i64, rid: RowId) -> Option<(i64, usize)> {
+        match &mut self.nodes[node_id] {
+            Node::Leaf { keys, values, .. } => {
+                // Single-sided i64 comparison: since the leaf is all
+                // Value::Int (invariant of an int index), LLVM collapses
+                // this to straight `i64 < key` after inlining.
+                let pos = keys.partition_point(|k| match k {
+                    Value::Int(i) => *i < key,
+                    _ => false,
+                });
+
+                // Duplicate key — overwrite rid in place.
+                if pos < keys.len() {
+                    if let Value::Int(existing) = &keys[pos] {
+                        if *existing == key {
+                            values[pos] = rid;
+                            return None;
+                        }
+                    }
+                }
+
+                keys.insert(pos, Value::Int(key));
+                values.insert(pos, rid);
+
+                if keys.len() <= ORDER {
+                    return None;
+                }
+
+                // Overflow — split (same shape as `insert_recursive`).
+                let mid = keys.len() / 2;
+                let right_keys = keys.split_off(mid);
+                let right_values = values.split_off(mid);
+                let mid_key = match &right_keys[0] {
+                    Value::Int(i) => *i,
+                    _ => unreachable!("int-keyed btree held non-int key"),
+                };
+                let captured_next_leaf = match &self.nodes[node_id] {
+                    Node::Leaf { next_leaf, .. } => *next_leaf,
+                    _ => unreachable!(),
+                };
+
+                let right_id = self.nodes.len();
+                self.nodes.push(Node::Leaf {
+                    keys: right_keys,
+                    values: right_values,
+                    next_leaf: captured_next_leaf,
+                });
+                if let Node::Leaf { next_leaf, .. } = &mut self.nodes[node_id] {
+                    *next_leaf = Some(right_id);
+                }
+
+                Some((mid_key, right_id))
+            }
+            Node::Internal { keys, children } => {
+                // First child whose separator key is strictly greater than
+                // `key`. Same single-sided i64 match as `lookup_int`.
+                let pos = keys.partition_point(|k| match k {
+                    Value::Int(i) => *i <= key,
+                    _ => false,
+                });
+                let child_id = children[pos];
+                // Drop the borrow on self.nodes[node_id] before recursing.
+
+                let (mid_key, new_child_id) = self.insert_recursive_int(child_id, key, rid)?;
+
+                // Re-borrow to insert the promoted key; possibly split.
+                let split_payload = match &mut self.nodes[node_id] {
+                    Node::Internal { keys, children } => {
+                        keys.insert(pos, Value::Int(mid_key));
+                        children.insert(pos + 1, new_child_id);
+                        if keys.len() <= ORDER {
+                            None
+                        } else {
+                            let mid = keys.len() / 2;
+                            let promote_key = match &keys[mid] {
+                                Value::Int(i) => *i,
+                                _ => unreachable!("int-keyed internal held non-int key"),
+                            };
+                            let right_keys: Vec<Value> = keys.drain(mid + 1..).collect();
+                            keys.truncate(mid);
+                            let right_children: Vec<usize> = children.drain(mid + 1..).collect();
+                            Some((promote_key, right_keys, right_children))
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+
+                if let Some((promote_key, right_keys, right_children)) = split_payload {
+                    let right_id = self.nodes.len();
+                    self.nodes.push(Node::Internal {
+                        keys: right_keys,
+                        children: right_children,
+                    });
+                    Some((promote_key, right_id))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
     fn insert_recursive(&mut self, node_id: usize, key: Value, rid: RowId) -> Option<(Value, usize)> {
         // Mission C Phase 6: in-place insert.
         //
@@ -588,6 +714,57 @@ mod tests {
         // Range scan across splits
         let results: Vec<_> = bt.range(&Value::Int(2000), &Value::Int(3000)).collect();
         assert_eq!(results.len(), 1001);
+    }
+
+    #[test]
+    fn test_insert_int_matches_insert() {
+        // Mission C Phase 15: specialized int insert path must produce a
+        // tree indistinguishable from repeated generic `insert` calls
+        // across the full key space, including updates (duplicate keys),
+        // splits, and interleaved reads.
+        let mut bt_fast = temp_btree("insert_int_fast");
+        let mut bt_refn = temp_btree("insert_int_refn");
+        for i in 0..5000i64 {
+            let rid = RowId {
+                page_id: (i / 256) as u32,
+                slot_index: (i % 256) as u16,
+            };
+            bt_fast.insert_int(i, rid);
+            bt_refn.insert(Value::Int(i), rid);
+        }
+        // Cross-check every key 0..5000 and a few missing ones on the
+        // edges.
+        for i in -5..5005 {
+            assert_eq!(bt_fast.lookup_int(i), bt_refn.lookup_int(i), "divergence at key {i}");
+        }
+        assert_eq!(bt_fast.len(), bt_refn.len());
+
+        // Duplicate-key update via the fast path should land on the same
+        // slot as the generic insert.
+        let new_rid = RowId { page_id: 999, slot_index: 42 };
+        bt_fast.insert_int(100, new_rid);
+        bt_refn.insert(Value::Int(100), new_rid);
+        assert_eq!(bt_fast.lookup_int(100), Some(new_rid));
+        assert_eq!(bt_refn.lookup_int(100), Some(new_rid));
+        assert_eq!(bt_fast.len(), bt_refn.len());
+    }
+
+    #[test]
+    fn test_insert_int_reverse_order_splits() {
+        // Exercise descending-key insertion, which stresses the leaf
+        // split path because every insert lands at position 0.
+        let mut bt = temp_btree("insert_int_reverse");
+        for i in (0..1000i64).rev() {
+            bt.insert_int(i, RowId { page_id: 0, slot_index: i as u16 });
+        }
+        for i in 0..1000i64 {
+            assert_eq!(
+                bt.lookup_int(i),
+                Some(RowId { page_id: 0, slot_index: i as u16 }),
+                "missing key {i}",
+            );
+        }
+        assert_eq!(bt.len(), 1000);
     }
 
     #[test]

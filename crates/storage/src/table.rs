@@ -6,6 +6,23 @@ use rustc_hash::FxHashMap;
 use std::io;
 use std::path::Path;
 
+/// Mission C Phase 15: per-indexed-column metadata, precomputed in
+/// `create_index` so the hot `Table::insert` path can look up the btree
+/// without walking the schema column list by name. Every field here is a
+/// derived projection over `schema` + `indexes`, kept in lockstep.
+#[derive(Clone)]
+pub(crate) struct IndexedCol {
+    /// Schema column index of the indexed column.
+    pub col_idx: usize,
+    /// Column name — still needed to look the btree out of the
+    /// name-keyed `indexes` map on the write paths.
+    pub col_name: String,
+    /// `true` when the column type is `TypeId::Int`. Lets `insert` /
+    /// `delete` take the `insert_int` / `delete_int` fast paths without
+    /// re-matching the schema every call.
+    pub is_int: bool,
+}
+
 /// A table combines a heap file, schema, and optional indexes.
 ///
 /// Mission F: indexes use FxHashMap. Per-row index lookup happens inside
@@ -22,9 +39,12 @@ pub struct Table {
     pub indexes: FxHashMap<String, BTree>, // column_name -> index
     /// Reusable scratch buffer for row encoding. Cleared on every call.
     encode_scratch: Vec<u8>,
-    /// Precomputed set of schema column indices that have an index. Kept
-    /// in sync with `indexes` — updated by `create_index`.
-    indexed_col_indices: Vec<usize>,
+    /// Mission C Phase 15: precomputed per-indexed-column metadata. Lets
+    /// the hot insert/delete/update paths iterate `(col_idx, col_name,
+    /// is_int)` tuples directly instead of walking the HashMap and
+    /// re-resolving names per row. Kept in lockstep with `indexes` —
+    /// updated by `create_index`.
+    indexed_cols: Vec<IndexedCol>,
     /// Mission C Phase 7: cached row layout so `delete` can decode only
     /// the indexed columns out of the raw page bytes without running the
     /// full per-row offset calculation every call.
@@ -41,7 +61,7 @@ impl Table {
             heap,
             indexes: FxHashMap::default(),
             encode_scratch: Vec::new(),
-            indexed_col_indices: Vec::new(),
+            indexed_cols: Vec::new(),
             row_layout,
         })
     }
@@ -58,22 +78,50 @@ impl Table {
             heap,
             indexes: FxHashMap::default(),
             encode_scratch: Vec::new(),
-            indexed_col_indices: Vec::new(),
+            indexed_cols: Vec::new(),
             row_layout,
         })
     }
 
+    /// Mission C Phase 15: the hot insert path used to do two wasted
+    /// things per secondary index, on every row:
+    ///   1. `for (col_name, btree) in &mut self.indexes` walked an
+    ///      FxHashMap by iterator (cheap but not free), and
+    ///   2. `self.schema.column_index(col_name)` walked `schema.columns`
+    ///      doing an O(n_cols) strcmp linear search to translate the
+    ///      column name back into its schema position.
+    ///
+    /// For the `insert_batch_1k` bench (1K rows, User table, one index on
+    /// `id`) that came out to ~6 strcmps * 1000 rows = 6K wasted
+    /// comparisons per iteration, plus the HashMap iter overhead. We now
+    /// iterate the precomputed `indexed_cols` slice directly, which hands
+    /// us `(col_idx, col_name, is_int)` per entry, and route int keys
+    /// straight through `BTree::insert_int` to skip the generic
+    /// `Value::Ord` dispatch on every binary-search comparison.
     pub fn insert(&mut self, values: &Row) -> io::Result<RowId> {
         encode_row_into(&self.schema, values, &mut self.encode_scratch);
         let rid = self.heap.insert(&self.encode_scratch)?;
 
-        // Update all indexes
-        for (col_name, btree) in &mut self.indexes {
-            if let Some(idx) = self.schema.column_index(col_name) {
-                if !values[idx].is_empty() {
-                    btree.insert(values[idx].clone(), rid);
+        // Fast path: no indexes — skip the whole loop entirely.
+        if self.indexed_cols.is_empty() {
+            return Ok(rid);
+        }
+
+        for entry in &self.indexed_cols {
+            let val = &values[entry.col_idx];
+            if val.is_empty() {
+                continue;
+            }
+            let Some(btree) = self.indexes.get_mut(&entry.col_name) else {
+                continue;
+            };
+            if entry.is_int {
+                if let Value::Int(i) = val {
+                    btree.insert_int(*i, rid);
+                    continue;
                 }
             }
+            btree.insert(val.clone(), rid);
         }
         Ok(rid)
     }
@@ -108,18 +156,17 @@ impl Table {
             indexes,
             schema,
             row_layout: layout,
-            indexed_col_indices: indexed,
+            indexed_cols,
             ..
         } = self;
 
         heap.with_row_bytes(rid, |data| {
-            for &col_idx in indexed.iter() {
-                let val = decode_column(schema, layout, data, col_idx);
+            for entry in indexed_cols.iter() {
+                let val = decode_column(schema, layout, data, entry.col_idx);
                 if val.is_empty() {
                     continue;
                 }
-                let col_name = &schema.columns[col_idx].name;
-                if let Some(btree) = indexes.get_mut(col_name) {
+                if let Some(btree) = indexes.get_mut(&entry.col_name) {
                     // Mission C Phase 11: dispatch to delete_int when the
                     // indexed key is an integer — skips Value::Ord dispatch
                     // in the btree binary search and partition_point walk.
@@ -170,10 +217,9 @@ impl Table {
         }
 
         // All indexed cols must be int for the batch btree path to apply.
-        let all_int = self
-            .indexed_col_indices
-            .iter()
-            .all(|&idx| self.schema.columns[idx].type_id == TypeId::Int);
+        // Phase 15: `is_int` is precomputed at create_index time, so this
+        // is now a straight bool AND across the slice.
+        let all_int = self.indexed_cols.iter().all(|c| c.is_int);
         if !all_int {
             // Mixed index types — defer to the generic per-row path.
             let mut count = 0u64;
@@ -185,18 +231,18 @@ impl Table {
         }
 
         // Split the borrow so the closure can capture `schema`/`layout`/
-        // `indexed` + `keys_per_index` while `heap` is borrowed mutably by
-        // `delete_with_hook`.
+        // `indexed_cols` + `keys_per_index` while `heap` is borrowed mutably
+        // by `delete_with_hook`.
         let Table {
             heap,
             indexes,
             schema,
             row_layout: layout,
-            indexed_col_indices: indexed,
+            indexed_cols,
             ..
         } = self;
 
-        let n_indexed = indexed.len();
+        let n_indexed = indexed_cols.len();
         let mut keys_per_index: Vec<Vec<i64>> = (0..n_indexed)
             .map(|_| Vec::with_capacity(rids.len()))
             .collect();
@@ -204,8 +250,8 @@ impl Table {
         let mut count = 0u64;
         for &rid in rids {
             let found = heap.delete_with_hook(rid, |data| {
-                for (slot_i, &col_idx) in indexed.iter().enumerate() {
-                    if let Value::Int(i) = decode_column(schema, layout, data, col_idx) {
+                for (slot_i, entry) in indexed_cols.iter().enumerate() {
+                    if let Value::Int(i) = decode_column(schema, layout, data, entry.col_idx) {
                         keys_per_index[slot_i].push(i);
                     }
                 }
@@ -216,11 +262,10 @@ impl Table {
         }
 
         // Batch-compact each btree in a single leaf-chain walk.
-        for (slot_i, &col_idx) in indexed.iter().enumerate() {
+        for (slot_i, entry) in indexed_cols.iter().enumerate() {
             let keys = &mut keys_per_index[slot_i];
             keys.sort_unstable();
-            let col_name = &schema.columns[col_idx].name;
-            if let Some(btree) = indexes.get_mut(col_name) {
+            if let Some(btree) = indexes.get_mut(&entry.col_name) {
                 btree.delete_many_int(keys);
             }
         }
@@ -265,9 +310,9 @@ impl Table {
         let touches_index = if self.indexes.is_empty() {
             false
         } else if let Some(changed) = changed_col_indices {
-            self.indexed_col_indices
+            self.indexed_cols
                 .iter()
-                .any(|i| changed.contains(i))
+                .any(|c| changed.contains(&c.col_idx))
         } else {
             // No hint — fall back to the safe path that reads the old row.
             true
@@ -345,12 +390,14 @@ impl Table {
         &self.row_layout
     }
 
-    /// Schema column indices that currently have an index. Used by the
-    /// executor's update fast-path planner to decide whether a byte-patch
-    /// update is safe (no index to maintain).
+    /// Mission C Phase 15: does the given schema column index have an
+    /// index attached? Used by the executor's update fast-path planner
+    /// to decide whether a byte-patch update is safe (no index to
+    /// maintain). Linear scan over `indexed_cols` — typically 1–3
+    /// entries, so cheaper than a HashMap lookup by name.
     #[inline]
-    pub fn indexed_col_indices(&self) -> &[usize] {
-        &self.indexed_col_indices
+    pub fn has_indexed_col(&self, col_idx: usize) -> bool {
+        self.indexed_cols.iter().any(|c| c.col_idx == col_idx)
     }
 
     pub fn scan(&self) -> impl Iterator<Item = (RowId, Row)> + '_ {
@@ -399,11 +446,17 @@ impl Table {
         }
 
         self.indexes.insert(col_name.to_string(), btree);
-        // Mission C Phase 2: keep the precomputed index-col set in sync so
-        // `update_hinted` can cheaply decide whether an update touches any
-        // indexed column.
-        if !self.indexed_col_indices.contains(&col_idx) {
-            self.indexed_col_indices.push(col_idx);
+        // Mission C Phase 15: keep the precomputed per-indexed-column
+        // metadata in sync. We store col_idx, owned col_name, and an
+        // `is_int` cache so the hot insert/delete paths don't have to
+        // re-resolve any of it per row.
+        if !self.indexed_cols.iter().any(|c| c.col_idx == col_idx) {
+            let is_int = self.schema.columns[col_idx].type_id == TypeId::Int;
+            self.indexed_cols.push(IndexedCol {
+                col_idx,
+                col_name: col_name.to_string(),
+                is_int,
+            });
         }
         Ok(())
     }
