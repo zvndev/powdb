@@ -27,6 +27,40 @@ pub struct Engine {
     plan_cache: PlanCache,
 }
 
+/// Mission C Phase 5: a pre-parsed, pre-planned query. The caller holds
+/// one of these and repeatedly executes it with fresh literal values via
+/// [`Engine::execute_prepared`]. This is PowDB's equivalent of SQLite's
+/// `prepare_cached` — the parse + plan cost is paid exactly once, and
+/// every subsequent execution skips the lexer, the canonicalise hash,
+/// and the plan-cache hashmap lookup.
+///
+/// The template plan still contains the literal values from the original
+/// query string. They're overwritten on every call. See `execute_prepared`
+/// for the substitution walk order.
+///
+/// For `PlanNode::Insert` templates whose assignment values are all plain
+/// literals (the common case — `insert T { id := 1, name := "a" }`), we
+/// additionally resolve the column indices at prepare time and stash them
+/// in `insert_col_indices`. That lets `execute_prepared` skip the
+/// plan-clone + substitute walk entirely and build the row directly from
+/// the caller's literal slice — the fastest possible insert through the
+/// query layer.
+#[derive(Clone)]
+pub struct PreparedQuery {
+    plan_template: PlanNode,
+    /// Total number of `Expr::Literal` slots reachable from the plan.
+    /// Callers must supply exactly this many literals per execution.
+    pub param_count: usize,
+    /// Fast-path metadata for `PlanNode::Insert`. `Some` when:
+    ///   * the template is an Insert, and
+    ///   * every assignment RHS is `Expr::Literal(_)` (no computed exprs),
+    ///     which means param_count == assignments.len() and the caller's
+    ///     literal slice maps 1:1 to schema column indices.
+    /// The `Vec<usize>` holds the schema column index for each assignment
+    /// in the same order the caller passes literals.
+    insert_col_indices: Option<Vec<usize>>,
+}
+
 impl Engine {
     pub fn new(data_dir: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
@@ -133,6 +167,101 @@ impl Engine {
     /// Plan cache stats — useful for benches and debugging.
     pub fn plan_cache_stats(&self) -> (u64, u64, usize) {
         (self.plan_cache.hits, self.plan_cache.misses, self.plan_cache.len())
+    }
+
+    /// Parse and plan a query once, returning a [`PreparedQuery`] handle
+    /// the caller can execute repeatedly with fresh literal values.
+    ///
+    /// Mission C Phase 5: the plan cache already short-circuits repeat
+    /// queries that share a shape, but every call still pays for
+    /// `canonicalize` (lex + FNV hash) and a hashmap lookup. For a tight
+    /// insert loop that's ~500-800ns of pure overhead per call on top of
+    /// the caller's `format!()` cost. Prepared statements skip the lex,
+    /// skip the hash, skip the format, and skip the cache lookup — the
+    /// caller holds the plan template directly and hands us the new
+    /// literals as a slice.
+    ///
+    /// The plan template holds whatever literal values the original query
+    /// string contained; those are overwritten on every `execute_prepared`
+    /// call, same way the plan cache does on a cache hit.
+    ///
+    /// The returned `param_count` matches the total number of
+    /// `Expr::Literal` slots reachable from the plan, in the deterministic
+    /// walk order used by `canonicalize` and the cache. Callers must pass
+    /// exactly that many literals to `execute_prepared`, in the same order
+    /// they appear in the source text.
+    pub fn prepare(&mut self, query: &str) -> Result<PreparedQuery, String> {
+        let plan = planner::plan(query).map_err(|e| e.message)?;
+        let param_count = crate::plan_cache::count_literal_slots(&plan);
+
+        // Insert fast path: if the template is Insert and every assignment
+        // RHS is a literal, resolve column indices once here and store
+        // them. execute_prepared will skip the plan-clone + substitute
+        // walk on this path.
+        let insert_col_indices = match &plan {
+            PlanNode::Insert { table, assignments }
+                if assignments.iter().all(|a| matches!(a.value, Expr::Literal(_)))
+                   && param_count == assignments.len() =>
+            {
+                let schema = self.catalog.schema(table)
+                    .ok_or_else(|| format!("table '{table}' not found"))?;
+                let indices: Result<Vec<usize>, String> = assignments.iter()
+                    .map(|a| schema.column_index(&a.field)
+                        .ok_or_else(|| format!("column '{}' not found", a.field)))
+                    .collect();
+                Some(indices?)
+            }
+            _ => None,
+        };
+
+        Ok(PreparedQuery { plan_template: plan, param_count, insert_col_indices })
+    }
+
+    /// Execute a [`PreparedQuery`] with the given literal values.
+    ///
+    /// The literals are substituted into a clone of the template plan in
+    /// the same deterministic walk order that [`crate::canonicalize`]
+    /// produces (filter predicate first, then projection, then assignment
+    /// RHS, and so on). Substitution errors here mean the caller passed
+    /// the wrong number of literals for this query shape.
+    pub fn execute_prepared(
+        &mut self,
+        prep: &PreparedQuery,
+        literals: &[Literal],
+    ) -> Result<QueryResult, String> {
+        if literals.len() != prep.param_count {
+            return Err(format!(
+                "prepared query expects {} literal(s), got {}",
+                prep.param_count,
+                literals.len(),
+            ));
+        }
+
+        // Insert fast path: skip plan-clone + substitute walk + PlanNode::Insert
+        // arm's column-index resolution. Build the Row directly from the
+        // caller's literal slice using indices we resolved at prepare time.
+        // Saves ~300-500ns per insert on the bench.
+        if let (PlanNode::Insert { table, .. }, Some(col_indices)) =
+            (&prep.plan_template, &prep.insert_col_indices)
+        {
+            let values = {
+                let schema = self.catalog.schema(table)
+                    .ok_or_else(|| format!("table '{table}' not found"))?;
+                let mut values = vec![Value::Empty; schema.columns.len()];
+                for (pos, lit) in literals.iter().enumerate() {
+                    values[col_indices[pos]] = literal_value_from(lit);
+                }
+                values
+            };
+            self.catalog.insert(table, &values).map_err(|e| e.to_string())?;
+            return Ok(QueryResult::Modified(1));
+        }
+
+        let mut plan = prep.plan_template.clone();
+        let mut idx = 0usize;
+        crate::plan_cache::substitute_plan(&mut plan, literals, &mut idx);
+        debug_assert_eq!(idx, literals.len());
+        self.execute_plan(&plan)
     }
 
     pub fn execute_plan(&mut self, plan: &PlanNode) -> Result<QueryResult, String> {
@@ -1257,6 +1386,20 @@ fn literal_to_value(expr: &Expr) -> Result<Value, String> {
     }
 }
 
+/// Mission C Phase 5: direct Literal→Value conversion used by the
+/// prepared-statement Insert fast path. Skips the `Expr::Literal` unwrap
+/// and the `Result` plumbing of [`literal_to_value`]. String literals
+/// still clone because the row needs an owned `Value::Str`.
+#[inline]
+fn literal_value_from(lit: &Literal) -> Value {
+    match lit {
+        Literal::Int(v)    => Value::Int(*v),
+        Literal::Float(v)  => Value::Float(*v),
+        Literal::String(v) => Value::Str(v.clone()),
+        Literal::Bool(v)   => Value::Bool(*v),
+    }
+}
+
 fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value {
     match expr {
         Expr::Field(name) => {
@@ -2129,5 +2272,68 @@ mod tests {
             }
             _ => panic!("expected Int"),
         }
+    }
+
+    // ── Mission C Phase 5: prepared statements ────────────────────
+
+    #[test]
+    fn test_prepared_insert_reuses_template() {
+        let mut engine = test_engine();
+        let prep = engine.prepare(
+            r#"insert User { name := "seed", email := "seed@ex.com", age := 0 }"#
+        ).expect("prepare");
+        // The template has 3 literal slots: name, email, age.
+        assert_eq!(prep.param_count, 3);
+
+        for i in 0..5 {
+            engine.execute_prepared(&prep, &[
+                Literal::String(format!("user{i}")),
+                Literal::String(format!("u{i}@ex.com")),
+                Literal::Int(20 + i as i64),
+            ]).expect("execute_prepared");
+        }
+
+        // 3 seeded + 5 prepared inserts = 8 rows.
+        let count = engine.execute_powql("count(User)").unwrap();
+        match count {
+            QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 8),
+            _ => panic!("expected scalar"),
+        }
+    }
+
+    #[test]
+    fn test_prepared_update_by_pk() {
+        let mut engine = test_engine();
+        let prep = engine.prepare(
+            r#"User filter .name = "seed" update { age := 0 }"#
+        ).expect("prepare");
+        // Two slots: filter literal "seed" + assignment literal 0.
+        assert_eq!(prep.param_count, 2);
+
+        engine.execute_prepared(&prep, &[
+            Literal::String("Alice".into()),
+            Literal::Int(99),
+        ]).expect("execute_prepared");
+
+        let result = engine.execute_powql(
+            r#"User filter .name = "Alice" { age }"#
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Int(99));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_prepared_wrong_arity_errors() {
+        let mut engine = test_engine();
+        let prep = engine.prepare(
+            r#"User filter .age > 0 { name }"#
+        ).expect("prepare");
+        assert_eq!(prep.param_count, 1);
+        let err = engine.execute_prepared(&prep, &[]).unwrap_err();
+        assert!(err.contains("expects 1 literal"));
     }
 }

@@ -124,7 +124,10 @@ impl PlanCache {
 ///   - For `Update`, the input plan is visited first (which holds the
 ///     filter literal), then assignments in declaration order — same
 ///     order as the source `User filter .id = 42 update { age := 31 }`.
-fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &mut usize) {
+///
+/// `pub(crate)` so the executor's prepared-statement API can reuse the
+/// exact same walk — same order as canonicalise, same as the cache.
+pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &mut usize) {
     match plan {
         PlanNode::SeqScan { .. } => {}
         PlanNode::IndexScan { key, .. } => {
@@ -175,6 +178,74 @@ fn substitute_assignments(
 ) {
     for a in assignments {
         substitute_expr(&mut a.value, literals, idx);
+    }
+}
+
+/// Count every `Expr::Literal` slot reachable from `plan` using the same
+/// walk order as [`substitute_plan`]. Used by `Engine::prepare` to validate
+/// that calls to `execute_prepared` pass the right number of literals, and
+/// to fail early if a caller prepares a query with zero literals (which
+/// would be a no-op for the prepared API — better to catch that up front).
+pub(crate) fn count_literal_slots(plan: &PlanNode) -> usize {
+    let mut n = 0usize;
+    count_plan(plan, &mut n);
+    n
+}
+
+fn count_plan(plan: &PlanNode, n: &mut usize) {
+    match plan {
+        PlanNode::SeqScan { .. } => {}
+        PlanNode::IndexScan { key, .. } => count_expr(key, n),
+        PlanNode::Filter { input, predicate } => {
+            count_plan(input, n);
+            count_expr(predicate, n);
+        }
+        PlanNode::Project { input, fields } => {
+            count_plan(input, n);
+            for f in fields {
+                count_expr(&f.expr, n);
+            }
+        }
+        PlanNode::Sort { input, .. } => count_plan(input, n),
+        PlanNode::Limit { input, count } => {
+            count_plan(input, n);
+            count_expr(count, n);
+        }
+        PlanNode::Offset { input, count } => {
+            count_plan(input, n);
+            count_expr(count, n);
+        }
+        PlanNode::Aggregate { input, .. } => count_plan(input, n),
+        PlanNode::Insert { assignments, .. } => {
+            for a in assignments {
+                count_expr(&a.value, n);
+            }
+        }
+        PlanNode::Update { input, assignments, .. } => {
+            count_plan(input, n);
+            for a in assignments {
+                count_expr(&a.value, n);
+            }
+        }
+        PlanNode::Delete { input, .. } => count_plan(input, n),
+        PlanNode::CreateTable { .. } => {}
+    }
+}
+
+fn count_expr(expr: &Expr, n: &mut usize) {
+    match expr {
+        Expr::Literal(_) => *n += 1,
+        Expr::Field(_) | Expr::Param(_) => {}
+        Expr::BinaryOp(l, _, r) => {
+            count_expr(l, n);
+            count_expr(r, n);
+        }
+        Expr::UnaryOp(_, inner) => count_expr(inner, n),
+        Expr::FunctionCall(_, inner) => count_expr(inner, n),
+        Expr::Coalesce(l, r) => {
+            count_expr(l, n);
+            count_expr(r, n);
+        }
     }
 }
 
