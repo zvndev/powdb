@@ -1099,11 +1099,27 @@ impl Engine {
                             AggFunc::Sum => {
                                 let col = field.as_ref().ok_or("sum requires field")?;
                                 let idx = columns.iter().position(|c| c == col).ok_or("col not found")?;
-                                let sum: i64 = rows.iter().filter_map(|r| match &r[idx] {
-                                    Value::Int(v) => Some(*v),
-                                    _ => None,
-                                }).sum();
-                                Ok(QueryResult::Scalar(Value::Int(sum)))
+                                // Track int and float contributions separately so
+                                // Float columns (and mixed Int/Float rows) don't get
+                                // silently dropped as they did in the Int-only
+                                // version. If any Float is present, the whole sum
+                                // promotes to Float — matching Avg's semantics.
+                                let mut int_sum: i64 = 0;
+                                let mut float_sum: f64 = 0.0;
+                                let mut saw_float = false;
+                                for r in &rows {
+                                    match &r[idx] {
+                                        Value::Int(v)   => int_sum += *v,
+                                        Value::Float(v) => { float_sum += *v; saw_float = true; }
+                                        _ => {}
+                                    }
+                                }
+                                let result = if saw_float {
+                                    Value::Float(float_sum + int_sum as f64)
+                                } else {
+                                    Value::Int(int_sum)
+                                };
+                                Ok(QueryResult::Scalar(result))
                             }
                             AggFunc::Min | AggFunc::Max => {
                                 let col = field.as_ref().ok_or("min/max requires field")?;
@@ -2670,13 +2686,25 @@ fn compute_group_aggregate(
             Value::Int(seen.len() as i64)
         }
         AggFunc::Sum => {
-            let mut sum: i64 = 0;
+            // Mirror the scalar Sum path: accumulate int and float
+            // contributions separately and promote the final result to
+            // Float if any Float row was observed. Prevents silent
+            // drop of Float columns in GROUP BY aggregates.
+            let mut int_sum: i64 = 0;
+            let mut float_sum: f64 = 0.0;
+            let mut saw_float = false;
             for &ri in row_indices {
-                if let Value::Int(v) = &all_rows[ri][col_idx] {
-                    sum += v;
+                match &all_rows[ri][col_idx] {
+                    Value::Int(v)   => int_sum += v,
+                    Value::Float(v) => { float_sum += *v; saw_float = true; }
+                    _ => {}
                 }
             }
-            Value::Int(sum)
+            if saw_float {
+                Value::Float(float_sum + int_sum as f64)
+            } else {
+                Value::Int(int_sum)
+            }
         }
         AggFunc::Avg => {
             let mut sum = 0.0f64;
@@ -5605,6 +5633,59 @@ mod tests {
                 assert!((by_name["Cherry"] -  1.0).abs() < 1e-9);
             }
             _ => panic!("expected rows"),
+        }
+    }
+
+    // Regression: sum() on a Float column must return the actual
+    // floating-point sum, not Int(0). The old slow-path loops filtered
+    // out Value::Float and only summed Ints, silently dropping every
+    // value in a Float column.
+    #[test]
+    fn test_sum_float_scalar() {
+        let mut engine = product_mix_engine();
+        let result = engine.execute_powql("sum(Product { .price })").unwrap();
+        match result {
+            QueryResult::Scalar(v) => {
+                // 1.5 + 0.25 + 2.0 = 3.75
+                assert!((as_float(&v) - 3.75).abs() < 1e-9,
+                        "expected 3.75, got {v:?}");
+            }
+            _ => panic!("expected scalar result, got {result:?}"),
+        }
+    }
+
+    // Regression: sum() of a Float column inside a GROUP BY must work
+    // the same way. compute_group_aggregate had the identical Int-only
+    // bug as the scalar path.
+    #[test]
+    fn test_sum_float_group_by() {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("powdb_sum_float_gb_{}_{}", std::process::id(), id));
+        let mut engine = Engine::new(&dir).unwrap();
+        engine.execute_powql(
+            "type Sale { required region: str, required amount: float }"
+        ).unwrap();
+        engine.execute_powql(r#"insert Sale { region := "E", amount := 1.5 }"#).unwrap();
+        engine.execute_powql(r#"insert Sale { region := "E", amount := 2.25 }"#).unwrap();
+        engine.execute_powql(r#"insert Sale { region := "W", amount := 4.0 }"#).unwrap();
+        engine.execute_powql(r#"insert Sale { region := "W", amount := 0.5 }"#).unwrap();
+
+        let result = engine.execute_powql(
+            "Sale group .region { .region, total: sum(.amount) }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["region", "total"]);
+                let mut by_region: std::collections::HashMap<String, f64> =
+                    std::collections::HashMap::new();
+                for row in &rows {
+                    let region = match &row[0] { Value::Str(s) => s.clone(), _ => panic!() };
+                    by_region.insert(region, as_float(&row[1]));
+                }
+                assert!((by_region["E"] - 3.75).abs() < 1e-9, "E: {:?}", by_region.get("E"));
+                assert!((by_region["W"] - 4.5).abs()  < 1e-9, "W: {:?}", by_region.get("W"));
+            }
+            _ => panic!("expected rows, got {result:?}"),
         }
     }
 }
