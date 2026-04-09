@@ -44,6 +44,10 @@ pub enum Token {
     Transaction,// transaction
     View,       // view
     Materialized,// materialized
+    Distinct,   // distinct
+    In,         // in
+    Between,    // between
+    Like,       // like
     Count,      // count
     Avg,        // avg
     Sum,        // sum

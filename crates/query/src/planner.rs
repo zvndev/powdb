@@ -82,6 +82,10 @@ fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
         node = PlanNode::Project { input: Box::new(node), fields };
     }
 
+    if q.distinct {
+        node = PlanNode::Distinct { input: Box::new(node) };
+    }
+
     if let Some(agg) = q.aggregation {
         node = PlanNode::Aggregate {
             input: Box::new(node),
@@ -177,6 +181,10 @@ fn plan_joined_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
             expr: pf.expr,
         }).collect();
         node = PlanNode::Project { input: Box::new(node), fields };
+    }
+
+    if q.distinct {
+        node = PlanNode::Distinct { input: Box::new(node) };
     }
 
     if let Some(agg) = q.aggregation {

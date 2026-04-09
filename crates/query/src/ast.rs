@@ -26,6 +26,7 @@ pub struct QueryExpr {
     pub offset: Option<Expr>,
     pub projection: Option<Vec<ProjectionField>>,
     pub aggregation: Option<AggregateExpr>,
+    pub distinct: bool,
 }
 
 /// A join clause appended to a query's primary source.
@@ -129,6 +130,8 @@ pub enum Expr {
     UnaryOp(UnaryOp, Box<Expr>),
     FunctionCall(AggFunc, Box<Expr>),
     Coalesce(Box<Expr>, Box<Expr>),
+    /// `expr in (val1, val2, ...)` or `expr not in (val1, val2, ...)`
+    InList { expr: Box<Expr>, list: Vec<Expr>, negated: bool },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -144,6 +147,7 @@ pub enum BinOp {
     Eq, Neq, Lt, Gt, Lte, Gte,
     And, Or,
     Add, Sub, Mul, Div,
+    Like,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

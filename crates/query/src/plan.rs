@@ -30,6 +30,7 @@ pub enum PlanNode {
         on: Option<Expr>,
         kind: JoinKind,
     },
+    Distinct { input: Box<PlanNode> },
     Insert { table: String, assignments: Vec<Assignment> },
     Update { input: Box<PlanNode>, table: String, assignments: Vec<Assignment> },
     Delete { input: Box<PlanNode>, table: String },

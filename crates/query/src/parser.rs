@@ -66,9 +66,14 @@ impl Parser {
         let mut limit = None;
         let mut offset = None;
         let mut projection = None;
+        let mut distinct = false;
 
         loop {
             match self.peek() {
+                Token::Distinct => {
+                    self.advance();
+                    distinct = true;
+                }
                 Token::Filter => {
                     self.advance();
                     filter = Some(self.parse_expr()?);
@@ -121,6 +126,7 @@ impl Parser {
             offset,
             projection,
             aggregation: None,
+            distinct,
         }))
     }
 
@@ -137,9 +143,14 @@ impl Parser {
         let mut limit = None;
         let mut offset = None;
         let mut projection = None;
+        let mut distinct = false;
 
         loop {
             match self.peek() {
+                Token::Distinct => {
+                    self.advance();
+                    distinct = true;
+                }
                 Token::Filter => {
                     self.advance();
                     filter = Some(self.parse_expr()?);
@@ -173,6 +184,7 @@ impl Parser {
             offset,
             projection,
             aggregation: None,
+            distinct,
         })
     }
 
@@ -409,6 +421,52 @@ impl Parser {
 
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
         let left = self.parse_additive()?;
+
+        // Postfix: `in (...)`, `like "..."`, `between X and Y`
+        // and their negated forms: `not in`, `not like`, `not between`.
+        match self.peek() {
+            Token::In => {
+                self.advance();
+                return self.parse_in_list(left, false);
+            }
+            Token::Like => {
+                self.advance();
+                let pattern = self.parse_additive()?;
+                return Ok(Expr::BinaryOp(Box::new(left), BinOp::Like, Box::new(pattern)));
+            }
+            Token::Between => {
+                self.advance();
+                return self.parse_between(left, false);
+            }
+            Token::Not => {
+                // Peek ahead: `not in`, `not like`, `not between`.
+                // If the token after `not` isn't one of these, don't consume
+                // `not` — let the caller handle it.
+                let next = self.tokens.get(self.pos + 1);
+                match next {
+                    Some(Token::In) => {
+                        self.advance(); // not
+                        self.advance(); // in
+                        return self.parse_in_list(left, true);
+                    }
+                    Some(Token::Like) => {
+                        self.advance(); // not
+                        self.advance(); // like
+                        let pattern = self.parse_additive()?;
+                        let like = Expr::BinaryOp(Box::new(left), BinOp::Like, Box::new(pattern));
+                        return Ok(Expr::UnaryOp(UnaryOp::Not, Box::new(like)));
+                    }
+                    Some(Token::Between) => {
+                        self.advance(); // not
+                        self.advance(); // between
+                        return self.parse_between(left, true);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+
         let op = match self.peek() {
             Token::Eq  => BinOp::Eq,
             Token::Neq => BinOp::Neq,
@@ -421,6 +479,44 @@ impl Parser {
         self.advance();
         let right = self.parse_additive()?;
         Ok(Expr::BinaryOp(Box::new(left), op, Box::new(right)))
+    }
+
+    /// Parse `(val1, val2, ...)` after `in` / `not in`.
+    fn parse_in_list(&mut self, expr: Expr, negated: bool) -> Result<Expr, ParseError> {
+        self.expect(&Token::LParen)?;
+        let mut list = Vec::new();
+        while *self.peek() != Token::RParen {
+            list.push(self.parse_expr()?);
+            if *self.peek() == Token::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&Token::RParen)?;
+        Ok(Expr::InList { expr: Box::new(expr), list, negated })
+    }
+
+    /// Parse `low and high` after `between` / `not between`.
+    /// Desugars into `expr >= low AND expr <= high` (or negated:
+    /// `expr < low OR expr > high`).
+    fn parse_between(&mut self, expr: Expr, negated: bool) -> Result<Expr, ParseError> {
+        let low = self.parse_additive()?;
+        self.expect(&Token::And)?;
+        let high = self.parse_additive()?;
+        if negated {
+            // NOT BETWEEN: expr < low OR expr > high
+            Ok(Expr::BinaryOp(
+                Box::new(Expr::BinaryOp(Box::new(expr.clone()), BinOp::Lt, Box::new(low))),
+                BinOp::Or,
+                Box::new(Expr::BinaryOp(Box::new(expr), BinOp::Gt, Box::new(high))),
+            ))
+        } else {
+            // BETWEEN: expr >= low AND expr <= high
+            Ok(Expr::BinaryOp(
+                Box::new(Expr::BinaryOp(Box::new(expr.clone()), BinOp::Gte, Box::new(low))),
+                BinOp::And,
+                Box::new(Expr::BinaryOp(Box::new(expr), BinOp::Lte, Box::new(high))),
+            ))
+        }
     }
 
     fn parse_additive(&mut self) -> Result<Expr, ParseError> {
@@ -916,5 +1012,117 @@ mod tests {
         let err =
             parse("User as u join Order as o on u.id = o.user_id delete").unwrap_err();
         assert!(err.message.contains("delete"));
+    }
+
+    // ---- Mission E2a: DISTINCT + IN-list + BETWEEN + LIKE -----------------
+
+    #[test]
+    fn test_parse_distinct() {
+        let stmt = parse("User distinct { .name }").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                assert!(q.distinct);
+                assert!(q.projection.is_some());
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_in_list() {
+        let stmt = parse(r#"User filter .name in ("Alice", "Bob")"#).unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                match q.filter.unwrap() {
+                    Expr::InList { expr, list, negated } => {
+                        assert!(!negated);
+                        assert!(matches!(*expr, Expr::Field(f) if f == "name"));
+                        assert_eq!(list.len(), 2);
+                    }
+                    other => panic!("expected InList, got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_not_in_list() {
+        let stmt = parse("User filter .age not in (1, 2, 3)").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                match q.filter.unwrap() {
+                    Expr::InList { negated, list, .. } => {
+                        assert!(negated);
+                        assert_eq!(list.len(), 3);
+                    }
+                    other => panic!("expected InList, got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_between() {
+        // BETWEEN desugars into >= AND <=.
+        let stmt = parse("User filter .age between 10 and 20").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                match q.filter.unwrap() {
+                    Expr::BinaryOp(_, BinOp::And, _) => {} // desugared
+                    other => panic!("expected And (desugared between), got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_not_between() {
+        // NOT BETWEEN desugars into < OR >.
+        let stmt = parse("User filter .age not between 10 and 20").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                match q.filter.unwrap() {
+                    Expr::BinaryOp(_, BinOp::Or, _) => {} // desugared
+                    other => panic!("expected Or (desugared not between), got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_like() {
+        let stmt = parse(r#"User filter .name like "A%""#).unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                match q.filter.unwrap() {
+                    Expr::BinaryOp(l, BinOp::Like, r) => {
+                        assert!(matches!(*l, Expr::Field(f) if f == "name"));
+                        assert!(matches!(*r, Expr::Literal(Literal::String(s)) if s == "A%"));
+                    }
+                    other => panic!("expected Like, got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_not_like() {
+        let stmt = parse(r#"User filter .name not like "A%""#).unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                match q.filter.unwrap() {
+                    Expr::UnaryOp(UnaryOp::Not, inner) => {
+                        assert!(matches!(*inner, Expr::BinaryOp(_, BinOp::Like, _)));
+                    }
+                    other => panic!("expected Not(Like), got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
     }
 }

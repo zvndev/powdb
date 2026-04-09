@@ -169,6 +169,9 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
                 substitute_expr(pred, literals, idx);
             }
         }
+        PlanNode::Distinct { input } => {
+            substitute_plan(input, literals, idx);
+        }
         PlanNode::Insert { assignments, .. } => {
             substitute_assignments(assignments, literals, idx);
         }
@@ -236,6 +239,7 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
                 count_expr(pred, n);
             }
         }
+        PlanNode::Distinct { input } => count_plan(input, n),
         PlanNode::Insert { assignments, .. } => {
             for a in assignments {
                 count_expr(&a.value, n);
@@ -266,6 +270,12 @@ fn count_expr(expr: &Expr, n: &mut usize) {
             count_expr(l, n);
             count_expr(r, n);
         }
+        Expr::InList { expr, list, .. } => {
+            count_expr(expr, n);
+            for item in list {
+                count_expr(item, n);
+            }
+        }
     }
 }
 
@@ -292,6 +302,12 @@ fn substitute_expr(expr: &mut Expr, literals: &[Literal], idx: &mut usize) {
         Expr::Coalesce(l, r) => {
             substitute_expr(l, literals, idx);
             substitute_expr(r, literals, idx);
+        }
+        Expr::InList { expr, list, .. } => {
+            substitute_expr(expr, literals, idx);
+            for item in list {
+                substitute_expr(item, literals, idx);
+            }
         }
     }
 }
@@ -466,6 +482,7 @@ mod tests {
                     collect_expr_literals(&a.value, out);
                 }
             }
+            PlanNode::Distinct { input } => collect_literals_for_test(input, out),
             PlanNode::Delete { input, .. } => collect_literals_for_test(input, out),
             PlanNode::CreateTable { .. } => {}
         }
@@ -484,6 +501,12 @@ mod tests {
             Expr::Coalesce(l, r) => {
                 collect_expr_literals(l, out);
                 collect_expr_literals(r, out);
+            }
+            Expr::InList { expr, list, .. } => {
+                collect_expr_literals(expr, out);
+                for item in list {
+                    collect_expr_literals(item, out);
+                }
             }
         }
     }

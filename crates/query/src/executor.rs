@@ -1354,6 +1354,23 @@ impl Engine {
                 Ok(QueryResult::Rows { columns, rows })
             }
 
+            PlanNode::Distinct { input } => {
+                let result = self.execute_plan(&input)?;
+                match result {
+                    QueryResult::Rows { columns, rows } => {
+                        let mut seen = std::collections::HashSet::new();
+                        let mut unique_rows = Vec::new();
+                        for row in rows {
+                            if seen.insert(row.clone()) {
+                                unique_rows.push(row);
+                            }
+                        }
+                        Ok(QueryResult::Rows { columns, rows: unique_rows })
+                    }
+                    other => Ok(other),
+                }
+            }
+
             PlanNode::CreateTable { name, fields } => {
                 let columns: Vec<ColumnDef> = fields.iter().enumerate().map(|(i, (fname, tname, req))| {
                     ColumnDef {
@@ -2058,7 +2075,26 @@ fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value {
             let l = eval_expr(left, row, columns);
             if l.is_empty() { eval_expr(right, row, columns) } else { l }
         }
-        _ => Value::Empty,
+        Expr::InList { expr, list, negated } => {
+            let val = eval_expr(expr, row, columns);
+            let found = list.iter().any(|item| {
+                let iv = eval_expr(item, row, columns);
+                val == iv
+            });
+            Value::Bool(if *negated { !found } else { found })
+        }
+        Expr::UnaryOp(op, inner) => {
+            let v = eval_expr(inner, row, columns);
+            match op {
+                UnaryOp::Not => match v {
+                    Value::Bool(b) => Value::Bool(!b),
+                    _ => Value::Empty,
+                },
+                UnaryOp::Exists => Value::Bool(!v.is_empty()),
+                UnaryOp::NotExists => Value::Bool(v.is_empty()),
+            }
+        }
+        Expr::FunctionCall(_, _) | Expr::Param(_) => Value::Empty,
     }
 }
 
@@ -2524,6 +2560,15 @@ fn collect_field_indices(expr: &Expr, columns: &[String], out: &mut Vec<usize>) 
             collect_field_indices(left, columns, out);
             collect_field_indices(right, columns, out);
         }
+        Expr::UnaryOp(_, inner) => {
+            collect_field_indices(inner, columns, out);
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_field_indices(expr, columns, out);
+            for item in list {
+                collect_field_indices(item, columns, out);
+            }
+        }
         _ => {}
     }
 }
@@ -2574,6 +2619,42 @@ fn eval_binop(left: &Value, op: BinOp, right: &Value) -> Value {
             (Value::Int(a), Value::Int(b)) if *b != 0 => Value::Int(a / b),
             _ => Value::Empty,
         },
+        BinOp::Like => match (left, right) {
+            (Value::Str(text), Value::Str(pattern)) => Value::Bool(like_match(text, pattern)),
+            _ => Value::Bool(false),
+        },
+    }
+}
+
+/// SQL LIKE pattern match. `%` matches any sequence (including empty),
+/// `_` matches exactly one character. No escape character for now.
+fn like_match(text: &str, pattern: &str) -> bool {
+    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    like_dp(&t, &p, 0, 0)
+}
+
+fn like_dp(t: &[char], p: &[char], ti: usize, pi: usize) -> bool {
+    if pi == p.len() {
+        return ti == t.len();
+    }
+    if p[pi] == '%' {
+        // '%' can match zero or more characters — try both.
+        // Skip consecutive '%' to avoid exponential blowup.
+        let mut pi2 = pi;
+        while pi2 < p.len() && p[pi2] == '%' {
+            pi2 += 1;
+        }
+        for i in ti..=t.len() {
+            if like_dp(t, p, i, pi2) {
+                return true;
+            }
+        }
+        false
+    } else if ti < t.len() && (p[pi] == '_' || p[pi] == t[ti]) {
+        like_dp(t, p, ti + 1, pi + 1)
+    } else {
+        false
     }
 }
 
@@ -3319,6 +3400,165 @@ mod tests {
                 assert!(columns.contains(&"u.name".to_string()));
                 assert!(columns.contains(&"o.total".to_string()));
                 assert!(columns.contains(&"p.name".to_string()));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    // ---- Mission E2a: DISTINCT + IN-list + BETWEEN + LIKE -----------------
+
+    #[test]
+    fn test_distinct_deduplicates_rows() {
+        let mut engine = test_engine();
+        // Insert a second Alice to create a duplicate name.
+        engine.execute_powql(
+            r#"insert User { name := "Alice", email := "alice2@ex.com", age := 25 }"#,
+        ).unwrap();
+        let result = engine.execute_powql("User distinct { .name }").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                let names: Vec<&Value> = rows.iter().map(|r| &r[0]).collect();
+                // 4 rows in table (Alice×2, Bob, Charlie) but 3 distinct names.
+                assert_eq!(names.len(), 3);
+                let alice_count = names.iter()
+                    .filter(|v| matches!(v, Value::Str(s) if s == "Alice"))
+                    .count();
+                assert_eq!(alice_count, 1);
+                assert!(names.iter().any(|v| matches!(v, Value::Str(s) if s == "Bob")));
+                assert!(names.iter().any(|v| matches!(v, Value::Str(s) if s == "Charlie")));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_in_list_filter() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql(
+            r#"User filter .name in ("Alice", "Bob") { .name }"#,
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_not_in_list_filter() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql(
+            r#"User filter .name not in ("Alice") { .name }"#,
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                // Bob and Charlie survive.
+                assert_eq!(rows.len(), 2);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_between_filter() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql(
+            "User filter .age between 25 and 30 { .name, .age }",
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                // Alice is 30 (inclusive), Bob is 25 (inclusive).
+                assert_eq!(rows.len(), 2);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_not_between_filter() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql(
+            "User filter .age not between 26 and 29 { .name }",
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                // Alice (30), Bob (25), Charlie (35) all outside [26,29].
+                assert_eq!(rows.len(), 3);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_like_prefix_match() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql(
+            r#"User filter .name like "Ali%" { .name }"#,
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert!(matches!(&rows[0][0], Value::Str(s) if s == "Alice"));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_like_wildcard_underscore() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql(
+            r#"User filter .name like "_ob" { .name }"#,
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert!(matches!(&rows[0][0], Value::Str(s) if s == "Bob"));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_not_like_filter() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql(
+            r#"User filter .name not like "A%" { .name }"#,
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                // Bob and Charlie survive (don't start with A).
+                assert_eq!(rows.len(), 2);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_in_list_with_integers() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql(
+            "User filter .age in (25, 30) { .name }",
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_like_full_match() {
+        let mut engine = test_engine();
+        // Exact match (no wildcards).
+        let result = engine.execute_powql(
+            r#"User filter .name like "Alice" { .name }"#,
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
             }
             _ => panic!("expected rows"),
         }
