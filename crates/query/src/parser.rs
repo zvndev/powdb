@@ -353,6 +353,44 @@ impl Parser {
                         self.expect(&Token::RParen)?;
                         Expr::FunctionCall(func, Box::new(inner))
                     }
+                    Token::Upper | Token::Lower | Token::Length | Token::Trim
+                    | Token::Substring | Token::Concat => {
+                        let func = match first {
+                            Token::Upper => ScalarFn::Upper,
+                            Token::Lower => ScalarFn::Lower,
+                            Token::Length => ScalarFn::Length,
+                            Token::Trim => ScalarFn::Trim,
+                            Token::Substring => ScalarFn::Substring,
+                            Token::Concat => ScalarFn::Concat,
+                            _ => unreachable!(),
+                        };
+                        self.expect(&Token::LParen)?;
+                        let mut args = Vec::new();
+                        while *self.peek() != Token::RParen {
+                            args.push(self.parse_expr()?);
+                            if *self.peek() == Token::Comma { self.advance(); }
+                        }
+                        self.expect(&Token::RParen)?;
+                        Expr::ScalarFunc(func, args)
+                    }
+                    Token::Case => {
+                        let mut whens = Vec::new();
+                        while *self.peek() == Token::When {
+                            self.advance();
+                            let condition = self.parse_expr()?;
+                            self.expect(&Token::Then)?;
+                            let result = self.parse_expr()?;
+                            whens.push((Box::new(condition), Box::new(result)));
+                        }
+                        let else_expr = if *self.peek() == Token::Else {
+                            self.advance();
+                            Some(Box::new(self.parse_expr()?))
+                        } else {
+                            None
+                        };
+                        self.expect(&Token::End)?;
+                        Expr::Case { whens, else_expr }
+                    }
                     _ => return Err(ParseError { message: format!("expected field, got {first:?}") }),
                 };
                 fields.push(ProjectionField { alias: None, expr });
@@ -447,6 +485,19 @@ impl Parser {
 
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
         let left = self.parse_additive()?;
+
+        // IS NULL / IS NOT NULL (postfix)
+        if *self.peek() == Token::Is {
+            self.advance();
+            if *self.peek() == Token::Not {
+                self.advance();
+                self.expect(&Token::Null)?;
+                return Ok(Expr::UnaryOp(UnaryOp::IsNotNull, Box::new(left)));
+            } else {
+                self.expect(&Token::Null)?;
+                return Ok(Expr::UnaryOp(UnaryOp::IsNull, Box::new(left)));
+            }
+        }
 
         // Postfix: `in (...)`, `like "..."`, `between X and Y`
         // and their negated forms: `not in`, `not like`, `not between`.
@@ -670,9 +721,54 @@ impl Parser {
                     _ => unreachable!(),
                 };
                 self.expect(&Token::LParen)?;
+                // count(*) — count all rows including nulls
+                if func == AggFunc::Count && *self.peek() == Token::Star {
+                    self.advance();
+                    self.expect(&Token::RParen)?;
+                    return Ok(Expr::FunctionCall(AggFunc::Count, Box::new(Expr::Field("*".into()))));
+                }
                 let inner = self.parse_expr()?;
                 self.expect(&Token::RParen)?;
                 Ok(Expr::FunctionCall(func, Box::new(inner)))
+            }
+            Token::Upper | Token::Lower | Token::Length | Token::Trim
+            | Token::Substring | Token::Concat => {
+                let func = match self.advance() {
+                    Token::Upper => ScalarFn::Upper,
+                    Token::Lower => ScalarFn::Lower,
+                    Token::Length => ScalarFn::Length,
+                    Token::Trim => ScalarFn::Trim,
+                    Token::Substring => ScalarFn::Substring,
+                    Token::Concat => ScalarFn::Concat,
+                    _ => unreachable!(),
+                };
+                self.expect(&Token::LParen)?;
+                let mut args = Vec::new();
+                while *self.peek() != Token::RParen {
+                    args.push(self.parse_expr()?);
+                    if *self.peek() == Token::Comma { self.advance(); }
+                }
+                self.expect(&Token::RParen)?;
+                Ok(Expr::ScalarFunc(func, args))
+            }
+            Token::Case => {
+                self.advance();
+                let mut whens = Vec::new();
+                while *self.peek() == Token::When {
+                    self.advance();
+                    let condition = self.parse_expr()?;
+                    self.expect(&Token::Then)?;
+                    let result = self.parse_expr()?;
+                    whens.push((Box::new(condition), Box::new(result)));
+                }
+                let else_expr = if *self.peek() == Token::Else {
+                    self.advance();
+                    Some(Box::new(self.parse_expr()?))
+                } else {
+                    None
+                };
+                self.expect(&Token::End)?;
+                Ok(Expr::Case { whens, else_expr })
             }
             t => Err(ParseError { message: format!("unexpected token in expression: {t:?}") }),
         }
@@ -1277,6 +1373,169 @@ mod tests {
                 assert!(matches!(&proj[1].expr, Expr::FunctionCall(AggFunc::Count, _)));
                 assert_eq!(proj[2].alias.as_deref(), Some("average"));
                 assert!(matches!(&proj[2].expr, Expr::FunctionCall(AggFunc::Avg, _)));
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    // ─── IS NULL / IS NOT NULL parser tests ────────────────────────────
+
+    #[test]
+    fn test_parse_is_null() {
+        let stmt = parse("User filter .age is null").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let filter = q.filter.unwrap();
+                assert_eq!(
+                    filter,
+                    Expr::UnaryOp(UnaryOp::IsNull, Box::new(Expr::Field("age".into())))
+                );
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_is_not_null() {
+        let stmt = parse("User filter .age is not null").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let filter = q.filter.unwrap();
+                assert_eq!(
+                    filter,
+                    Expr::UnaryOp(UnaryOp::IsNotNull, Box::new(Expr::Field("age".into())))
+                );
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_count_star_expr() {
+        let stmt = parse("User filter count(*) > 0").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let filter = q.filter.unwrap();
+                match filter {
+                    Expr::BinaryOp(left, BinOp::Gt, _) => {
+                        assert_eq!(
+                            *left,
+                            Expr::FunctionCall(AggFunc::Count, Box::new(Expr::Field("*".into())))
+                        );
+                    }
+                    _ => panic!("expected comparison"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    // ─── String function parser tests ──────────────────────────────────
+
+    #[test]
+    fn test_parse_upper_in_filter() {
+        let stmt = parse(r#"User filter upper(.name) = "ALICE""#).unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let f = q.filter.unwrap();
+                match f {
+                    Expr::BinaryOp(left, BinOp::Eq, _right) => {
+                        assert!(matches!(*left, Expr::ScalarFunc(ScalarFn::Upper, _)));
+                    }
+                    _ => panic!("expected binary op with upper"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_substring() {
+        let stmt = parse("User { sub: substring(.name, 1, 3) }").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let proj = q.projection.unwrap();
+                match &proj[0].expr {
+                    Expr::ScalarFunc(ScalarFn::Substring, args) => {
+                        assert_eq!(args.len(), 3);
+                    }
+                    other => panic!("expected ScalarFunc Substring, got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_concat() {
+        let stmt = parse(r#"User { full: concat(.name, " - ", .email) }"#).unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let proj = q.projection.unwrap();
+                match &proj[0].expr {
+                    Expr::ScalarFunc(ScalarFn::Concat, args) => {
+                        assert_eq!(args.len(), 3);
+                    }
+                    other => panic!("expected ScalarFunc Concat, got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    // ─── CASE WHEN parser tests ────────────────────────────────────────
+
+    #[test]
+    fn test_parse_case_single_when() {
+        let stmt = parse(r#"User filter case when .age > 30 then true else false end"#).unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let filter = q.filter.unwrap();
+                match filter {
+                    Expr::Case { whens, else_expr } => {
+                        assert_eq!(whens.len(), 1);
+                        assert!(else_expr.is_some());
+                    }
+                    other => panic!("expected Case expr, got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_case_multiple_whens() {
+        let stmt = parse(
+            r#"User { label: case when .age > 30 then "senior" when .age > 20 then "adult" else "young" end }"#
+        ).unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let proj = q.projection.unwrap();
+                match &proj[0].expr {
+                    Expr::Case { whens, else_expr } => {
+                        assert_eq!(whens.len(), 2);
+                        assert!(else_expr.is_some());
+                    }
+                    other => panic!("expected Case expr, got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_case_without_else() {
+        let stmt = parse(r#"User filter case when .age > 30 then true end"#).unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let filter = q.filter.unwrap();
+                match filter {
+                    Expr::Case { whens, else_expr } => {
+                        assert_eq!(whens.len(), 1);
+                        assert!(else_expr.is_none());
+                    }
+                    other => panic!("expected Case expr, got {other:?}"),
+                }
             }
             _ => panic!("expected query"),
         }

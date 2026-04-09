@@ -123,6 +123,17 @@ pub enum AggFunc {
     Max,
 }
 
+/// Scalar (non-aggregate) function — operates on single values.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScalarFn {
+    Upper,
+    Lower,
+    Length,
+    Trim,
+    Substring,  // substring(expr, start, len) — 1-indexed
+    Concat,     // concat(expr, expr, ...) — variadic
+}
+
 /// Expressions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
@@ -137,9 +148,16 @@ pub enum Expr {
     BinaryOp(Box<Expr>, BinOp, Box<Expr>),
     UnaryOp(UnaryOp, Box<Expr>),
     FunctionCall(AggFunc, Box<Expr>),
+    /// Scalar (non-aggregate) function call.
+    ScalarFunc(ScalarFn, Vec<Expr>),
     Coalesce(Box<Expr>, Box<Expr>),
     /// `expr in (val1, val2, ...)` or `expr not in (val1, val2, ...)`
     InList { expr: Box<Expr>, list: Vec<Expr>, negated: bool },
+    /// CASE WHEN ... THEN ... [ELSE ...] END
+    Case {
+        whens: Vec<(Box<Expr>, Box<Expr>)>,
+        else_expr: Option<Box<Expr>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -163,4 +181,6 @@ pub enum UnaryOp {
     Not,
     Exists,
     NotExists,
+    IsNull,
+    IsNotNull,
 }

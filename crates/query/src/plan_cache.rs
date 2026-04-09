@@ -288,6 +288,20 @@ fn count_expr(expr: &Expr, n: &mut usize) {
                 count_expr(item, n);
             }
         }
+        Expr::ScalarFunc(_, args) => {
+            for a in args {
+                count_expr(a, n);
+            }
+        }
+        Expr::Case { whens, else_expr } => {
+            for (cond, result) in whens {
+                count_expr(cond, n);
+                count_expr(result, n);
+            }
+            if let Some(e) = else_expr {
+                count_expr(e, n);
+            }
+        }
     }
 }
 
@@ -319,6 +333,20 @@ fn substitute_expr(expr: &mut Expr, literals: &[Literal], idx: &mut usize) {
             substitute_expr(expr, literals, idx);
             for item in list {
                 substitute_expr(item, literals, idx);
+            }
+        }
+        Expr::ScalarFunc(_, args) => {
+            for a in args {
+                substitute_expr(a, literals, idx);
+            }
+        }
+        Expr::Case { whens, else_expr } => {
+            for (cond, result) in whens {
+                substitute_expr(cond, literals, idx);
+                substitute_expr(result, literals, idx);
+            }
+            if let Some(e) = else_expr {
+                substitute_expr(e, literals, idx);
             }
         }
     }
@@ -524,6 +552,20 @@ mod tests {
                 collect_expr_literals(expr, out);
                 for item in list {
                     collect_expr_literals(item, out);
+                }
+            }
+            Expr::ScalarFunc(_, args) => {
+                for a in args {
+                    collect_expr_literals(a, out);
+                }
+            }
+            Expr::Case { whens, else_expr } => {
+                for (cond, result) in whens {
+                    collect_expr_literals(cond, out);
+                    collect_expr_literals(result, out);
+                }
+                if let Some(e) = else_expr {
+                    collect_expr_literals(e, out);
                 }
             }
         }

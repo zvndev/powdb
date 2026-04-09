@@ -2156,6 +2156,23 @@ fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value {
                 },
                 UnaryOp::Exists => Value::Bool(!v.is_empty()),
                 UnaryOp::NotExists => Value::Bool(v.is_empty()),
+                UnaryOp::IsNull => Value::Bool(v.is_empty()),
+                UnaryOp::IsNotNull => Value::Bool(!v.is_empty()),
+            }
+        }
+        Expr::ScalarFunc(func, args) => {
+            let vals: Vec<Value> = args.iter().map(|a| eval_expr(a, row, columns)).collect();
+            eval_scalar_func(*func, &vals)
+        }
+        Expr::Case { whens, else_expr } => {
+            for (condition, result) in whens {
+                if eval_predicate(condition, row, columns) {
+                    return eval_expr(result, row, columns);
+                }
+            }
+            match else_expr {
+                Some(e) => eval_expr(e, row, columns),
+                None => Value::Empty,
             }
         }
         Expr::FunctionCall(_, _) | Expr::Param(_) => Value::Empty,
@@ -2166,6 +2183,52 @@ fn eval_predicate(expr: &Expr, row: &[Value], columns: &[String]) -> bool {
     match eval_expr(expr, row, columns) {
         Value::Bool(b) => b,
         _ => false,
+    }
+}
+
+fn eval_scalar_func(func: ScalarFn, args: &[Value]) -> Value {
+    match func {
+        ScalarFn::Upper => match args.first() {
+            Some(Value::Str(s)) => Value::Str(s.to_uppercase()),
+            _ => Value::Empty,
+        },
+        ScalarFn::Lower => match args.first() {
+            Some(Value::Str(s)) => Value::Str(s.to_lowercase()),
+            _ => Value::Empty,
+        },
+        ScalarFn::Length => match args.first() {
+            Some(Value::Str(s)) => Value::Int(s.len() as i64),
+            _ => Value::Empty,
+        },
+        ScalarFn::Trim => match args.first() {
+            Some(Value::Str(s)) => Value::Str(s.trim().to_string()),
+            _ => Value::Empty,
+        },
+        ScalarFn::Substring => {
+            if args.len() < 3 { return Value::Empty; }
+            match (&args[0], &args[1], &args[2]) {
+                (Value::Str(s), Value::Int(start), Value::Int(len)) => {
+                    let start = (*start as usize).saturating_sub(1); // 1-indexed
+                    let len = *len as usize;
+                    let sub: String = s.chars().skip(start).take(len).collect();
+                    Value::Str(sub)
+                }
+                _ => Value::Empty,
+            }
+        }
+        ScalarFn::Concat => {
+            let mut result = String::new();
+            for v in args {
+                match v {
+                    Value::Str(s) => result.push_str(s),
+                    Value::Int(n) => result.push_str(&n.to_string()),
+                    Value::Float(f) => result.push_str(&f.to_string()),
+                    Value::Bool(b) => result.push_str(if *b { "true" } else { "false" }),
+                    _ => {}
+                }
+            }
+            Value::Str(result)
+        }
     }
 }
 
@@ -2436,6 +2499,12 @@ enum CompiledLeaf {
         op: BinOp,
         literal: i64,
     },
+    /// `.field is null` or `.field is not null`
+    IsNull {
+        bitmap_byte: usize,
+        bitmap_bit: u8,
+        want_null: bool,
+    },
     /// `.field = string_literal` or `.field != string_literal`
     StrEq {
         var_offset_table_start: usize,
@@ -2477,6 +2546,10 @@ impl CompiledLeaf {
                     BinOp::Gte => val >= *literal,
                     _ => false,
                 }
+            }
+            CompiledLeaf::IsNull { bitmap_byte, bitmap_bit, want_null } => {
+                let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
+                if *want_null { is_null } else { !is_null }
             }
             CompiledLeaf::StrEq {
                 var_offset_table_start,
@@ -2569,6 +2642,18 @@ fn flatten_and_compile(
                 return Some(());
             }
             None
+        }
+        Expr::UnaryOp(op, inner) if *op == UnaryOp::IsNull || *op == UnaryOp::IsNotNull => {
+            if let Expr::Field(name) = inner.as_ref() {
+                let col_idx = columns.iter().position(|c| c == name)?;
+                let bitmap_byte = col_idx / 8;
+                let bitmap_bit = (col_idx % 8) as u8;
+                let want_null = *op == UnaryOp::IsNull;
+                out.push(CompiledLeaf::IsNull { bitmap_byte, bitmap_bit, want_null });
+                Some(())
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -2678,6 +2763,23 @@ fn collect_field_indices(expr: &Expr, columns: &[String], out: &mut Vec<usize>) 
         }
         Expr::UnaryOp(_, inner) => {
             collect_field_indices(inner, columns, out);
+        }
+        Expr::FunctionCall(_, inner) => {
+            collect_field_indices(inner, columns, out);
+        }
+        Expr::ScalarFunc(_, args) => {
+            for arg in args {
+                collect_field_indices(arg, columns, out);
+            }
+        }
+        Expr::Case { whens, else_expr } => {
+            for (cond, result) in whens {
+                collect_field_indices(cond, columns, out);
+                collect_field_indices(result, columns, out);
+            }
+            if let Some(e) = else_expr {
+                collect_field_indices(e, columns, out);
+            }
         }
         Expr::InList { expr, list, .. } => {
             collect_field_indices(expr, columns, out);
@@ -3813,6 +3915,205 @@ mod tests {
                 match &rows[0][1] {
                     Value::Float(v) => assert!((v - 19.5).abs() < 0.001),
                     other => panic!("expected float, got {other:?}"),
+                }
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    // ─── IS NULL / IS NOT NULL tests ─────────────────────────────────────
+
+    #[test]
+    fn test_is_null_filter() {
+        let mut engine = test_engine();
+        engine.execute_powql(r#"insert User { name := "Diana", email := "diana@ex.com" }"#).unwrap();
+        let result = engine.execute_powql("User filter .age is null { .name }").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Str("Diana".into()));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_is_not_null_filter() {
+        let mut engine = test_engine();
+        engine.execute_powql(r#"insert User { name := "Diana", email := "diana@ex.com" }"#).unwrap();
+        let result = engine.execute_powql("User filter .age is not null { .name }").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_is_null_count() {
+        let mut engine = test_engine();
+        engine.execute_powql(r#"insert User { name := "Diana", email := "diana@ex.com" }"#).unwrap();
+        let result = engine.execute_powql("count(User filter .age is null)").unwrap();
+        match result {
+            QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 1),
+            _ => panic!("expected scalar int"),
+        }
+    }
+
+    #[test]
+    fn test_is_null_combined_with_and() {
+        let mut engine = test_engine();
+        engine.execute_powql(r#"insert User { name := "Diana", email := "diana@ex.com" }"#).unwrap();
+        engine.execute_powql(r#"insert User { name := "Eve", email := "eve@ex.com" }"#).unwrap();
+        let result = engine.execute_powql(
+            r#"User filter .age is null and .name = "Diana" { .name }"#
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Str("Diana".into()));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    // ─── String function tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_upper_in_filter() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql(r#"User filter upper(.name) = "ALICE""#).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Str("Alice".into()));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_lower_in_projection() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql("User { low: lower(.email) }").unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["low"]);
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0][0], Value::Str("alice@ex.com".into()));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_length_in_projection() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql("User { .name, len: length(.name) }").unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["name", "len"]);
+                assert_eq!(rows[0][1], Value::Int(5));
+                assert_eq!(rows[1][1], Value::Int(3));
+                assert_eq!(rows[2][1], Value::Int(7));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_substring_in_projection() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql("User { sub: substring(.name, 1, 3) }").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Str("Ali".into()));
+                assert_eq!(rows[1][0], Value::Str("Bob".into()));
+                assert_eq!(rows[2][0], Value::Str("Cha".into()));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_concat_in_projection() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql(r#"User { full: concat(.name, " - ", .email) }"#).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Str("Alice - alice@ex.com".into()));
+                assert_eq!(rows[1][0], Value::Str("Bob - bob@ex.com".into()));
+                assert_eq!(rows[2][0], Value::Str("Charlie - charlie@ex.com".into()));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_concat_coerces_int() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql(r#"User { info: concat(.name, " age=", .age) }"#).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Str("Alice age=30".into()));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    // ─── CASE WHEN tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_case_in_projection() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql(
+            r#"User { .name, label: case when .age > 30 then "senior" when .age >= 30 then "exactly30" else "young" end }"#
+        ).unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["name", "label"]);
+                assert_eq!(rows.len(), 3);
+                for row in &rows {
+                    let name = &row[0];
+                    let label = &row[1];
+                    match name {
+                        Value::Str(n) if n == "Alice" => assert_eq!(label, &Value::Str("exactly30".into())),
+                        Value::Str(n) if n == "Bob" => assert_eq!(label, &Value::Str("young".into())),
+                        Value::Str(n) if n == "Charlie" => assert_eq!(label, &Value::Str("senior".into())),
+                        _ => panic!("unexpected name: {name:?}"),
+                    }
+                }
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_case_in_filter() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql(
+            r#"User filter case when .age > 30 then true else false end"#
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Str("Charlie".into()));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_case_without_else_returns_empty() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql(
+            r#"User { .name, label: case when .age > 100 then "old" end }"#
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                for row in &rows {
+                    assert_eq!(row[1], Value::Empty);
                 }
             }
             _ => panic!("expected rows"),

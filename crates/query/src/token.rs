@@ -54,6 +54,23 @@ pub enum Token {
     Sum,        // sum
     Min,        // min
     Max,        // max
+    Is,         // is
+    Null,       // null
+
+    // String functions
+    Upper,      // upper
+    Lower,      // lower
+    Length,     // length
+    Trim,       // trim
+    Substring,  // substring
+    Concat,     // concat
+
+    // CASE WHEN
+    Case,       // case
+    When,       // when
+    Then,       // then
+    Else,       // else
+    End,        // end
 
     // Operators
     Eq,         // =
