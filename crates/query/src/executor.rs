@@ -20,6 +20,100 @@ use tracing::{info, error, Level};
 /// `plan_cache::PlanCache::insert`).
 const PLAN_CACHE_CAPACITY: usize = 256;
 
+// ─── Mission D11 Phase 1: scalar hot-loop helpers ─────────────────────────
+//
+// These macros expand into the scan body of `agg_single_col_fast` and sit
+// inside the `for_each_row_raw` closure. They exist to:
+//
+//   1. Split the loop on presence of a predicate *outside* the hot body,
+//      so the no-predicate path (agg_sum/agg_min/agg_max bench workloads)
+//      never pays the `Option<CompiledPredicate>` branch per row.
+//   2. Drop two bounds checks per row by reading the null bitmap byte
+//      and the 8-byte value via raw pointer casts.
+//
+// SAFETY (shared across every call site below):
+//
+//   - `$bmp_byte` is `col_idx / 8` where `col_idx < n_cols`, and the row
+//     encoding stores `bitmap_size = n_cols.div_ceil(8)` bytes of bitmap
+//     starting at offset 2. So `2 + $bmp_byte < 2 + bitmap_size ≤ row_len`
+//     and `get_unchecked(2 + $bmp_byte)` is inside the row slice.
+//   - `$off = 2 + bitmap_size + fixed_offsets[col_idx]` for a fixed-size
+//     column. Every fixed-size column contributes `fixed_size(type_id)`
+//     bytes to the fixed region, so the row always has `[$off .. $off+8]`
+//     available for any i64/f64 column — enforced by the row encoder
+//     (`storage/src/row.rs`) and the schema invariant that a row with a
+//     given schema has `row_len ≥ 2 + bitmap_size + fixed_region_size`.
+//   - Both macros are only invoked from `agg_single_col_fast`, which
+//     early-returns if the column isn't Int/Float (8-byte fixed) and
+//     early-returns if `fast.fixed_offsets[col_idx]` is `None`.
+macro_rules! agg_int_loop {
+    (
+        $self:expr, $table:expr, $pred:expr,
+        $bmp_byte:expr, $bmp_bit:expr, $off:expr,
+        |$v:ident : i64| $body:block
+    ) => {{
+        let bmp_byte = $bmp_byte;
+        let bmp_bit = $bmp_bit;
+        let off = $off;
+        if let Some(pred) = &$pred {
+            $self.catalog.for_each_row_raw($table, |_rid, data| {
+                if !pred(data) { return; }
+                // SAFETY: see module-level comment on agg_int_loop!.
+                let bmp = unsafe { *data.get_unchecked(2 + bmp_byte) };
+                if (bmp >> bmp_bit) & 1 == 1 { return; }
+                let $v: i64 = unsafe {
+                    i64::from_le_bytes(*(data.as_ptr().add(off) as *const [u8; 8]))
+                };
+                $body
+            }).map_err(|e| e.to_string())?;
+        } else {
+            $self.catalog.for_each_row_raw($table, |_rid, data| {
+                // SAFETY: see module-level comment on agg_int_loop!.
+                let bmp = unsafe { *data.get_unchecked(2 + bmp_byte) };
+                if (bmp >> bmp_bit) & 1 == 1 { return; }
+                let $v: i64 = unsafe {
+                    i64::from_le_bytes(*(data.as_ptr().add(off) as *const [u8; 8]))
+                };
+                $body
+            }).map_err(|e| e.to_string())?;
+        }
+    }};
+}
+
+macro_rules! agg_float_loop {
+    (
+        $self:expr, $table:expr, $pred:expr,
+        $bmp_byte:expr, $bmp_bit:expr, $off:expr,
+        |$v:ident : f64| $body:block
+    ) => {{
+        let bmp_byte = $bmp_byte;
+        let bmp_bit = $bmp_bit;
+        let off = $off;
+        if let Some(pred) = &$pred {
+            $self.catalog.for_each_row_raw($table, |_rid, data| {
+                if !pred(data) { return; }
+                // SAFETY: see module-level comment on agg_float_loop!.
+                let bmp = unsafe { *data.get_unchecked(2 + bmp_byte) };
+                if (bmp >> bmp_bit) & 1 == 1 { return; }
+                let $v: f64 = unsafe {
+                    f64::from_le_bytes(*(data.as_ptr().add(off) as *const [u8; 8]))
+                };
+                $body
+            }).map_err(|e| e.to_string())?;
+        } else {
+            $self.catalog.for_each_row_raw($table, |_rid, data| {
+                // SAFETY: see module-level comment on agg_float_loop!.
+                let bmp = unsafe { *data.get_unchecked(2 + bmp_byte) };
+                if (bmp >> bmp_bit) & 1 == 1 { return; }
+                let $v: f64 = unsafe {
+                    f64::from_le_bytes(*(data.as_ptr().add(off) as *const [u8; 8]))
+                };
+                $body
+            }).map_err(|e| e.to_string())?;
+        }
+    }};
+}
+
 pub struct Engine {
     catalog: Catalog,
     /// Mission D9 — cached parsed+planned query trees keyed by canonical
@@ -1962,23 +2056,28 @@ impl Engine {
         // top-N sort fast path use, keeping semantics consistent across
         // read paths (NaN compares as greatest, -0.0 < +0.0 for
         // deterministic tie-breaking).
+        //
+        // Mission D11 Phase 1: each inner loop now splits on presence of
+        // a predicate (`if let Some(pred) = &compiled_pred`) so the hot
+        // body never re-tests `Option` per row, and reads column bytes
+        // via `read_i64_unchecked` / `read_f64_unchecked` helpers that
+        // drop two bounds checks per row (null bitmap byte + value
+        // slice). Safety is carried by the `FastLayout` invariant that
+        // `data_offset + 8 <= row_len` for any fixed-size column; see
+        // the helper doc comments. Hot loops are macro-generated so the
+        // with-pred / no-pred split can't drift between variants.
         let result = match col_type {
             TypeId::Int => match function {
                 AggFunc::Sum | AggFunc::Avg => {
                     let mut sum_i128: i128 = 0;
                     let mut count: i64 = 0;
-                    self.catalog.for_each_row_raw(table, |_rid, data| {
-                        if let Some(ref pred) = compiled_pred {
-                            if !pred(data) { return; }
+                    agg_int_loop!(
+                        self, table, compiled_pred, bitmap_byte, bitmap_bit, data_offset,
+                        |v: i64| {
+                            count += 1;
+                            sum_i128 += v as i128;
                         }
-                        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
-                        if is_null { return; }
-                        let v = i64::from_le_bytes(
-                            data[data_offset..data_offset + 8].try_into().unwrap(),
-                        );
-                        count += 1;
-                        sum_i128 += v as i128;
-                    }).map_err(|e| e.to_string())?;
+                    );
                     if matches!(function, AggFunc::Sum) {
                         let clamped = sum_i128.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
                         QueryResult::Scalar(Value::Int(clamped))
@@ -1991,59 +2090,38 @@ impl Engine {
                 }
                 AggFunc::Min => {
                     let mut min_v: Option<i64> = None;
-                    self.catalog.for_each_row_raw(table, |_rid, data| {
-                        if let Some(ref pred) = compiled_pred {
-                            if !pred(data) { return; }
+                    agg_int_loop!(
+                        self, table, compiled_pred, bitmap_byte, bitmap_bit, data_offset,
+                        |v: i64| {
+                            min_v = Some(match min_v { Some(m) => m.min(v), None => v });
                         }
-                        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
-                        if is_null { return; }
-                        let v = i64::from_le_bytes(
-                            data[data_offset..data_offset + 8].try_into().unwrap(),
-                        );
-                        min_v = Some(match min_v { Some(m) => m.min(v), None => v });
-                    }).map_err(|e| e.to_string())?;
+                    );
                     QueryResult::Scalar(min_v.map(Value::Int).unwrap_or(Value::Empty))
                 }
                 AggFunc::Max => {
                     let mut max_v: Option<i64> = None;
-                    self.catalog.for_each_row_raw(table, |_rid, data| {
-                        if let Some(ref pred) = compiled_pred {
-                            if !pred(data) { return; }
+                    agg_int_loop!(
+                        self, table, compiled_pred, bitmap_byte, bitmap_bit, data_offset,
+                        |v: i64| {
+                            max_v = Some(match max_v { Some(m) => m.max(v), None => v });
                         }
-                        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
-                        if is_null { return; }
-                        let v = i64::from_le_bytes(
-                            data[data_offset..data_offset + 8].try_into().unwrap(),
-                        );
-                        max_v = Some(match max_v { Some(m) => m.max(v), None => v });
-                    }).map_err(|e| e.to_string())?;
+                    );
                     QueryResult::Scalar(max_v.map(Value::Int).unwrap_or(Value::Empty))
                 }
                 AggFunc::Count => {
                     let mut count: i64 = 0;
-                    self.catalog.for_each_row_raw(table, |_rid, data| {
-                        if let Some(ref pred) = compiled_pred {
-                            if !pred(data) { return; }
-                        }
-                        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
-                        if is_null { return; }
-                        count += 1;
-                    }).map_err(|e| e.to_string())?;
+                    agg_int_loop!(
+                        self, table, compiled_pred, bitmap_byte, bitmap_bit, data_offset,
+                        |_v: i64| { count += 1; }
+                    );
                     QueryResult::Scalar(Value::Int(count))
                 }
                 AggFunc::CountDistinct => {
                     let mut seen = rustc_hash::FxHashSet::default();
-                    self.catalog.for_each_row_raw(table, |_rid, data| {
-                        if let Some(ref pred) = compiled_pred {
-                            if !pred(data) { return; }
-                        }
-                        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
-                        if is_null { return; }
-                        let v = i64::from_le_bytes(
-                            data[data_offset..data_offset + 8].try_into().unwrap(),
-                        );
-                        seen.insert(v);
-                    }).map_err(|e| e.to_string())?;
+                    agg_int_loop!(
+                        self, table, compiled_pred, bitmap_byte, bitmap_bit, data_offset,
+                        |v: i64| { seen.insert(v); }
+                    );
                     QueryResult::Scalar(Value::Int(seen.len() as i64))
                 }
             }
@@ -2054,34 +2132,22 @@ impl Engine {
                     // issue on long scans we can upgrade to Kahan–Neumaier
                     // compensated sum (~2x scalar cost, zero error growth).
                     let mut sum: f64 = 0.0;
-                    self.catalog.for_each_row_raw(table, |_rid, data| {
-                        if let Some(ref pred) = compiled_pred {
-                            if !pred(data) { return; }
-                        }
-                        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
-                        if is_null { return; }
-                        let v = f64::from_le_bytes(
-                            data[data_offset..data_offset + 8].try_into().unwrap(),
-                        );
-                        sum += v;
-                    }).map_err(|e| e.to_string())?;
+                    agg_float_loop!(
+                        self, table, compiled_pred, bitmap_byte, bitmap_bit, data_offset,
+                        |v: f64| { sum += v; }
+                    );
                     QueryResult::Scalar(Value::Float(sum))
                 }
                 AggFunc::Avg => {
                     let mut sum: f64 = 0.0;
                     let mut count: i64 = 0;
-                    self.catalog.for_each_row_raw(table, |_rid, data| {
-                        if let Some(ref pred) = compiled_pred {
-                            if !pred(data) { return; }
+                    agg_float_loop!(
+                        self, table, compiled_pred, bitmap_byte, bitmap_bit, data_offset,
+                        |v: f64| {
+                            sum += v;
+                            count += 1;
                         }
-                        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
-                        if is_null { return; }
-                        let v = f64::from_le_bytes(
-                            data[data_offset..data_offset + 8].try_into().unwrap(),
-                        );
-                        sum += v;
-                        count += 1;
-                    }).map_err(|e| e.to_string())?;
+                    );
                     if count == 0 {
                         QueryResult::Scalar(Value::Empty)
                     } else {
@@ -2093,50 +2159,36 @@ impl Engine {
                     // Value::Ord). NaN compares greatest, so Min will
                     // correctly ignore it in favour of any finite value.
                     let mut min_v: Option<f64> = None;
-                    self.catalog.for_each_row_raw(table, |_rid, data| {
-                        if let Some(ref pred) = compiled_pred {
-                            if !pred(data) { return; }
+                    agg_float_loop!(
+                        self, table, compiled_pred, bitmap_byte, bitmap_bit, data_offset,
+                        |v: f64| {
+                            min_v = Some(match min_v {
+                                Some(m) => if v.total_cmp(&m).is_lt() { v } else { m },
+                                None => v,
+                            });
                         }
-                        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
-                        if is_null { return; }
-                        let v = f64::from_le_bytes(
-                            data[data_offset..data_offset + 8].try_into().unwrap(),
-                        );
-                        min_v = Some(match min_v {
-                            Some(m) => if v.total_cmp(&m).is_lt() { v } else { m },
-                            None => v,
-                        });
-                    }).map_err(|e| e.to_string())?;
+                    );
                     QueryResult::Scalar(min_v.map(Value::Float).unwrap_or(Value::Empty))
                 }
                 AggFunc::Max => {
                     let mut max_v: Option<f64> = None;
-                    self.catalog.for_each_row_raw(table, |_rid, data| {
-                        if let Some(ref pred) = compiled_pred {
-                            if !pred(data) { return; }
+                    agg_float_loop!(
+                        self, table, compiled_pred, bitmap_byte, bitmap_bit, data_offset,
+                        |v: f64| {
+                            max_v = Some(match max_v {
+                                Some(m) => if v.total_cmp(&m).is_gt() { v } else { m },
+                                None => v,
+                            });
                         }
-                        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
-                        if is_null { return; }
-                        let v = f64::from_le_bytes(
-                            data[data_offset..data_offset + 8].try_into().unwrap(),
-                        );
-                        max_v = Some(match max_v {
-                            Some(m) => if v.total_cmp(&m).is_gt() { v } else { m },
-                            None => v,
-                        });
-                    }).map_err(|e| e.to_string())?;
+                    );
                     QueryResult::Scalar(max_v.map(Value::Float).unwrap_or(Value::Empty))
                 }
                 AggFunc::Count => {
                     let mut count: i64 = 0;
-                    self.catalog.for_each_row_raw(table, |_rid, data| {
-                        if let Some(ref pred) = compiled_pred {
-                            if !pred(data) { return; }
-                        }
-                        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
-                        if is_null { return; }
-                        count += 1;
-                    }).map_err(|e| e.to_string())?;
+                    agg_float_loop!(
+                        self, table, compiled_pred, bitmap_byte, bitmap_bit, data_offset,
+                        |_v: f64| { count += 1; }
+                    );
                     QueryResult::Scalar(Value::Int(count))
                 }
                 AggFunc::CountDistinct => {
@@ -2146,17 +2198,10 @@ impl Engine {
                     // Float values are hashed in every other DISTINCT /
                     // GROUP BY path.
                     let mut seen = rustc_hash::FxHashSet::default();
-                    self.catalog.for_each_row_raw(table, |_rid, data| {
-                        if let Some(ref pred) = compiled_pred {
-                            if !pred(data) { return; }
-                        }
-                        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
-                        if is_null { return; }
-                        let v = f64::from_le_bytes(
-                            data[data_offset..data_offset + 8].try_into().unwrap(),
-                        );
-                        seen.insert(v.to_bits());
-                    }).map_err(|e| e.to_string())?;
+                    agg_float_loop!(
+                        self, table, compiled_pred, bitmap_byte, bitmap_bit, data_offset,
+                        |v: f64| { seen.insert(v.to_bits()); }
+                    );
                     QueryResult::Scalar(Value::Int(seen.len() as i64))
                 }
             }
