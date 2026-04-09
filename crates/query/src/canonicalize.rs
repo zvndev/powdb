@@ -144,6 +144,12 @@ fn hash_token(h: u64, tok: &Token, literals: &mut Vec<Literal>) -> u64 {
         Token::Sum          => hash_byte(h, 0x2E),
         Token::Min          => hash_byte(h, 0x2F),
         Token::Max          => hash_byte(h, 0x30),
+        Token::Join         => hash_byte(h, 0x31),
+        Token::Inner        => hash_byte(h, 0x32),
+        Token::LeftKw       => hash_byte(h, 0x33),
+        Token::RightKw      => hash_byte(h, 0x34),
+        Token::Outer        => hash_byte(h, 0x35),
+        Token::Cross        => hash_byte(h, 0x36),
 
         // Operators.
         Token::Eq       => hash_byte(h, 0x40),

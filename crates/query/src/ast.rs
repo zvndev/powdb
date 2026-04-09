@@ -8,16 +8,45 @@ pub enum Statement {
     CreateType(CreateTypeExpr),
 }
 
-/// A query expression: Type [filter ...] [order ...] [limit ...] [{ projection }]
+/// A query expression: Type [join ...]* [filter ...] [order ...] [limit ...] [{ projection }]
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryExpr {
     pub source: String,
+    /// Optional alias for the primary source (e.g. `User as u`). Used to
+    /// disambiguate qualified column references in join queries. `None` for
+    /// single-table queries.
+    pub alias: Option<String>,
+    /// Zero or more join clauses chained to the primary source. For a
+    /// single-table query this is always empty so existing code paths are
+    /// untouched.
+    pub joins: Vec<JoinClause>,
     pub filter: Option<Expr>,
     pub order: Option<OrderClause>,
     pub limit: Option<Expr>,
     pub offset: Option<Expr>,
     pub projection: Option<Vec<ProjectionField>>,
     pub aggregation: Option<AggregateExpr>,
+}
+
+/// A join clause appended to a query's primary source.
+///
+/// Example syntax (Mission E1.1 parser accepts this; executor still errors):
+///   `User as u inner join Order as o on u.id = o.user_id filter o.total > 100`
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinClause {
+    pub kind: JoinKind,
+    pub source: String,
+    pub alias: Option<String>,
+    /// `on <expr>` — required for every kind except `Cross`.
+    pub on: Option<Expr>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    LeftOuter,
+    RightOuter,
+    Cross,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -89,6 +118,11 @@ pub enum AggFunc {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Field(String),
+    /// A table-qualified field reference: `table.field` or `alias.field`.
+    /// Used by join queries to disambiguate columns that appear in multiple
+    /// sources. The single-table read path never emits this variant, so
+    /// existing fast paths keep matching `Expr::Field` unchanged.
+    QualifiedField { qualifier: String, field: String },
     Literal(Literal),
     Param(String),
     BinaryOp(Box<Expr>, BinOp, Box<Expr>),

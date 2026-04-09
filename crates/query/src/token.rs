@@ -35,6 +35,12 @@ pub enum Token {
     As,         // as
     Match,      // match
     Group,      // group
+    Join,       // join
+    Inner,      // inner
+    LeftKw,     // left  (keyword — avoids clashing with ast::JoinKind::LeftOuter naming)
+    RightKw,    // right
+    Outer,      // outer
+    Cross,      // cross
     Transaction,// transaction
     View,       // view
     Materialized,// materialized

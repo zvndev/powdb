@@ -235,7 +235,7 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
 fn count_expr(expr: &Expr, n: &mut usize) {
     match expr {
         Expr::Literal(_) => *n += 1,
-        Expr::Field(_) | Expr::Param(_) => {}
+        Expr::Field(_) | Expr::QualifiedField { .. } | Expr::Param(_) => {}
         Expr::BinaryOp(l, _, r) => {
             count_expr(l, n);
             count_expr(r, n);
@@ -258,7 +258,7 @@ fn substitute_expr(expr: &mut Expr, literals: &[Literal], idx: &mut usize) {
             *expr = Expr::Literal(literals[*idx].clone());
             *idx += 1;
         }
-        Expr::Field(_) | Expr::Param(_) => {}
+        Expr::Field(_) | Expr::QualifiedField { .. } | Expr::Param(_) => {}
         Expr::BinaryOp(l, _, r) => {
             substitute_expr(l, literals, idx);
             substitute_expr(r, literals, idx);
@@ -446,7 +446,7 @@ mod tests {
     fn collect_expr_literals(expr: &Expr, out: &mut Vec<Literal>) {
         match expr {
             Expr::Literal(l) => out.push(l.clone()),
-            Expr::Field(_) | Expr::Param(_) => {}
+            Expr::Field(_) | Expr::QualifiedField { .. } | Expr::Param(_) => {}
             Expr::BinaryOp(l, _, r) => {
                 collect_expr_literals(l, out);
                 collect_expr_literals(r, out);

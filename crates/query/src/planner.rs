@@ -29,6 +29,14 @@ pub fn plan_statement(stmt: Statement) -> Result<PlanNode, PlanError> {
 }
 
 fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
+    // Mission E1.1: JOIN parser landed, but execution isn't wired yet. Error
+    // out cleanly so users see a helpful message instead of silently wrong
+    // results. E1.2 will replace this with a NestedLoopJoin planner.
+    if !q.joins.is_empty() {
+        return Err(PlanError {
+            message: "JOIN is parsed but not yet executable (Mission E1.2)".into(),
+        });
+    }
     // Try to fold `filter .col = literal` into an IndexScan. The executor
     // decides at run time whether the column actually has an index — if not,
     // it transparently falls back to a sequential scan with the same predicate,
@@ -291,5 +299,18 @@ mod tests {
             }
             other => panic!("expected Delete, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_plan_join_errors_cleanly() {
+        // Mission E1.1: parser accepts joins but the planner rejects them
+        // until E1.2 wires up execution. The error message should be
+        // actionable, not a panic or confusing type error.
+        let err = plan("User as u join Order as o on u.id = o.user_id").unwrap_err();
+        assert!(
+            err.message.contains("JOIN"),
+            "expected JOIN error, got: {}",
+            err.message
+        );
     }
 }

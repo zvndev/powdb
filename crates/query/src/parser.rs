@@ -55,6 +55,8 @@ impl Parser {
             Token::Ident(name) => name,
             t => return Err(ParseError { message: format!("expected type name, got {t:?}") }),
         };
+        let alias = self.try_parse_alias();
+        let joins = self.parse_joins()?;
 
         // Walk filter/order/limit/offset/projection, peeling off update/delete
         // mutations as we hit them. Anything else terminates the read pipeline
@@ -87,11 +89,21 @@ impl Parser {
                     projection = Some(self.parse_projection()?);
                 }
                 Token::Update => {
+                    if !joins.is_empty() {
+                        return Err(ParseError {
+                            message: "update on a joined query is not supported".into(),
+                        });
+                    }
                     self.advance();
                     let assignments = self.parse_assignments()?;
                     return Ok(Statement::UpdateQuery(UpdateExpr { source, filter, assignments }));
                 }
                 Token::Delete => {
+                    if !joins.is_empty() {
+                        return Err(ParseError {
+                            message: "delete on a joined query is not supported".into(),
+                        });
+                    }
                     self.advance();
                     return Ok(Statement::DeleteQuery(DeleteExpr { source, filter }));
                 }
@@ -101,6 +113,8 @@ impl Parser {
 
         Ok(Statement::Query(QueryExpr {
             source,
+            alias,
+            joins,
             filter,
             order,
             limit,
@@ -116,6 +130,8 @@ impl Parser {
     /// terminator (RParen for an aggregate, EOF for a top-level query, etc.).
     /// Always returns `aggregation: None`; the caller layers that on.
     fn parse_query_tail(&mut self, source: String) -> Result<QueryExpr, ParseError> {
+        let alias = self.try_parse_alias();
+        let joins = self.parse_joins()?;
         let mut filter = None;
         let mut order = None;
         let mut limit = None;
@@ -149,6 +165,8 @@ impl Parser {
 
         Ok(QueryExpr {
             source,
+            alias,
+            joins,
             filter,
             order,
             limit,
@@ -156,6 +174,88 @@ impl Parser {
             projection,
             aggregation: None,
         })
+    }
+
+    /// Consume an optional `as <ident>` suffix on a source. Returns `None`
+    /// if the next token isn't `as`. Used by both the primary source and each
+    /// join source so queries can disambiguate columns via `alias.field`.
+    fn try_parse_alias(&mut self) -> Option<String> {
+        if *self.peek() == Token::As {
+            self.advance();
+            if let Token::Ident(name) = self.peek().clone() {
+                self.advance();
+                return Some(name);
+            }
+        }
+        None
+    }
+
+    /// Parse zero or more join clauses. Each clause is:
+    ///   (`inner` | `left` [`outer`] | `right` [`outer`] | `cross`)? `join`
+    ///   <Ident> [`as` <ident>] [`on` <expr>]
+    ///
+    /// `on` is required for every kind except `cross`. The default kind is
+    /// `inner` when the caller wrote bare `join` without a preceding modifier.
+    fn parse_joins(&mut self) -> Result<Vec<JoinClause>, ParseError> {
+        let mut joins = Vec::new();
+        loop {
+            let kind = match self.peek() {
+                Token::Join => {
+                    self.advance();
+                    JoinKind::Inner
+                }
+                Token::Inner => {
+                    self.advance();
+                    self.expect(&Token::Join)?;
+                    JoinKind::Inner
+                }
+                Token::LeftKw => {
+                    self.advance();
+                    if *self.peek() == Token::Outer {
+                        self.advance();
+                    }
+                    self.expect(&Token::Join)?;
+                    JoinKind::LeftOuter
+                }
+                Token::RightKw => {
+                    self.advance();
+                    if *self.peek() == Token::Outer {
+                        self.advance();
+                    }
+                    self.expect(&Token::Join)?;
+                    JoinKind::RightOuter
+                }
+                Token::Cross => {
+                    self.advance();
+                    self.expect(&Token::Join)?;
+                    JoinKind::Cross
+                }
+                _ => break,
+            };
+
+            let source = match self.advance() {
+                Token::Ident(name) => name,
+                t => {
+                    return Err(ParseError {
+                        message: format!("expected type name after join, got {t:?}"),
+                    });
+                }
+            };
+            let alias = self.try_parse_alias();
+            let on = if kind == JoinKind::Cross {
+                None
+            } else if *self.peek() == Token::On {
+                self.advance();
+                Some(self.parse_expr()?)
+            } else {
+                return Err(ParseError {
+                    message: format!("expected `on <expr>` after join {source}"),
+                });
+            };
+
+            joins.push(JoinClause { kind, source, alias, on });
+        }
+        Ok(joins)
     }
 
     fn parse_insert(&mut self) -> Result<Statement, ParseError> {
@@ -384,6 +484,13 @@ impl Parser {
             }
             Token::Ident(name) => {
                 self.advance();
+                // `alias.field` → QualifiedField. The lexer emits `t1.name` as
+                // `Ident("t1")` + `DotIdent("name")` (see lexer.rs line 30),
+                // so a trailing DotIdent here means a qualified reference.
+                if let Token::DotIdent(field) = self.peek().clone() {
+                    self.advance();
+                    return Ok(Expr::QualifiedField { qualifier: name, field });
+                }
                 Ok(Expr::Field(name))
             }
             t => Err(ParseError { message: format!("unexpected token in expression: {t:?}") }),
@@ -625,5 +732,179 @@ mod tests {
             }
             _ => panic!("expected query"),
         }
+    }
+
+    // ---- Mission E1.1: JOIN parser tests ----------------------------------
+    // Parser-level only. The planner rejects joins with a clean error until
+    // E1.2 wires up execution.
+
+    #[test]
+    fn test_parse_source_alias() {
+        let stmt = parse("User as u filter u.age > 30").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                assert_eq!(q.source, "User");
+                assert_eq!(q.alias.as_deref(), Some("u"));
+                assert!(q.joins.is_empty());
+                match q.filter.unwrap() {
+                    Expr::BinaryOp(l, BinOp::Gt, _) => match *l {
+                        Expr::QualifiedField { qualifier, field } => {
+                            assert_eq!(qualifier, "u");
+                            assert_eq!(field, "age");
+                        }
+                        other => panic!("expected qualified field, got {other:?}"),
+                    },
+                    other => panic!("expected >, got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_inner_join_on() {
+        let stmt = parse("User as u inner join Order as o on u.id = o.user_id").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                assert_eq!(q.source, "User");
+                assert_eq!(q.alias.as_deref(), Some("u"));
+                assert_eq!(q.joins.len(), 1);
+                let j = &q.joins[0];
+                assert_eq!(j.kind, JoinKind::Inner);
+                assert_eq!(j.source, "Order");
+                assert_eq!(j.alias.as_deref(), Some("o"));
+                let on = j.on.as_ref().expect("on clause");
+                match on {
+                    Expr::BinaryOp(l, BinOp::Eq, r) => {
+                        assert!(matches!(**l, Expr::QualifiedField { .. }));
+                        assert!(matches!(**r, Expr::QualifiedField { .. }));
+                    }
+                    other => panic!("expected eq, got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_bare_join_defaults_to_inner() {
+        let stmt = parse("User join Order on User.id = Order.user_id").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                assert_eq!(q.joins.len(), 1);
+                assert_eq!(q.joins[0].kind, JoinKind::Inner);
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_left_outer_join() {
+        let stmt = parse("User as u left outer join Order as o on u.id = o.user_id").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                assert_eq!(q.joins.len(), 1);
+                assert_eq!(q.joins[0].kind, JoinKind::LeftOuter);
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_left_join_without_outer_keyword() {
+        // `left join` is shorthand for `left outer join` in SQL — we accept it.
+        let stmt = parse("User as u left join Order as o on u.id = o.user_id").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                assert_eq!(q.joins[0].kind, JoinKind::LeftOuter);
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_right_join() {
+        let stmt = parse("User as u right join Order as o on u.id = o.user_id").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                assert_eq!(q.joins[0].kind, JoinKind::RightOuter);
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_cross_join_has_no_on() {
+        let stmt = parse("User cross join Order").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                assert_eq!(q.joins[0].kind, JoinKind::Cross);
+                assert!(q.joins[0].on.is_none());
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_multi_join_chain() {
+        let stmt = parse(
+            "User as u join Order as o on u.id = o.user_id \
+             join Product as p on o.product_id = p.id",
+        )
+        .unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                assert_eq!(q.joins.len(), 2);
+                assert_eq!(q.joins[0].source, "Order");
+                assert_eq!(q.joins[1].source, "Product");
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_join_with_filter_tail() {
+        // Filter/order/limit still work after a join clause.
+        let stmt = parse(
+            "User as u join Order as o on u.id = o.user_id \
+             filter o.total > 100 order .name limit 10",
+        )
+        .unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                assert_eq!(q.joins.len(), 1);
+                assert!(q.filter.is_some());
+                assert!(q.order.is_some());
+                assert!(q.limit.is_some());
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_join_requires_on_for_inner() {
+        // Non-cross joins require `on <expr>`. Missing `on` is a parse error.
+        let err = parse("User join Order").unwrap_err();
+        assert!(
+            err.message.contains("on"),
+            "expected on-clause error, got {:?}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_parse_update_on_joined_query_errors() {
+        // E1.1 explicitly rejects update/delete on joined queries — SQL
+        // semantics here are messy and we're not implementing them yet.
+        let err = parse("User as u join Order as o on u.id = o.user_id update { age := 1 }")
+            .unwrap_err();
+        assert!(err.message.contains("update"));
+    }
+
+    #[test]
+    fn test_parse_delete_on_joined_query_errors() {
+        let err =
+            parse("User as u join Order as o on u.id = o.user_id delete").unwrap_err();
+        assert!(err.message.contains("delete"));
     }
 }
