@@ -355,6 +355,12 @@ impl Parser {
                             _ => unreachable!(),
                         };
                         self.expect(&Token::LParen)?;
+                        // count(*) — count all rows
+                        if func == AggFunc::Count && *self.peek() == Token::Star {
+                            self.advance();
+                            self.expect(&Token::RParen)?;
+                            Expr::FunctionCall(AggFunc::Count, Box::new(Expr::Field("*".into())))
+                        } else {
                         // count(distinct .field) → CountDistinct
                         if func == AggFunc::Count && *self.peek() == Token::Distinct {
                             self.advance();
@@ -363,6 +369,7 @@ impl Parser {
                         let inner = self.parse_expr()?;
                         self.expect(&Token::RParen)?;
                         Expr::FunctionCall(func, Box::new(inner))
+                        }
                     }
                     Token::Upper | Token::Lower | Token::Length | Token::Trim
                     | Token::Substring | Token::Concat => {

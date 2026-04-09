@@ -1521,10 +1521,16 @@ impl Engine {
                                 .ok_or_else(|| format!("group-by column '{k}' not found"))
                         }).collect::<Result<Vec<_>, _>>()?;
 
-                        // Resolve aggregate field indices.
+                        // Resolve aggregate field indices. count(*) uses
+                        // sentinel usize::MAX — compute_group_aggregate
+                        // treats it as "count all rows in the group".
                         let agg_field_indices: Vec<usize> = aggregates.iter().map(|a| {
-                            columns.iter().position(|c| c == &a.field)
-                                .ok_or_else(|| format!("aggregate column '{}' not found", a.field))
+                            if a.field == "*" {
+                                Ok(usize::MAX)
+                            } else {
+                                columns.iter().position(|c| c == &a.field)
+                                    .ok_or_else(|| format!("aggregate column '{}' not found", a.field))
+                            }
                         }).collect::<Result<Vec<_>, _>>()?;
 
                         // Group rows by key values (preserving insertion order).
@@ -2623,6 +2629,10 @@ fn compute_group_aggregate(
 ) -> Value {
     match func {
         AggFunc::Count => {
+            if col_idx == usize::MAX {
+                // count(*) — count all rows in the group.
+                return Value::Int(row_indices.len() as i64);
+            }
             let count = row_indices.iter()
                 .filter(|&&ri| !all_rows[ri][col_idx].is_empty())
                 .count();
@@ -5061,5 +5071,35 @@ mod tests {
         let result = engine.execute_powql(r#"User filter .name = "Alice""#).unwrap();
         let rows = match result { QueryResult::Rows { rows, .. } => rows, _ => panic!() };
         assert_eq!(rows[0][2], Value::Int(99));
+    }
+
+    // ── COUNT(*) in GROUP BY tests ─────────────────────────────
+
+    #[test]
+    fn test_group_by_count_star() {
+        let mut engine = test_engine();
+        // test_engine has 3 users: Alice(30), Bob(25), Charlie(35)
+        // Add another user with same age as Alice
+        engine.execute_powql(r#"insert User { name := "Dave", email := "d@e.com", age := 30 }"#).unwrap();
+        let result = engine.execute_powql(
+            "User group .age { .age, count(*) }"
+        ).unwrap();
+        let rows = match result { QueryResult::Rows { rows, .. } => rows, _ => panic!() };
+        let age30 = rows.iter().find(|r| r[0] == Value::Int(30)).unwrap();
+        assert_eq!(age30[1], Value::Int(2)); // Alice + Dave
+        let age25 = rows.iter().find(|r| r[0] == Value::Int(25)).unwrap();
+        assert_eq!(age25[1], Value::Int(1)); // Bob only
+    }
+
+    #[test]
+    fn test_group_by_count_star_with_having() {
+        let mut engine = test_engine();
+        engine.execute_powql(r#"insert User { name := "Dave", email := "d@e.com", age := 30 }"#).unwrap();
+        let result = engine.execute_powql(
+            "User group .age having count(*) > 1 { .age, count(*) }"
+        ).unwrap();
+        let rows = match result { QueryResult::Rows { rows, .. } => rows, _ => panic!() };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Int(30)); // only age=30 has count > 1
     }
 }
