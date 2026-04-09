@@ -58,6 +58,41 @@ fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
         node = PlanNode::Filter { input: Box::new(node), predicate: pred };
     }
 
+    // Mission E2b: GROUP BY path — insert GroupBy + Project before
+    // order/limit/offset/distinct.
+    if let Some(group) = q.group_by {
+        let mut proj_fields: Vec<ProjectField> = q.projection
+            .map(|proj| proj.into_iter().map(|pf| ProjectField { alias: pf.alias, expr: pf.expr }).collect())
+            .unwrap_or_default();
+        let mut having = group.having;
+        let aggregates = extract_aggregates(&mut proj_fields, &mut having);
+
+        node = PlanNode::GroupBy {
+            input: Box::new(node),
+            keys: group.keys,
+            aggregates,
+            having,
+        };
+
+        if !proj_fields.is_empty() {
+            node = PlanNode::Project { input: Box::new(node), fields: proj_fields };
+        }
+
+        if let Some(order) = q.order {
+            node = PlanNode::Sort { input: Box::new(node), field: order.field, descending: order.descending };
+        }
+        if let Some(lim) = q.limit {
+            node = PlanNode::Limit { input: Box::new(node), count: lim };
+        }
+        if let Some(off) = q.offset {
+            node = PlanNode::Offset { input: Box::new(node), count: off };
+        }
+        if q.distinct {
+            node = PlanNode::Distinct { input: Box::new(node) };
+        }
+        return Ok(node);
+    }
+
     if let Some(order) = q.order {
         node = PlanNode::Sort {
             input: Box::new(node),
@@ -175,6 +210,30 @@ fn plan_joined_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
         node = PlanNode::Offset { input: Box::new(node), count: off };
     }
 
+    // Mission E2b: GROUP BY path for joined queries.
+    if let Some(group) = q.group_by {
+        let mut proj_fields: Vec<ProjectField> = q.projection
+            .map(|proj| proj.into_iter().map(|pf| ProjectField { alias: pf.alias, expr: pf.expr }).collect())
+            .unwrap_or_default();
+        let mut having = group.having;
+        let aggregates = extract_aggregates(&mut proj_fields, &mut having);
+
+        node = PlanNode::GroupBy {
+            input: Box::new(node),
+            keys: group.keys,
+            aggregates,
+            having,
+        };
+
+        if !proj_fields.is_empty() {
+            node = PlanNode::Project { input: Box::new(node), fields: proj_fields };
+        }
+        if q.distinct {
+            node = PlanNode::Distinct { input: Box::new(node) };
+        }
+        return Ok(node);
+    }
+
     if let Some(proj) = q.projection {
         let fields = proj.into_iter().map(|pf| ProjectField {
             alias: pf.alias,
@@ -276,6 +335,74 @@ fn try_extract_eq_index_key(table: &str, pred: &Expr) -> Option<PlanNode> {
         column,
         key,
     })
+}
+
+/// Walk projection fields and HAVING expression, replacing every
+/// `Expr::FunctionCall(func, Field(col))` with `Expr::Field("__agg_N")`
+/// and collecting the corresponding `GroupAgg` descriptors. Deduplicates:
+/// if the same (func, field) pair appears in both projection and HAVING,
+/// they share a single `GroupAgg` entry.
+fn extract_aggregates(
+    proj_fields: &mut [ProjectField],
+    having: &mut Option<Expr>,
+) -> Vec<GroupAgg> {
+    let mut aggs: Vec<GroupAgg> = Vec::new();
+    let mut counter = 0usize;
+    for f in proj_fields.iter_mut() {
+        rewrite_agg_expr(&mut f.expr, &mut aggs, &mut counter);
+    }
+    if let Some(h) = having {
+        rewrite_agg_expr(h, &mut aggs, &mut counter);
+    }
+    aggs
+}
+
+fn rewrite_agg_expr(expr: &mut Expr, aggs: &mut Vec<GroupAgg>, counter: &mut usize) {
+    match expr {
+        Expr::FunctionCall(func, inner) => {
+            if let Expr::Field(name) = inner.as_ref() {
+                let output = find_or_insert_agg(aggs, *func, name, counter);
+                *expr = Expr::Field(output);
+            }
+        }
+        Expr::BinaryOp(l, _, r) => {
+            rewrite_agg_expr(l, aggs, counter);
+            rewrite_agg_expr(r, aggs, counter);
+        }
+        Expr::UnaryOp(_, inner) => rewrite_agg_expr(inner, aggs, counter),
+        Expr::Coalesce(l, r) => {
+            rewrite_agg_expr(l, aggs, counter);
+            rewrite_agg_expr(r, aggs, counter);
+        }
+        Expr::InList { expr: e, list, .. } => {
+            rewrite_agg_expr(e, aggs, counter);
+            for item in list {
+                rewrite_agg_expr(item, aggs, counter);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn find_or_insert_agg(
+    aggs: &mut Vec<GroupAgg>,
+    func: AggFunc,
+    field: &str,
+    counter: &mut usize,
+) -> String {
+    for existing in aggs.iter() {
+        if existing.function == func && existing.field == field {
+            return existing.output_name.clone();
+        }
+    }
+    let output_name = format!("__agg_{counter}");
+    aggs.push(GroupAgg {
+        function: func,
+        field: field.to_string(),
+        output_name: output_name.clone(),
+    });
+    *counter += 1;
+    output_name
 }
 
 #[cfg(test)]
@@ -475,6 +602,56 @@ mod tests {
                 assert!(matches!(*input, PlanNode::NestedLoopJoin { .. }));
             }
             other => panic!("expected Filter(NestedLoopJoin), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_plan_group_by_builds_groupby_node() {
+        let plan = plan("User group .status { .status, n: count(.name) }").unwrap();
+        // Should be Project(GroupBy(SeqScan)).
+        match plan {
+            PlanNode::Project { input, fields } => {
+                assert_eq!(fields.len(), 2);
+                match *input {
+                    PlanNode::GroupBy { input: inner, keys, aggregates, having } => {
+                        assert!(matches!(*inner, PlanNode::SeqScan { .. }));
+                        assert_eq!(keys, vec!["status"]);
+                        assert_eq!(aggregates.len(), 1);
+                        assert_eq!(aggregates[0].function, AggFunc::Count);
+                        assert_eq!(aggregates[0].field, "name");
+                        assert!(having.is_none());
+                    }
+                    other => panic!("expected GroupBy, got {other:?}"),
+                }
+            }
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_plan_group_by_having_rewrites_agg_in_having() {
+        let plan = plan("User group .status having count(.name) > 1 { .status }").unwrap();
+        match plan {
+            PlanNode::Project { input, .. } => {
+                match *input {
+                    PlanNode::GroupBy { having, aggregates, .. } => {
+                        // The planner should have extracted count(.name) into
+                        // aggregates and rewritten the HAVING to reference __agg_0.
+                        assert_eq!(aggregates.len(), 1);
+                        assert_eq!(aggregates[0].output_name, "__agg_0");
+                        let h = having.expect("having should be Some");
+                        match h {
+                            Expr::BinaryOp(l, BinOp::Gt, _) => {
+                                assert!(matches!(*l, Expr::Field(ref name) if name == "__agg_0"),
+                                    "expected Field(__agg_0), got {l:?}");
+                            }
+                            other => panic!("expected BinaryOp, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected GroupBy, got {other:?}"),
+                }
+            }
+            other => panic!("expected Project, got {other:?}"),
         }
     }
 }

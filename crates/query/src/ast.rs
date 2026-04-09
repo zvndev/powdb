@@ -27,6 +27,14 @@ pub struct QueryExpr {
     pub projection: Option<Vec<ProjectionField>>,
     pub aggregation: Option<AggregateExpr>,
     pub distinct: bool,
+    pub group_by: Option<GroupByClause>,
+}
+
+/// GROUP BY clause: `group .field1, .field2 [having <expr>]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupByClause {
+    pub keys: Vec<String>,
+    pub having: Option<Expr>,
 }
 
 /// A join clause appended to a query's primary source.

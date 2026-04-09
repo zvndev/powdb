@@ -67,12 +67,17 @@ impl Parser {
         let mut offset = None;
         let mut projection = None;
         let mut distinct = false;
+        let mut group_by = None;
 
         loop {
             match self.peek() {
                 Token::Distinct => {
                     self.advance();
                     distinct = true;
+                }
+                Token::Group => {
+                    self.advance();
+                    group_by = Some(self.parse_group_by()?);
                 }
                 Token::Filter => {
                     self.advance();
@@ -127,6 +132,7 @@ impl Parser {
             projection,
             aggregation: None,
             distinct,
+            group_by,
         }))
     }
 
@@ -144,12 +150,17 @@ impl Parser {
         let mut offset = None;
         let mut projection = None;
         let mut distinct = false;
+        let mut group_by = None;
 
         loop {
             match self.peek() {
                 Token::Distinct => {
                     self.advance();
                     distinct = true;
+                }
+                Token::Group => {
+                    self.advance();
+                    group_by = Some(self.parse_group_by()?);
                 }
                 Token::Filter => {
                     self.advance();
@@ -185,6 +196,7 @@ impl Parser {
             projection,
             aggregation: None,
             distinct,
+            group_by,
         })
     }
 
@@ -327,6 +339,20 @@ impl Parser {
                         }
                     }
                     Token::DotIdent(name) => Expr::Field(name),
+                    Token::Count | Token::Avg | Token::Sum | Token::Min | Token::Max => {
+                        let func = match first {
+                            Token::Count => AggFunc::Count,
+                            Token::Avg   => AggFunc::Avg,
+                            Token::Sum   => AggFunc::Sum,
+                            Token::Min   => AggFunc::Min,
+                            Token::Max   => AggFunc::Max,
+                            _ => unreachable!(),
+                        };
+                        self.expect(&Token::LParen)?;
+                        let inner = self.parse_expr()?;
+                        self.expect(&Token::RParen)?;
+                        Expr::FunctionCall(func, Box::new(inner))
+                    }
                     _ => return Err(ParseError { message: format!("expected field, got {first:?}") }),
                 };
                 fields.push(ProjectionField { alias: None, expr });
@@ -519,6 +545,38 @@ impl Parser {
         }
     }
 
+    /// Parse `group .field1, .field2 [having <expr>]`.
+    fn parse_group_by(&mut self) -> Result<GroupByClause, ParseError> {
+        let mut keys = Vec::new();
+        loop {
+            match self.peek() {
+                Token::DotIdent(name) => {
+                    let name = name.clone();
+                    self.advance();
+                    keys.push(name);
+                }
+                _ => break,
+            }
+            if *self.peek() == Token::Comma {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if keys.is_empty() {
+            return Err(ParseError {
+                message: "expected at least one .field after group".into(),
+            });
+        }
+        let having = if *self.peek() == Token::Having {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(GroupByClause { keys, having })
+    }
+
     fn parse_additive(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_primary()?;
         loop {
@@ -598,6 +656,23 @@ impl Parser {
                     return Ok(Expr::QualifiedField { qualifier: name, field });
                 }
                 Ok(Expr::Field(name))
+            }
+            // Aggregate function calls inside expressions (projections, HAVING).
+            // Top-level `count(User)` still routes through parse_aggregate_query
+            // in parse_statement; this arm handles `count(.id)`, `sum(.age)`, etc.
+            Token::Count | Token::Avg | Token::Sum | Token::Min | Token::Max => {
+                let func = match self.advance() {
+                    Token::Count => AggFunc::Count,
+                    Token::Avg   => AggFunc::Avg,
+                    Token::Sum   => AggFunc::Sum,
+                    Token::Min   => AggFunc::Min,
+                    Token::Max   => AggFunc::Max,
+                    _ => unreachable!(),
+                };
+                self.expect(&Token::LParen)?;
+                let inner = self.parse_expr()?;
+                self.expect(&Token::RParen)?;
+                Ok(Expr::FunctionCall(func, Box::new(inner)))
             }
             t => Err(ParseError { message: format!("unexpected token in expression: {t:?}") }),
         }
@@ -1121,6 +1196,87 @@ mod tests {
                     }
                     other => panic!("expected Not(Like), got {other:?}"),
                 }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    // ---- Mission E2b: GROUP BY + HAVING ------------------------------------
+
+    #[test]
+    fn test_parse_group_by_single_key() {
+        let stmt = parse("User group .status { .status, n: count(.name) }").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let gb = q.group_by.unwrap();
+                assert_eq!(gb.keys, vec!["status"]);
+                assert!(gb.having.is_none());
+                let proj = q.projection.unwrap();
+                assert_eq!(proj.len(), 2);
+                assert!(matches!(&proj[1].expr, Expr::FunctionCall(AggFunc::Count, _)));
+                assert_eq!(proj[1].alias.as_deref(), Some("n"));
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_group_by_multi_key() {
+        let stmt = parse("User group .status, .age { .status, .age }").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let gb = q.group_by.unwrap();
+                assert_eq!(gb.keys, vec!["status", "age"]);
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_group_by_having() {
+        let stmt = parse("User group .status having count(.name) > 1 { .status }").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let gb = q.group_by.unwrap();
+                assert_eq!(gb.keys, vec!["status"]);
+                assert!(gb.having.is_some());
+                // HAVING is `count(.name) > 1` — BinaryOp(FunctionCall, Gt, Literal)
+                match gb.having.unwrap() {
+                    Expr::BinaryOp(l, BinOp::Gt, _) => {
+                        assert!(matches!(*l, Expr::FunctionCall(AggFunc::Count, _)));
+                    }
+                    other => panic!("expected BinaryOp, got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_aggregate_in_projection() {
+        // Unaliased aggregate function calls in projection.
+        let stmt = parse("User group .status { .status, count(.name), sum(.age) }").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let proj = q.projection.unwrap();
+                assert_eq!(proj.len(), 3);
+                assert!(matches!(&proj[1].expr, Expr::FunctionCall(AggFunc::Count, _)));
+                assert!(matches!(&proj[2].expr, Expr::FunctionCall(AggFunc::Sum, _)));
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_aggregate_in_aliased_projection() {
+        let stmt = parse("User group .status { .status, total: count(.name), average: avg(.age) }").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let proj = q.projection.unwrap();
+                assert_eq!(proj[1].alias.as_deref(), Some("total"));
+                assert!(matches!(&proj[1].expr, Expr::FunctionCall(AggFunc::Count, _)));
+                assert_eq!(proj[2].alias.as_deref(), Some("average"));
+                assert!(matches!(&proj[2].expr, Expr::FunctionCall(AggFunc::Avg, _)));
             }
             _ => panic!("expected query"),
         }

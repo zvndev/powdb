@@ -44,6 +44,7 @@ pub enum Token {
     Transaction,// transaction
     View,       // view
     Materialized,// materialized
+    Having,     // having
     Distinct,   // distinct
     In,         // in
     Between,    // between

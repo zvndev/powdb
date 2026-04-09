@@ -1371,6 +1371,70 @@ impl Engine {
                 }
             }
 
+            PlanNode::GroupBy { input, keys, aggregates, having } => {
+                let result = self.execute_plan(input)?;
+                match result {
+                    QueryResult::Rows { columns, rows } => {
+                        // Resolve key column indices.
+                        let key_indices: Vec<usize> = keys.iter().map(|k| {
+                            columns.iter().position(|c| c == k)
+                                .ok_or_else(|| format!("group-by column '{k}' not found"))
+                        }).collect::<Result<Vec<_>, _>>()?;
+
+                        // Resolve aggregate field indices.
+                        let agg_field_indices: Vec<usize> = aggregates.iter().map(|a| {
+                            columns.iter().position(|c| c == &a.field)
+                                .ok_or_else(|| format!("aggregate column '{}' not found", a.field))
+                        }).collect::<Result<Vec<_>, _>>()?;
+
+                        // Group rows by key values (preserving insertion order).
+                        let mut group_map: rustc_hash::FxHashMap<Vec<Value>, usize> =
+                            rustc_hash::FxHashMap::default();
+                        let mut groups: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
+                        for (ri, row) in rows.iter().enumerate() {
+                            let key: Vec<Value> = key_indices.iter()
+                                .map(|&i| row[i].clone()).collect();
+                            match group_map.get(&key) {
+                                Some(&idx) => groups[idx].1.push(ri),
+                                None => {
+                                    let idx = groups.len();
+                                    group_map.insert(key.clone(), idx);
+                                    groups.push((key, vec![ri]));
+                                }
+                            }
+                        }
+
+                        // Build output column names: keys ++ aggregate output names.
+                        let mut out_columns: Vec<String> = keys.clone();
+                        for agg in aggregates.iter() {
+                            out_columns.push(agg.output_name.clone());
+                        }
+
+                        // Compute aggregates per group.
+                        let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
+                        for (key_vals, row_indices) in &groups {
+                            let mut row = key_vals.clone();
+                            for (ai, agg) in aggregates.iter().enumerate() {
+                                let col_idx = agg_field_indices[ai];
+                                let val = compute_group_aggregate(
+                                    agg.function, &rows, row_indices, col_idx,
+                                );
+                                row.push(val);
+                            }
+                            out_rows.push(row);
+                        }
+
+                        // Apply HAVING filter.
+                        if let Some(having_expr) = having {
+                            out_rows.retain(|row| eval_predicate(having_expr, row, &out_columns));
+                        }
+
+                        Ok(QueryResult::Rows { columns: out_columns, rows: out_rows })
+                    }
+                    _ => Err("group by requires row input".into()),
+                }
+            }
+
             PlanNode::CreateTable { name, fields } => {
                 let columns: Vec<ColumnDef> = fields.iter().enumerate().map(|(i, (fname, tname, req))| {
                     ColumnDef {
@@ -2102,6 +2166,58 @@ fn eval_predicate(expr: &Expr, row: &[Value], columns: &[String]) -> bool {
     match eval_expr(expr, row, columns) {
         Value::Bool(b) => b,
         _ => false,
+    }
+}
+
+/// Mission E2b: compute one aggregate over a set of rows in a group.
+fn compute_group_aggregate(
+    func: AggFunc,
+    all_rows: &[Vec<Value>],
+    row_indices: &[usize],
+    col_idx: usize,
+) -> Value {
+    match func {
+        AggFunc::Count => {
+            let count = row_indices.iter()
+                .filter(|&&ri| !all_rows[ri][col_idx].is_empty())
+                .count();
+            Value::Int(count as i64)
+        }
+        AggFunc::Sum => {
+            let mut sum: i64 = 0;
+            for &ri in row_indices {
+                if let Value::Int(v) = &all_rows[ri][col_idx] {
+                    sum += v;
+                }
+            }
+            Value::Int(sum)
+        }
+        AggFunc::Avg => {
+            let mut sum = 0.0f64;
+            let mut count = 0usize;
+            for &ri in row_indices {
+                match &all_rows[ri][col_idx] {
+                    Value::Int(v)   => { sum += *v as f64; count += 1; }
+                    Value::Float(v) => { sum += *v;        count += 1; }
+                    _ => {}
+                }
+            }
+            if count == 0 { Value::Empty } else { Value::Float(sum / count as f64) }
+        }
+        AggFunc::Min => {
+            row_indices.iter()
+                .map(|&ri| &all_rows[ri][col_idx])
+                .filter(|v| !v.is_empty())
+                .min().cloned()
+                .unwrap_or(Value::Empty)
+        }
+        AggFunc::Max => {
+            row_indices.iter()
+                .map(|&ri| &all_rows[ri][col_idx])
+                .filter(|v| !v.is_empty())
+                .max().cloned()
+                .unwrap_or(Value::Empty)
+        }
     }
 }
 
@@ -3559,6 +3675,145 @@ mod tests {
         match result {
             QueryResult::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 1);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    // ─── Mission E2b: GROUP BY + HAVING ────────────────────────────────────
+
+    #[test]
+    fn test_group_by_count() {
+        // All 3 users share the same "age bucket" when we group by a
+        // derived column, but we can at least group by a column with
+        // distinct values. test_engine has 3 distinct names.
+        let mut engine = test_engine();
+        let result = engine.execute_powql(
+            "User group .name { .name, n: count(.name) }",
+        ).unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["name", "n"]);
+                assert_eq!(rows.len(), 3); // 3 distinct names
+                // Each group has 1 row.
+                for row in &rows {
+                    assert_eq!(row[1], Value::Int(1));
+                }
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_group_by_sum_avg() {
+        // Group all rows into one bucket by a constant column.
+        // We'll use the mission_a_engine with a known shape.
+        let mut engine = test_engine();
+        // All 3 users: ages 30, 25, 35 → sum=90, avg=30.0
+        let result = engine.execute_powql(
+            "User group .email { .email, total_age: sum(.age) }",
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                // Each email is unique → 3 groups, each with sum of one age.
+                assert_eq!(rows.len(), 3);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_group_by_with_filter() {
+        let mut engine = test_engine();
+        // Filter first, then group.
+        let result = engine.execute_powql(
+            "User filter .age >= 30 group .name { .name, n: count(.name) }",
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                // Alice (30) and Charlie (35) survive filter.
+                assert_eq!(rows.len(), 2);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_group_by_having() {
+        // Use mission_a_engine so we have multiple rows per group.
+        let mut engine = mission_a_engine(30);
+        // 30 rows: statuses cycle active/inactive/pending → 10 each.
+        // Group by status, HAVING count > 5.
+        let result = engine.execute_powql(
+            "User group .status having count(.name) > 5 { .status, n: count(.name) }",
+        ).unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["status", "n"]);
+                // All 3 groups have 10 rows each, all > 5.
+                assert_eq!(rows.len(), 3);
+                for row in &rows {
+                    assert_eq!(row[1], Value::Int(10));
+                }
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_group_by_having_filters_groups() {
+        let mut engine = mission_a_engine(30);
+        // HAVING count > 100 → no groups survive.
+        let result = engine.execute_powql(
+            "User group .status having count(.name) > 100 { .status }",
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 0);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_group_by_min_max() {
+        let mut engine = mission_a_engine(30);
+        // 30 rows, ages = 18 + (i % 60) for i in 0..30, so ages 18..47.
+        // Group by status (3 groups of 10 each).
+        // status=active: i=0,3,6,9,12,15,18,21,24,27 → ages 18,21,24,27,30,33,36,39,42,45
+        // min=18, max=45
+        let result = engine.execute_powql(
+            r#"User filter .status = "active" group .status { .status, lo: min(.age), hi: max(.age) }"#,
+        ).unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["status", "lo", "hi"]);
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Str("active".into()));
+                assert_eq!(rows[0][1], Value::Int(18));
+                assert_eq!(rows[0][2], Value::Int(45));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_group_by_avg() {
+        let mut engine = mission_a_engine(6);
+        // 6 rows: i=0..5
+        // active (i=0,3): ages 18,21 → avg=19.5
+        // inactive (i=1,4): ages 19,22 → avg=20.5
+        // pending (i=2,5): ages 20,23 → avg=21.5
+        let result = engine.execute_powql(
+            r#"User filter .status = "active" group .status { .status, a: avg(.age) }"#,
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                match &rows[0][1] {
+                    Value::Float(v) => assert!((v - 19.5).abs() < 0.001),
+                    other => panic!("expected float, got {other:?}"),
+                }
             }
             _ => panic!("expected rows"),
         }

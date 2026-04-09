@@ -31,6 +31,18 @@ pub enum PlanNode {
         kind: JoinKind,
     },
     Distinct { input: Box<PlanNode> },
+    /// Mission E2b: grouped aggregation. Output columns are
+    /// `keys ++ [agg.output_name for agg in aggregates]`. The optional
+    /// `having` predicate is evaluated against each output row *after*
+    /// aggregation — it can reference both key columns and aggregate
+    /// output names (the planner rewrites `FunctionCall` nodes in the
+    /// HAVING expression into `Field("__agg_N")` references).
+    GroupBy {
+        input: Box<PlanNode>,
+        keys: Vec<String>,
+        aggregates: Vec<GroupAgg>,
+        having: Option<Expr>,
+    },
     Insert { table: String, assignments: Vec<Assignment> },
     Update { input: Box<PlanNode>, table: String, assignments: Vec<Assignment> },
     Delete { input: Box<PlanNode>, table: String },
@@ -41,4 +53,14 @@ pub enum PlanNode {
 pub struct ProjectField {
     pub alias: Option<String>,
     pub expr: Expr,
+}
+
+/// One aggregate computation inside a `PlanNode::GroupBy`.
+#[derive(Debug, Clone)]
+pub struct GroupAgg {
+    pub function: AggFunc,
+    /// Source column name to aggregate over.
+    pub field: String,
+    /// Synthetic output column name (`__agg_0`, `__agg_1`, …).
+    pub output_name: String,
 }

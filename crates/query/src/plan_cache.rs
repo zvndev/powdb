@@ -172,6 +172,12 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
         PlanNode::Distinct { input } => {
             substitute_plan(input, literals, idx);
         }
+        PlanNode::GroupBy { input, having, .. } => {
+            substitute_plan(input, literals, idx);
+            if let Some(pred) = having {
+                substitute_expr(pred, literals, idx);
+            }
+        }
         PlanNode::Insert { assignments, .. } => {
             substitute_assignments(assignments, literals, idx);
         }
@@ -240,6 +246,12 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
             }
         }
         PlanNode::Distinct { input } => count_plan(input, n),
+        PlanNode::GroupBy { input, having, .. } => {
+            count_plan(input, n);
+            if let Some(pred) = having {
+                count_expr(pred, n);
+            }
+        }
         PlanNode::Insert { assignments, .. } => {
             for a in assignments {
                 count_expr(&a.value, n);
@@ -483,6 +495,12 @@ mod tests {
                 }
             }
             PlanNode::Distinct { input } => collect_literals_for_test(input, out),
+            PlanNode::GroupBy { input, having, .. } => {
+                collect_literals_for_test(input, out);
+                if let Some(pred) = having {
+                    collect_expr_literals(pred, out);
+                }
+            }
             PlanNode::Delete { input, .. } => collect_literals_for_test(input, out),
             PlanNode::CreateTable { .. } => {}
         }
