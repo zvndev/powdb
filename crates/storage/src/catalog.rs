@@ -305,9 +305,28 @@ impl Catalog {
         Ok(())
     }
 
-    /// Add a column to an existing table's schema. Existing rows get
-    /// `Value::Empty` for the new column on next read (no backfill needed
-    /// since the heap format already handles short rows gracefully).
+    /// Add a column to an existing table's schema and backfill all
+    /// existing rows to match the new shape.
+    ///
+    /// Older versions of this method only mutated the in-memory schema
+    /// and relied on a (false) claim that "the heap format already
+    /// handles short rows gracefully". It doesn't: `decode_row` reads
+    /// exactly `n_var + 1` variable-column offsets from the row bytes
+    /// using the CURRENT schema. Any row encoded with the old schema's
+    /// (smaller) offset table would walk off the end of its buffer and
+    /// panic with "range end index X out of range for slice of length Y"
+    /// — which is exactly what a bare `Type` scan triggered right after
+    /// an ALTER ADD COLUMN.
+    ///
+    /// The fix: rewrite every existing row through
+    /// [`Table::rewrite_rows_for_schema_change`] so the on-disk
+    /// encoding matches the new schema layout. Existing rows get
+    /// `Value::Empty` for the new column.
+    ///
+    /// If the new column is `required` we refuse to add it to a
+    /// non-empty table — there is no default value to backfill with,
+    /// and silently storing `Empty` in a required slot would just
+    /// shift the invariant violation to the next query.
     pub fn alter_table_add_column(&mut self, table: &str, col: ColumnDef) -> io::Result<()> {
         let tbl = self.by_name_mut(table)?;
         // Check for duplicate column name.
@@ -315,25 +334,95 @@ impl Catalog {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists,
                 format!("column '{}' already exists in table '{table}'", col.name)));
         }
+
+        // Snapshot the old schema so we can decode existing rows with
+        // the original layout before we mutate anything.
+        let old_schema = tbl.schema.clone();
+
+        // Peek at the heap to learn whether there are any existing
+        // rows at all. An empty table is always safe to alter — no
+        // rewrite needed, required columns are fine, etc.
+        let has_rows = tbl.heap.scan().next().is_some();
+
+        if has_rows && col.required {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot add required column '{}' to non-empty table '{table}': \
+                     no default value to backfill existing rows with",
+                    col.name
+                ),
+            ));
+        }
+
+        // Commit the new column into the schema and refresh the
+        // cached layout so the rewrite below encodes with the new
+        // shape.
         tbl.schema.columns.push(col);
         tbl.refresh_layout();
+
+        if has_rows {
+            // Build the "fill" template: all Empty, matching the new
+            // schema width. `rewrite_rows_for_schema_change` will
+            // overwrite old-column slots from each live row and leave
+            // the new slot as Empty.
+            let fill: Vec<Value> = vec![Value::Empty; tbl.schema.columns.len()];
+            tbl.rewrite_rows_for_schema_change(&old_schema, &fill)?;
+        }
+
         self.persist()?;
         Ok(())
     }
 
-    /// Remove a column from an existing table's schema. Does NOT rewrite
-    /// existing heap rows — reads simply won't decode the dropped column.
+    /// Remove a column from an existing table's schema and rewrite
+    /// every live row to match the new shape.
+    ///
+    /// Older versions of this method only mutated the in-memory schema
+    /// and claimed that "reads simply won't decode the dropped column".
+    /// That was wrong in several ways:
+    ///
+    ///   1. The null bitmap is indexed by column position. Dropping a
+    ///      column shifts every later column's bit left, but old rows
+    ///      still have bits in the original positions — so `is_null`
+    ///      checks silently lie for every column after the dropped one.
+    ///   2. The bitmap's byte width (`ceil(n_cols/8)`) can shrink when
+    ///      `n_cols` crosses an 8-boundary, shifting every subsequent
+    ///      byte of the row against the decoder's cursor.
+    ///   3. Fixed-region size and the variable-offset-table width both
+    ///      depend on the column set, so dropping any fixed or variable
+    ///      column slides every following byte.
+    ///
+    /// The fix mirrors `alter_table_add_column`: snapshot the old
+    /// schema, mutate to the new schema, then rewrite every row
+    /// through [`Table::rewrite_rows_for_schema_change`]. Dropping a
+    /// column from an empty table skips the rewrite.
     pub fn alter_table_drop_column(&mut self, table: &str, col_name: &str) -> io::Result<()> {
         let tbl = self.by_name_mut(table)?;
         let idx = tbl.schema.columns.iter().position(|c| c.name == col_name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound,
                 format!("column '{col_name}' not found in table '{table}'")))?;
+
+        // Snapshot for decoding old rows.
+        let old_schema = tbl.schema.clone();
+        let has_rows = tbl.heap.scan().next().is_some();
+
+        // Commit the schema change.
         tbl.schema.columns.remove(idx);
-        // Recompute positions.
         for (i, col) in tbl.schema.columns.iter_mut().enumerate() {
             col.position = i as u16;
         }
         tbl.refresh_layout();
+
+        if has_rows {
+            // Build a filler matching the new (smaller) shape. The
+            // rewrite path overwrites each new-column slot from the
+            // matching old-column value by name, so the filler only
+            // matters for brand-new columns — drop has none, so
+            // `Empty` is a safe placeholder that never gets read.
+            let fill: Vec<Value> = vec![Value::Empty; tbl.schema.columns.len()];
+            tbl.rewrite_rows_for_schema_change(&old_schema, &fill)?;
+        }
+
         self.persist()?;
         Ok(())
     }

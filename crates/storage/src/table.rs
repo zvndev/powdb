@@ -100,6 +100,129 @@ impl Table {
         self.row_layout = RowLayout::new(&self.schema);
     }
 
+    /// Rewrite every live heap row to match a new schema shape.
+    ///
+    /// This is the backfill path for `ALTER TABLE ADD COLUMN`. Before
+    /// this existed, the catalog happily swapped the schema in memory
+    /// and left old rows on disk with the OLD variable-column offset
+    /// table layout. Any subsequent `decode_row` then panicked with
+    /// `range end index X out of range` because the decoder reads
+    /// `n_var + 1` offsets using the NEW schema.
+    ///
+    /// The caller passes in the pre-mutation schema so rows can be
+    /// decoded correctly; `self.schema` must already hold the NEW
+    /// schema when this is invoked. `fill_values` must have
+    /// `new_schema.columns.len()` entries and supplies the values for
+    /// columns that did not exist in the old schema (use
+    /// `Value::Empty` for optional adds).
+    ///
+    /// Rewrites every row via `HeapFile::update`, which may move the
+    /// row to a new page when the new encoding is larger. Any secondary
+    /// indexes are rebuilt from scratch at the end because their
+    /// `RowId` pointers can become stale during the rewrite.
+    ///
+    /// Not on any hot path — ALTER is a rare administrative op, so this
+    /// intentionally prefers simplicity (collect snapshot → rewrite →
+    /// rebuild indexes) over any of the fast-path tricks used by
+    /// insert/update/delete.
+    pub(crate) fn rewrite_rows_for_schema_change(
+        &mut self,
+        old_schema: &Schema,
+        fill_values: &[Value],
+    ) -> io::Result<()> {
+        debug_assert_eq!(fill_values.len(), self.schema.columns.len());
+
+        // Snapshot every live (rid, old_bytes) pair up front. We can't
+        // mutate `self.heap` while iterating it, and the rewrite grows
+        // every row (+2 bytes of offset table at minimum), so in-place
+        // updates are not guaranteed.
+        let snapshot: Vec<(RowId, Vec<u8>)> = self.heap.scan().collect();
+
+        // Map from old column index → new column index, or `None` if
+        // the old column was dropped by the schema change. The caller
+        // is expected to keep surviving columns in their original
+        // positions. We look up by name so ADD and DROP can share the
+        // same path: ADD has every old column present in the new
+        // schema; DROP has exactly one missing.
+        let old_to_new: Vec<Option<usize>> = old_schema
+            .columns
+            .iter()
+            .map(|c| self.schema.column_index(&c.name))
+            .collect();
+
+        for (rid, old_bytes) in snapshot {
+            let old_row = decode_row(old_schema, &old_bytes);
+            // Start from the caller-supplied defaults for the new
+            // shape, then overwrite with whatever the old row had.
+            // Dropped columns are simply skipped (their value has
+            // nowhere to go in the new row).
+            let mut new_row: Vec<Value> = fill_values.to_vec();
+            for (old_idx, val) in old_row.into_iter().enumerate() {
+                if let Some(new_idx) = old_to_new[old_idx] {
+                    new_row[new_idx] = val;
+                }
+            }
+
+            encode_row_into_with_layout(
+                &self.schema,
+                &self.row_layout,
+                &new_row,
+                &mut self.encode_scratch,
+            );
+            // We don't care about the new RowId here: any secondary
+            // index is rebuilt from scratch below.
+            self.heap.update(rid, &self.encode_scratch)?;
+        }
+
+        // Rebuild every secondary index from the rewritten heap. The
+        // in-memory btree is the source of truth for reads, and its
+        // RowId pointers may now be stale after the heap rewrite.
+        if !self.indexed_cols.is_empty() {
+            // Preserve per-index metadata (col_idx, col_name, is_int)
+            // via fresh BTree instances. The old btrees are dropped
+            // when `indexed_cols` is reassigned.
+            let existing: Vec<(usize, String, bool)> = self
+                .indexed_cols
+                .iter()
+                .map(|c| (c.col_idx, c.col_name.clone(), c.is_int))
+                .collect();
+
+            // Drain the old entries first so the borrow of
+            // `self.indexed_cols` is clear before we start scanning.
+            self.indexed_cols.clear();
+
+            for (col_idx, col_name, is_int) in existing {
+                // Reuse the existing index file path. `BTree::create`
+                // is in-memory only (the path is purely informational
+                // today), so this does not touch the filesystem.
+                let idx_path = std::path::PathBuf::new();
+                let mut btree = crate::btree::BTree::create(&idx_path)?;
+                for (rid, row) in self.heap.scan() {
+                    let row = decode_row(&self.schema, &row);
+                    let v = &row[col_idx];
+                    if v.is_empty() {
+                        continue;
+                    }
+                    if is_int {
+                        if let Value::Int(i) = v {
+                            btree.insert_int(*i, rid);
+                            continue;
+                        }
+                    }
+                    btree.insert(v.clone(), rid);
+                }
+                self.indexed_cols.push(IndexedCol {
+                    col_idx,
+                    col_name,
+                    is_int,
+                    btree,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     /// Look up an index by column name. Returns `None` if no index on
     /// this column. Used by the read-side executor paths (IndexScan,
     /// Project(IndexScan), etc.) that still need name-based resolution;
