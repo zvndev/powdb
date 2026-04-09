@@ -48,6 +48,20 @@ const DEFAULT_ABSOLUTE_THRESHOLD: f64 = 0.07;
 /// margin keeps the gate honest without flapping.
 const NOISY_ABSOLUTE_THRESHOLD: f64 = 0.10;
 
+/// ±20% tolerance for the sub-millisecond aggregation + point-probe workloads
+/// that are dominated by Azure-pool ubuntu-24.04 runner-to-runner variance
+/// rather than any structural property of the code. Evidence: two identical
+/// `--bench` runs on the same merge commit (07fcaa6, runs 24213258406 and
+/// 24213724490, fifteen minutes apart) produced agg_sum 385ms vs 504ms
+/// (+31% spread), agg_min 362ms vs 467ms (+29%), powql_aggregation 545ms vs
+/// 624ms (+14%) — with NO code change between runs. These workloads all
+/// scan ~100K rows of ~5μs work each, so ~100μs of runner scheduling noise
+/// is a 20-30% delta. Widening to 20% + pinning the baseline at the high
+/// end of observed noise keeps the gate honest against real regressions
+/// (which would have to exceed even the slowest runner by another 20%)
+/// without flapping on every fresh Azure VM assignment.
+const VERY_NOISY_ABSOLUTE_THRESHOLD: f64 = 0.20;
+
 const WORKLOADS: &[&str] = &[
     // ── Storage layer (ratio denominator + existing guards) ──
     "insert_10k",
@@ -80,6 +94,18 @@ const WORKLOADS: &[&str] = &[
 /// get ±10% because their per-iter work is chunkier and the variance wider.
 fn threshold_for(workload: &str) -> f64 {
     match workload {
+        // Sub-millisecond aggregation + point-probe workloads where
+        // Azure-pool GHA runner variance dominates over any structural
+        // perf delta. See VERY_NOISY_ABSOLUTE_THRESHOLD comment above for
+        // the evidence chain (back-to-back same-commit runs with +14 to
+        // +31% spread across these workloads).
+        "agg_sum"
+        | "agg_avg"
+        | "agg_min"
+        | "agg_max"
+        | "powql_aggregation"
+        | "point_lookup_nonindexed" => VERY_NOISY_ABSOLUTE_THRESHOLD,
+
         // Sort over a filtered scan + top-N limit: mixed allocation path,
         // noisier than pure scans.
         "scan_filter_sort_limit10"
