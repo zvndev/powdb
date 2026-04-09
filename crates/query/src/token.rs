@@ -35,14 +35,50 @@ pub enum Token {
     As,         // as
     Match,      // match
     Group,      // group
+    Join,       // join
+    Inner,      // inner
+    LeftKw,     // left  (keyword — avoids clashing with ast::JoinKind::LeftOuter naming)
+    RightKw,    // right
+    Outer,      // outer
+    Cross,      // cross
     Transaction,// transaction
     View,       // view
     Materialized,// materialized
+    Refresh,    // refresh
+    Union,      // union
+    Having,     // having
+    Distinct,   // distinct
+    In,         // in
+    Between,    // between
+    Like,       // like
     Count,      // count
     Avg,        // avg
     Sum,        // sum
     Min,        // min
     Max,        // max
+    Is,         // is
+    Null,       // null
+
+    // String functions
+    Upper,      // upper
+    Lower,      // lower
+    Length,     // length
+    Trim,       // trim
+    Substring,  // substring
+    Concat,     // concat
+
+    // CASE WHEN
+    Case,       // case
+    When,       // when
+    Then,       // then
+    Else,       // else
+    End,        // end
+
+    // DDL
+    Alter,      // alter
+    Drop,       // drop
+    Add,        // add
+    Column,     // column
 
     // Operators
     Eq,         // =

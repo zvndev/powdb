@@ -1,0 +1,11 @@
+# Mission F: enable host-CPU-specific instructions (NEON on M1, AVX on x86).
+#
+# crc32fast (used by the WAL) ships SIMD acceleration that's gated on the
+# target CPU. Without target-cpu=native it silently uses the scalar fallback.
+#
+# IMPORTANT: this produces binaries that won't run on older CPUs than the
+# build host. For local thesis development on M1 → M1 this is fine. CI builds
+# (GitHub Actions) override this with their own profile or unset rustflags so
+# the artifacts remain portable.
+[build]
+rustflags = ["-C", "target-cpu=native"]

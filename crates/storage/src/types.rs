@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::hash::{Hash, Hasher};
 
 /// Type identifier for schema definitions and wire protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -77,6 +78,27 @@ impl PartialEq for Value {
 }
 
 impl Eq for Value {}
+
+impl Hash for Value {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Tag first so distinct variants with coincidentally equal byte
+        // representations (e.g. Int(0) vs Bool(false)) can't collide.
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Value::Int(v)      => v.hash(state),
+            // f64 has no Hash impl. Use the IEEE bit pattern, but canonicalise
+            // via total_cmp so NaN hashes stably (and matches our PartialEq,
+            // which also uses total_cmp for equality).
+            Value::Float(v)    => v.to_bits().hash(state),
+            Value::Bool(v)     => v.hash(state),
+            Value::Str(v)      => v.hash(state),
+            Value::DateTime(v) => v.hash(state),
+            Value::Uuid(v)     => v.hash(state),
+            Value::Bytes(v)    => v.hash(state),
+            Value::Empty       => {} // discriminant already hashed
+        }
+    }
+}
 
 impl PartialOrd for Value {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {

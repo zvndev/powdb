@@ -25,7 +25,7 @@
 use std::cell::RefCell;
 
 use powdb_query::ast::{AggFunc, Expr, Literal};
-use powdb_query::executor::Engine;
+use powdb_query::executor::{Engine, PreparedQuery};
 use powdb_query::plan::PlanNode;
 use powdb_query::result::QueryResult;
 use powdb_storage::row::RowLayout;
@@ -39,6 +39,15 @@ pub struct PowdbEngine {
     engine: RefCell<Engine>,
     /// Cached layout for zero-alloc column decode on point lookups.
     layout: Option<RowLayout>,
+    /// Mission C Phase 5: prepared insert statement reused across every
+    /// `insert_batch` / `insert_single` row. SQLite's comparator uses
+    /// `prepare_cached`; this is the fair equivalent on the PowDB side.
+    /// Built lazily on first use because `setup()` may recreate the
+    /// underlying engine and invalidate the template.
+    insert_prep: RefCell<Option<PreparedQuery>>,
+    /// Prepared update-by-pk. Two params: the pk literal (filter) and the
+    /// new age (assignment).
+    update_pk_prep: RefCell<Option<PreparedQuery>>,
     /// Keeps the temp directory alive for the lifetime of the engine.
     _tmp: TempDir,
 }
@@ -50,8 +59,56 @@ impl PowdbEngine {
         PowdbEngine {
             engine: RefCell::new(engine),
             layout: None,
+            insert_prep: RefCell::new(None),
+            update_pk_prep: RefCell::new(None),
             _tmp: tmp,
         }
+    }
+
+    /// Get (or lazily build) the prepared INSERT statement.
+    ///
+    /// The template values don't matter — they'll be overwritten on every
+    /// `execute_prepared` call. The *shape* is what we're caching: six
+    /// assignments in the order `(id, name, age, status, email, created_at)`.
+    fn insert_prepared(&self) -> std::cell::RefMut<'_, PreparedQuery> {
+        {
+            let borrow = self.insert_prep.borrow();
+            if borrow.is_some() {
+                drop(borrow);
+                return std::cell::RefMut::map(
+                    self.insert_prep.borrow_mut(),
+                    |o| o.as_mut().unwrap(),
+                );
+            }
+        }
+        let prep = self.engine
+            .borrow_mut()
+            .prepare(
+                r#"insert User { id := 0, name := "", age := 0, status := "", email := "", created_at := 0 }"#
+            )
+            .expect("prepare insert template");
+        *self.insert_prep.borrow_mut() = Some(prep);
+        std::cell::RefMut::map(self.insert_prep.borrow_mut(), |o| o.as_mut().unwrap())
+    }
+
+    /// Get (or lazily build) the prepared UPDATE-by-pk statement.
+    fn update_pk_prepared(&self) -> std::cell::RefMut<'_, PreparedQuery> {
+        {
+            let borrow = self.update_pk_prep.borrow();
+            if borrow.is_some() {
+                drop(borrow);
+                return std::cell::RefMut::map(
+                    self.update_pk_prep.borrow_mut(),
+                    |o| o.as_mut().unwrap(),
+                );
+            }
+        }
+        let prep = self.engine
+            .borrow_mut()
+            .prepare("User filter .id = 0 update { age := 0 }")
+            .expect("prepare update-by-pk template");
+        *self.update_pk_prep.borrow_mut() = Some(prep);
+        std::cell::RefMut::map(self.update_pk_prep.borrow_mut(), |o| o.as_mut().unwrap())
     }
 
     /// Run a PowQL read query and return the first row's first column as an
@@ -153,6 +210,13 @@ impl BenchEngine for PowdbEngine {
             let fresh_engine = Engine::new(fresh_tmp.path()).expect("engine reset");
             self.engine = RefCell::new(fresh_engine);
             self.layout = None;
+            // Mission C Phase 5: a fresh engine means a fresh catalog,
+            // fresh schema, fresh plan cache. The cached prepared-plan
+            // templates reference the *old* engine's parsed plan trees —
+            // they're still structurally valid but logically stale, so
+            // wipe them and let them be rebuilt lazily on the next call.
+            *self.insert_prep.get_mut() = None;
+            *self.update_pk_prep.get_mut() = None;
             self._tmp = fresh_tmp;
         }
 
@@ -212,9 +276,13 @@ impl BenchEngine for PowdbEngine {
         // Direct B-tree lookup — bypasses the PowQL parser entirely. This
         // is the "cached plan / direct API" path a real client SDK would
         // use. See §4 FASTPATH→BENCH in PLAN-MISSION-A.md.
+        //
+        // Mission D7: use the int-specialized `lookup_int` path to skip
+        // the `<Value as Ord>::cmp` discriminant dispatch (5-10ns × ~24
+        // comparisons per lookup on an order-256 tree).
         let engine = self.engine.borrow();
         let tbl = engine.catalog().get_table("User")?;
-        let rid = tbl.indexes.get("id")?.lookup(&Value::Int(id))?;
+        let rid = tbl.index("id")?.lookup_int(id)?;
         let data = tbl.heap.get(rid)?;
         // Columns: id=0, name=1, age=2, status=3, email=4, created_at=5
         let layout = self.layout.as_ref().unwrap();
@@ -225,7 +293,11 @@ impl BenchEngine for PowdbEngine {
     }
 
     fn point_lookup_nonindexed(&self, created_at: i64) -> Option<String> {
-        let query = format!("User filter .created_at = {created_at} {{ .name }}");
+        // Fair comparison with SQLite's `LIMIT 1` — stop scanning as soon
+        // as the first (and usually only) match is found.
+        let query = format!(
+            "User filter .created_at = {created_at} limit 1 {{ .name }}"
+        );
         self.powql_first_string(&query)
     }
 
@@ -363,38 +435,72 @@ impl BenchEngine for PowdbEngine {
         email: &str,
         created_at: i64,
     ) {
-        let query = format!(
-            "insert User {{ id := {id}, name := \"{name}\", age := {age}, status := \"{status}\", email := \"{email}\", created_at := {created_at} }}"
-        );
-        let _ = self
-            .engine
-            .get_mut()
-            .execute_powql(&query)
+        // Mission C Phase 5: prepared statement instead of `format!()` +
+        // `execute_powql()`. Saves canonicalise + parse + plan cache
+        // lookup on every call. SQLite's adapter uses `prepare_cached` —
+        // this is the fair equivalent.
+        let prep = self.insert_prepared();
+        self.engine
+            .borrow_mut()
+            .execute_prepared(&prep, &[
+                Literal::Int(id),
+                Literal::String(name.to_string()),
+                Literal::Int(age),
+                Literal::String(status.to_string()),
+                Literal::String(email.to_string()),
+                Literal::Int(created_at),
+            ])
             .expect("insert_single failed");
     }
 
     fn insert_batch(&mut self, rows: &[(i64, String, i64, String, String, i64)]) {
-        // PowQL has no batch-insert syntax; loop one INSERT per row, all
-        // going through `execute_powql` like the SQL engines' prepared
-        // statements. Each call is independent — PowDB has no transaction
-        // at the query-text layer (writes are already ACID per call).
-        let engine = self.engine.get_mut();
+        // Mission C Phase 5: batch over a single prepared statement. Every
+        // row reuses the same template — zero lexing, zero parsing, zero
+        // planning per row. Each call is still independent (PowDB writes
+        // are already ACID per-call), which matches SQLite's `prepare_cached`
+        // + `execute` pattern in the comparator.
+        //
+        // Mission C Phase 13: use the moving `execute_prepared_take`
+        // variant so the three `String::clone()` calls inside PowDB's
+        // `Literal → Value` conversion collapse into `mem::take`. The
+        // `params` vec is reused across rows — only the string slots
+        // get overwritten each iteration, and those strings are moved
+        // into the row encoder on the next call.
+        let prep = self.insert_prepared();
+        let mut engine = self.engine.borrow_mut();
+        let mut params: Vec<Literal> = vec![
+            Literal::Int(0),
+            Literal::String(String::new()),
+            Literal::Int(0),
+            Literal::String(String::new()),
+            Literal::String(String::new()),
+            Literal::Int(0),
+        ];
         for (id, name, age, status, email, created_at) in rows {
-            let query = format!(
-                "insert User {{ id := {id}, name := \"{name}\", age := {age}, status := \"{status}\", email := \"{email}\", created_at := {created_at} }}"
-            );
+            params[0] = Literal::Int(*id);
+            params[1] = Literal::String(name.clone());
+            params[2] = Literal::Int(*age);
+            params[3] = Literal::String(status.clone());
+            params[4] = Literal::String(email.clone());
+            params[5] = Literal::Int(*created_at);
             engine
-                .execute_powql(&query)
+                .execute_prepared_take(&prep, &mut params)
                 .expect("insert_batch row failed");
         }
     }
 
     fn update_by_pk(&mut self, id: i64, new_age: i64) -> u64 {
-        let query = format!("User filter .id = {id} update {{ age := {new_age} }}");
+        // Mission C Phase 5: prepared statement. Combined with the Phase 4
+        // in-place byte-patch fast path this makes update_by_pk nearly a
+        // pure write — no parse, no plan, no row decode/encode.
+        let prep = self.update_pk_prepared();
         let result = self
             .engine
-            .get_mut()
-            .execute_powql(&query)
+            .borrow_mut()
+            .execute_prepared(&prep, &[
+                Literal::Int(id),
+                Literal::Int(new_age),
+            ])
             .expect("update_by_pk failed");
         match result {
             QueryResult::Modified(n) => n,

@@ -265,6 +265,9 @@ fn print_local_result(result: &QueryResult) {
         QueryResult::Created(name) => {
             println!("type {name} created");
         }
+        QueryResult::Executed { message } => {
+            println!("{message}");
+        }
     }
 }
 

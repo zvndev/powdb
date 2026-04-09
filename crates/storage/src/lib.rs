@@ -10,3 +10,4 @@ pub mod tx;
 pub mod mvcc;
 pub mod table;
 pub mod catalog;
+pub mod view;

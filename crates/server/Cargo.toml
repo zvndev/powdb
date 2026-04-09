@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 powdb-storage = { path = "../storage" }
 powdb-query = { path = "../query" }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros"] }
 thiserror.workspace = true
 bytes.workspace = true
 tracing.workspace = true

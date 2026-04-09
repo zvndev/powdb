@@ -6,18 +6,112 @@ pub enum Statement {
     UpdateQuery(UpdateExpr),
     DeleteQuery(DeleteExpr),
     CreateType(CreateTypeExpr),
+    AlterTable(AlterTableExpr),
+    DropTable(DropTableExpr),
+    CreateView(CreateViewExpr),
+    RefreshView(RefreshViewExpr),
+    DropView(DropViewExpr),
+    Union(UnionExpr),
 }
 
-/// A query expression: Type [filter ...] [order ...] [limit ...] [{ projection }]
+/// `alter User add column status: str` / `alter User drop column status`
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTableExpr {
+    pub table: String,
+    pub action: AlterAction,
+}
+
+/// An individual ALTER TABLE action.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterAction {
+    AddColumn { name: String, type_name: String, required: bool },
+    DropColumn { name: String },
+}
+
+/// `drop User`
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropTableExpr {
+    pub table: String,
+}
+
+/// `create [materialized] view ActiveUsers as User filter .active = true`
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateViewExpr {
+    pub name: String,
+    pub query: QueryExpr,
+    /// The original source query text, stored for re-execution on refresh.
+    pub query_text: String,
+}
+
+/// `refresh ActiveUsers`
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefreshViewExpr {
+    pub name: String,
+}
+
+/// `drop view ActiveUsers`
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropViewExpr {
+    pub name: String,
+}
+
+/// `User filter .age > 30 union User filter .status = "vip"`
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnionExpr {
+    pub left: Box<Statement>,
+    pub right: Box<Statement>,
+    /// `true` for `union all` (keep duplicates), `false` for `union` (deduplicate).
+    pub all: bool,
+}
+
+/// A query expression: Type [join ...]* [filter ...] [order ...] [limit ...] [{ projection }]
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryExpr {
     pub source: String,
+    /// Optional alias for the primary source (e.g. `User as u`). Used to
+    /// disambiguate qualified column references in join queries. `None` for
+    /// single-table queries.
+    pub alias: Option<String>,
+    /// Zero or more join clauses chained to the primary source. For a
+    /// single-table query this is always empty so existing code paths are
+    /// untouched.
+    pub joins: Vec<JoinClause>,
     pub filter: Option<Expr>,
     pub order: Option<OrderClause>,
     pub limit: Option<Expr>,
     pub offset: Option<Expr>,
     pub projection: Option<Vec<ProjectionField>>,
     pub aggregation: Option<AggregateExpr>,
+    pub distinct: bool,
+    pub group_by: Option<GroupByClause>,
+}
+
+/// GROUP BY clause: `group .field1, .field2 [having <expr>]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupByClause {
+    pub keys: Vec<String>,
+    pub having: Option<Expr>,
+}
+
+/// A join clause appended to a query's primary source.
+///
+/// Example syntax (Mission E1.1 parser accepts this; executor still errors):
+///   `User as u inner join Order as o on u.id = o.user_id filter o.total > 100`
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinClause {
+    pub kind: JoinKind,
+    pub source: String,
+    pub alias: Option<String>,
+    /// `on <expr>` — required for every kind except `Cross`.
+    pub on: Option<Expr>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    LeftOuter,
+    RightOuter,
+    Cross,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -28,6 +122,11 @@ pub struct ProjectionField {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrderClause {
+    pub keys: Vec<OrderKey>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderKey {
     pub field: String,
     pub descending: bool,
 }
@@ -79,22 +178,51 @@ pub struct AggregateExpr {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AggFunc {
     Count,
+    CountDistinct,
     Avg,
     Sum,
     Min,
     Max,
 }
 
+/// Scalar (non-aggregate) function — operates on single values.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScalarFn {
+    Upper,
+    Lower,
+    Length,
+    Trim,
+    Substring,  // substring(expr, start, len) — 1-indexed
+    Concat,     // concat(expr, expr, ...) — variadic
+}
+
 /// Expressions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Field(String),
+    /// A table-qualified field reference: `table.field` or `alias.field`.
+    /// Used by join queries to disambiguate columns that appear in multiple
+    /// sources. The single-table read path never emits this variant, so
+    /// existing fast paths keep matching `Expr::Field` unchanged.
+    QualifiedField { qualifier: String, field: String },
     Literal(Literal),
     Param(String),
     BinaryOp(Box<Expr>, BinOp, Box<Expr>),
     UnaryOp(UnaryOp, Box<Expr>),
     FunctionCall(AggFunc, Box<Expr>),
+    /// Scalar (non-aggregate) function call.
+    ScalarFunc(ScalarFn, Vec<Expr>),
     Coalesce(Box<Expr>, Box<Expr>),
+    /// `expr in (val1, val2, ...)` or `expr not in (val1, val2, ...)`
+    InList { expr: Box<Expr>, list: Vec<Expr>, negated: bool },
+    /// `expr [not] in (subquery)` — the subquery is a full QueryExpr
+    /// that produces a single column.
+    InSubquery { expr: Box<Expr>, subquery: Box<QueryExpr>, negated: bool },
+    /// CASE WHEN ... THEN ... [ELSE ...] END
+    Case {
+        whens: Vec<(Box<Expr>, Box<Expr>)>,
+        else_expr: Option<Box<Expr>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -110,6 +238,7 @@ pub enum BinOp {
     Eq, Neq, Lt, Gt, Lte, Gte,
     And, Or,
     Add, Sub, Mul, Div,
+    Like,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -117,4 +246,6 @@ pub enum UnaryOp {
     Not,
     Exists,
     NotExists,
+    IsNull,
+    IsNotNull,
 }
