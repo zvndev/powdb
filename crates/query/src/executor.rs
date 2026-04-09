@@ -641,6 +641,23 @@ impl Engine {
                     negated: *negated,
                 })
             }
+            Expr::ExistsSubquery { subquery, negated } => {
+                // Uncorrelated EXISTS: run the subquery once and collapse
+                // into a Bool literal. Correlated subqueries (referencing
+                // outer columns) aren't supported yet — the planner would
+                // fail on the unknown field reference, surfacing a clear
+                // error rather than silently misbehaving.
+                let sub_plan = crate::planner::plan_statement(
+                    Statement::Query(*subquery.clone()),
+                ).map_err(|e| e.message)?;
+                let result = self.execute_plan(&sub_plan)?;
+                let has_rows = match result {
+                    QueryResult::Rows { rows, .. } => !rows.is_empty(),
+                    _ => false,
+                };
+                let truth = if *negated { !has_rows } else { has_rows };
+                Ok(Expr::Literal(Literal::Bool(truth)))
+            }
             Expr::BinaryOp(l, op, r) => {
                 let l = self.materialize_subqueries(l)?;
                 let r = self.materialize_subqueries(r)?;
@@ -1082,11 +1099,27 @@ impl Engine {
                             AggFunc::Sum => {
                                 let col = field.as_ref().ok_or("sum requires field")?;
                                 let idx = columns.iter().position(|c| c == col).ok_or("col not found")?;
-                                let sum: i64 = rows.iter().filter_map(|r| match &r[idx] {
-                                    Value::Int(v) => Some(*v),
-                                    _ => None,
-                                }).sum();
-                                Ok(QueryResult::Scalar(Value::Int(sum)))
+                                // Track int and float contributions separately so
+                                // Float columns (and mixed Int/Float rows) don't get
+                                // silently dropped as they did in the Int-only
+                                // version. If any Float is present, the whole sum
+                                // promotes to Float — matching Avg's semantics.
+                                let mut int_sum: i64 = 0;
+                                let mut float_sum: f64 = 0.0;
+                                let mut saw_float = false;
+                                for r in &rows {
+                                    match &r[idx] {
+                                        Value::Int(v)   => int_sum += *v,
+                                        Value::Float(v) => { float_sum += *v; saw_float = true; }
+                                        _ => {}
+                                    }
+                                }
+                                let result = if saw_float {
+                                    Value::Float(float_sum + int_sum as f64)
+                                } else {
+                                    Value::Int(int_sum)
+                                };
+                                Ok(QueryResult::Scalar(result))
                             }
                             AggFunc::Min | AggFunc::Max => {
                                 let col = field.as_ref().ok_or("min/max requires field")?;
@@ -2418,6 +2451,7 @@ fn type_name_to_id(name: &str) -> TypeId {
 fn contains_subquery(expr: &Expr) -> bool {
     match expr {
         Expr::InSubquery { .. } => true,
+        Expr::ExistsSubquery { .. } => true,
         Expr::BinaryOp(l, _, r) => contains_subquery(l) || contains_subquery(r),
         Expr::UnaryOp(_, inner) => contains_subquery(inner),
         Expr::InList { expr, list, .. } => {
@@ -2535,6 +2569,11 @@ fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value {
             // Should have been materialized into InList before eval_expr.
             Value::Empty
         }
+        Expr::ExistsSubquery { .. } => {
+            // Should have been materialized into a Bool literal before
+            // eval_expr (see materialize_subqueries).
+            Value::Empty
+        }
         Expr::UnaryOp(op, inner) => {
             let v = eval_expr(inner, row, columns);
             match op {
@@ -2647,13 +2686,25 @@ fn compute_group_aggregate(
             Value::Int(seen.len() as i64)
         }
         AggFunc::Sum => {
-            let mut sum: i64 = 0;
+            // Mirror the scalar Sum path: accumulate int and float
+            // contributions separately and promote the final result to
+            // Float if any Float row was observed. Prevents silent
+            // drop of Float columns in GROUP BY aggregates.
+            let mut int_sum: i64 = 0;
+            let mut float_sum: f64 = 0.0;
+            let mut saw_float = false;
             for &ri in row_indices {
-                if let Value::Int(v) = &all_rows[ri][col_idx] {
-                    sum += v;
+                match &all_rows[ri][col_idx] {
+                    Value::Int(v)   => int_sum += v,
+                    Value::Float(v) => { float_sum += *v; saw_float = true; }
+                    _ => {}
                 }
             }
-            Value::Int(sum)
+            if saw_float {
+                Value::Float(float_sum + int_sum as f64)
+            } else {
+                Value::Int(int_sum)
+            }
         }
         AggFunc::Avg => {
             let mut sum = 0.0f64;
@@ -3033,7 +3084,7 @@ fn flatten_and_compile(
             Some(())
         }
         Expr::BinaryOp(left, op, right) => {
-            if let Some(leaf) = build_int_leaf(left, *op, right, columns, layout) {
+            if let Some(leaf) = build_int_leaf(left, *op, right, columns, layout, schema) {
                 out.push(leaf);
                 return Some(());
             }
@@ -3060,12 +3111,21 @@ fn flatten_and_compile(
 }
 
 /// Build an `Int` leaf from `.field <op> literal_int` (or reversed).
+///
+/// Only fires for columns whose declared type is `TypeId::Int`. If the
+/// column is a different numeric type (Float, DateTime) we return `None`
+/// so the caller falls back to the generic `Value::cmp` evaluation path,
+/// which correctly handles cross-type numeric comparison (e.g. Int literal
+/// vs Float column in `BETWEEN 100 AND 500` on a `price: float` column).
+/// Previously this function read 8 bytes of a Float column as little-endian
+/// i64, producing nonsense comparisons.
 fn build_int_leaf(
     left: &Expr,
     op: BinOp,
     right: &Expr,
     columns: &[String],
     layout: &FastLayout,
+    schema: &Schema,
 ) -> Option<CompiledLeaf> {
     let (field_name, literal_val, op) = match (left, right) {
         (Expr::Field(name), Expr::Literal(Literal::Int(v))) => (name, *v, op),
@@ -3083,6 +3143,11 @@ fn build_int_leaf(
     };
 
     let col_idx = columns.iter().position(|c| c == field_name)?;
+    // Guard: the compiled Int leaf reads the column's 8 bytes as i64.
+    // Only valid when the column is actually an Int column.
+    if schema.columns[col_idx].type_id != TypeId::Int {
+        return None;
+    }
     let byte_offset = layout.fixed_offsets[col_idx]?;
     let bitmap_byte = col_idx / 8;
     let bitmap_bit = (col_idx % 8) as u8;
@@ -3223,21 +3288,31 @@ fn eval_binop(left: &Value, op: BinOp, right: &Value) -> Value {
             _ => Value::Bool(false),
         },
         BinOp::Add => match (left, right) {
-            (Value::Int(a), Value::Int(b)) => Value::Int(a + b),
+            (Value::Int(a), Value::Int(b)) => Value::Int(a.saturating_add(*b)),
             (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
+            (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 + b),
+            (Value::Float(a), Value::Int(b)) => Value::Float(a + *b as f64),
             _ => Value::Empty,
         },
         BinOp::Sub => match (left, right) {
-            (Value::Int(a), Value::Int(b)) => Value::Int(a - b),
+            (Value::Int(a), Value::Int(b)) => Value::Int(a.saturating_sub(*b)),
             (Value::Float(a), Value::Float(b)) => Value::Float(a - b),
+            (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 - b),
+            (Value::Float(a), Value::Int(b)) => Value::Float(a - *b as f64),
             _ => Value::Empty,
         },
         BinOp::Mul => match (left, right) {
-            (Value::Int(a), Value::Int(b)) => Value::Int(a * b),
+            (Value::Int(a), Value::Int(b)) => Value::Int(a.saturating_mul(*b)),
+            (Value::Float(a), Value::Float(b)) => Value::Float(a * b),
+            (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 * b),
+            (Value::Float(a), Value::Int(b)) => Value::Float(a * *b as f64),
             _ => Value::Empty,
         },
         BinOp::Div => match (left, right) {
             (Value::Int(a), Value::Int(b)) if *b != 0 => Value::Int(a / b),
+            (Value::Float(a), Value::Float(b)) => Value::Float(a / b),
+            (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 / b),
+            (Value::Float(a), Value::Int(b)) => Value::Float(a / *b as f64),
             _ => Value::Empty,
         },
         BinOp::Like => match (left, right) {
@@ -3375,6 +3450,98 @@ mod tests {
                 assert_eq!(rows.len(), 2);
                 assert_eq!(rows[0][0], Value::Str("Charlie".into())); // age 35
                 assert_eq!(rows[1][0], Value::Str("Alice".into()));   // age 30
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    // ─── LIMIT / OFFSET combined semantics ──────────────────────────────────
+    //
+    // SQL/PowQL semantics: offset skips M rows first, then limit takes N rows.
+    // `limit 3 offset 1` on 5 rows must return rows 1..4 (three rows), not
+    // `N - M` rows. These regression tests pin the plan-shape ordering that
+    // previously had Offset wrapping Limit (so Limit capped at N rows and
+    // Offset then skipped M of those, yielding N - M).
+
+    /// 5-row Product fixture with an `id` column we can order on.
+    fn product_engine() -> Engine {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("powdb_limit_offset_{}_{}", std::process::id(), id));
+        let mut engine = Engine::new(&dir).unwrap();
+        engine.execute_powql("type Product { required id: int, required name: str }").unwrap();
+        for i in 0..5i64 {
+            let q = format!(r#"insert Product {{ id := {i}, name := "p{i}" }}"#);
+            engine.execute_powql(&q).unwrap();
+        }
+        engine
+    }
+
+    #[test]
+    fn test_limit_offset_combined() {
+        // 5 rows, `limit 3 offset 1` → exactly 3 rows, ids [1, 2, 3] when
+        // ordered by id. We order by id to pin the row identity; without
+        // an order by, insertion order is implementation-defined.
+        let mut engine = product_engine();
+        let result = engine
+            .execute_powql("Product order .id limit 3 offset 1 { .id }")
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3, "limit 3 offset 1 on 5 rows must return 3 rows");
+                assert_eq!(rows[0][0], Value::Int(1));
+                assert_eq!(rows[1][0], Value::Int(2));
+                assert_eq!(rows[2][0], Value::Int(3));
+            }
+            _ => panic!("expected rows"),
+        }
+
+        // `limit 2 offset 1` → exactly 2 rows, ids [1, 2].
+        let result = engine
+            .execute_powql("Product order .id limit 2 offset 1 { .id }")
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2, "limit 2 offset 1 on 5 rows must return 2 rows");
+                assert_eq!(rows[0][0], Value::Int(1));
+                assert_eq!(rows[1][0], Value::Int(2));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_limit_offset_combined_with_order() {
+        // Same semantics but ordering on a string column. Names are p0..p4,
+        // so sort order is identical to id order.
+        let mut engine = product_engine();
+        let result = engine
+            .execute_powql("Product order .name limit 3 offset 1 { .name }")
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0][0], Value::Str("p1".into()));
+                assert_eq!(rows[1][0], Value::Str("p2".into()));
+                assert_eq!(rows[2][0], Value::Str("p3".into()));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_offset_then_limit_keyword_order() {
+        // Parser accepts limit/offset in either order — verify the plan
+        // semantics are identical regardless of keyword order.
+        let mut engine = product_engine();
+        let result = engine
+            .execute_powql("Product order .id offset 1 limit 3 { .id }")
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0][0], Value::Int(1));
+                assert_eq!(rows[1][0], Value::Int(2));
+                assert_eq!(rows[2][0], Value::Int(3));
             }
             _ => panic!("expected rows"),
         }
@@ -4097,6 +4264,39 @@ mod tests {
     }
 
     #[test]
+    fn test_between_filter_float_column_int_literals() {
+        // Regression for Value::Ord cross-type bug: BETWEEN on a Float column
+        // with Int literals previously returned zero rows because Ord fell
+        // through to TypeId discriminant comparison instead of promoting Int
+        // to f64. Verifies the fix end-to-end through the query engine.
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("powdb_exec_between_float_{}_{}", std::process::id(), id));
+        let mut engine = Engine::new(&dir).unwrap();
+        engine.execute_powql("type Product { required name: str, required price: float }").unwrap();
+        engine.execute_powql(r#"insert Product { name := "Cable",   price := 29.0 }"#).unwrap();
+        engine.execute_powql(r#"insert Product { name := "Speaker", price := 175.5 }"#).unwrap();
+        engine.execute_powql(r#"insert Product { name := "Monitor", price := 450.0 }"#).unwrap();
+        engine.execute_powql(r#"insert Product { name := "Laptop",  price := 1299.0 }"#).unwrap();
+
+        let result = engine.execute_powql(
+            "Product filter .price between 100 and 500 { .name, .price }",
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2, "expected 2 rows in [100, 500] range, got {}: {:?}", rows.len(), rows);
+                // Sorted by insert order: Speaker (175.5), Monitor (450.0).
+                let names: Vec<&str> = rows.iter().map(|r| match &r[0] {
+                    Value::Str(s) => s.as_str(),
+                    _ => panic!("expected string name"),
+                }).collect();
+                assert!(names.contains(&"Speaker"));
+                assert!(names.contains(&"Monitor"));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
     fn test_not_between_filter() {
         let mut engine = test_engine();
         let result = engine.execute_powql(
@@ -4619,6 +4819,116 @@ mod tests {
     }
 
     #[test]
+    fn test_alter_add_column_reads_old_rows() {
+        // Regression: before the catalog rewrite path existed, rows
+        // inserted before `alter ... add column` were left on disk
+        // with the pre-alter variable-offset-table layout. A bare
+        // `Type` scan then walked `decode_row` which read
+        // `n_var + 1` offsets using the NEW schema and panicked with
+        // "range end index X out of range for slice of length Y".
+        //
+        // This test reproduces that exactly: insert, alter, bare scan.
+        // Any panic or wrong row count means the rewrite regressed.
+        let mut engine = test_engine();
+        engine
+            .execute_powql("alter User add column country: str")
+            .unwrap();
+        // Bare scan: NO filter, so the planner cannot skip old rows.
+        let result = engine.execute_powql("User").unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert!(columns.contains(&"country".to_string()));
+                assert_eq!(rows.len(), 3, "three old rows must still be readable");
+                let country_idx = columns
+                    .iter()
+                    .position(|c| c == "country")
+                    .expect("country column");
+                for row in &rows {
+                    assert_eq!(
+                        row[country_idx],
+                        Value::Empty,
+                        "backfilled column must be Empty"
+                    );
+                }
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_alter_add_required_column_fails() {
+        // Adding a required column to a non-empty table has no
+        // default value to backfill with, so storing `Empty` would
+        // silently violate the required invariant. The catalog must
+        // reject it.
+        let mut engine = test_engine();
+        let err = engine
+            .execute_powql("alter User add column required country: str")
+            .expect_err("required-column add on non-empty table must fail");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("required") || msg.contains("backfill"),
+            "error should mention required/backfill, got: {err}"
+        );
+        // And the schema must NOT have silently gained the column.
+        let result = engine.execute_powql("User").unwrap();
+        if let QueryResult::Rows { columns, .. } = result {
+            assert!(
+                !columns.contains(&"country".to_string()),
+                "failed alter must not mutate the schema"
+            );
+        }
+    }
+
+    #[test]
+    fn test_alter_add_column_then_update_old_row() {
+        // Regression-plus: after the rewrite path backfills Empty, an
+        // UPDATE against an old row's new column must round-trip.
+        // This exercises encode/decode with the new schema shape on a
+        // row that was originally written with the old shape.
+        let mut engine = test_engine();
+        engine
+            .execute_powql("alter User add column country: str")
+            .unwrap();
+        engine
+            .execute_powql(r#"User filter .name = "Alice" update { country := "US" }"#)
+            .unwrap();
+
+        let result = engine
+            .execute_powql(r#"User filter .name = "Alice" { .name, .country }"#)
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Str("Alice".into()));
+                assert_eq!(rows[0][1], Value::Str("US".into()));
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+
+        // The other two rows should still decode cleanly with Empty.
+        let result = engine.execute_powql("User").unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(rows.len(), 3);
+                let country_idx = columns
+                    .iter()
+                    .position(|c| c == "country")
+                    .expect("country column");
+                let empties = rows
+                    .iter()
+                    .filter(|r| r[country_idx] == Value::Empty)
+                    .count();
+                assert_eq!(
+                    empties, 2,
+                    "two unchanged old rows must still read as Empty"
+                );
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_alter_drop_column() {
         let mut engine = test_engine();
         engine.execute_powql("alter User drop column email").unwrap();
@@ -4727,6 +5037,109 @@ mod tests {
                 assert!(names.contains(&&Value::Str("Alice".into())));
                 assert!(names.contains(&&Value::Str("Charlie".into())));
             }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    // ─── EXISTS subquery tests (uncorrelated) ───────────────────────────
+
+    #[test]
+    fn test_exists_subquery_uncorrelated_true() {
+        let mut engine = test_engine();
+        // A side table with at least one row → EXISTS(...) = true, so the
+        // filter passes every User row through.
+        engine.execute_powql("type VIP { required name: str }").unwrap();
+        engine.execute_powql(r#"insert VIP { name := "Alice" }"#).unwrap();
+
+        let result = engine.execute_powql(
+            "User filter exists (VIP) { .name }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3, "all users should pass when EXISTS is true");
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_exists_subquery_uncorrelated_false() {
+        let mut engine = test_engine();
+        // An empty side table → EXISTS(...) = false, so no User rows pass.
+        engine.execute_powql("type VIP { required name: str }").unwrap();
+
+        let result = engine.execute_powql(
+            "User filter exists (VIP) { .name }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 0, "no rows should pass when EXISTS is false");
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_not_exists_subquery() {
+        let mut engine = test_engine();
+        // NOT EXISTS over an empty table → true → all rows pass.
+        engine.execute_powql("type VIP { required name: str }").unwrap();
+
+        let result = engine.execute_powql(
+            "User filter not exists (VIP) { .name }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3);
+            }
+            _ => panic!("expected rows"),
+        }
+
+        // Now add a row — NOT EXISTS becomes false → no rows pass.
+        engine.execute_powql(r#"insert VIP { name := "Alice" }"#).unwrap();
+        let result = engine.execute_powql(
+            "User filter not exists (VIP) { .name }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 0);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_exists_subquery_with_inner_filter() {
+        let mut engine = test_engine();
+        // Subquery with its own filter: only rows matching the inner
+        // predicate count toward EXISTS.
+        engine.execute_powql("type Score { required name: str, required points: int }").unwrap();
+        engine.execute_powql(r#"insert Score { name := "Alice", points := 100 }"#).unwrap();
+
+        // Inner filter matches → EXISTS true → all users pass.
+        let result = engine.execute_powql(
+            "User filter exists (Score filter .points > 50) { .name }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 3),
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_exists_subquery_with_inner_filter_no_match() {
+        // Fresh engine so the plan cache doesn't collide with the
+        // `> 50` shape from the sibling test.
+        let mut engine = test_engine();
+        engine.execute_powql("type Score { required name: str, required points: int }").unwrap();
+        engine.execute_powql(r#"insert Score { name := "Alice", points := 100 }"#).unwrap();
+
+        // Inner filter matches nothing → EXISTS false → no users pass.
+        let result = engine.execute_powql(
+            "User filter exists (Score filter .points > 1000) { .name }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 0),
             _ => panic!("expected rows"),
         }
     }
@@ -5101,5 +5514,178 @@ mod tests {
         let rows = match result { QueryResult::Rows { rows, .. } => rows, _ => panic!() };
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Value::Int(30)); // only age=30 has count > 1
+    }
+
+    // ── Mixed-type arithmetic (Int <-> Float) regression tests ─────────
+
+    /// Engine with a Product type containing price:float + stock:int.
+    /// Exercises mixed numeric promotion in `eval_binop`.
+    fn product_mix_engine() -> Engine {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("powdb_product_mix_{}_{}", std::process::id(), id));
+        let mut engine = Engine::new(&dir).unwrap();
+        engine.execute_powql(
+            "type Product { required name: str, required price: float, required stock: int }"
+        ).unwrap();
+        engine.execute_powql(
+            r#"insert Product { name := "Apple",  price := 1.5, stock := 10 }"#
+        ).unwrap();
+        engine.execute_powql(
+            r#"insert Product { name := "Banana", price := 0.25, stock := 4 }"#
+        ).unwrap();
+        engine.execute_powql(
+            r#"insert Product { name := "Cherry", price := 2.0, stock := 3 }"#
+        ).unwrap();
+        engine
+    }
+
+    fn as_float(v: &Value) -> f64 {
+        match v {
+            Value::Float(f) => *f,
+            other => panic!("expected Float, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_arith_float_times_int() {
+        let mut engine = product_mix_engine();
+        let result = engine.execute_powql(
+            "Product { .name, total: .price * .stock }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["name", "total"]);
+                let mut by_name: std::collections::HashMap<String, f64> =
+                    std::collections::HashMap::new();
+                for row in &rows {
+                    let name = match &row[0] { Value::Str(s) => s.clone(), _ => panic!() };
+                    by_name.insert(name, as_float(&row[1]));
+                }
+                assert!((by_name["Apple"]  - 15.0).abs() < 1e-9);
+                assert!((by_name["Banana"] -  1.0).abs() < 1e-9);
+                assert!((by_name["Cherry"] -  6.0).abs() < 1e-9);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_arith_int_plus_float() {
+        let mut engine = product_mix_engine();
+        // stock:int + price:float → should promote to float
+        let result = engine.execute_powql(
+            "Product { .name, bumped: .stock + .price }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                let mut by_name: std::collections::HashMap<String, f64> =
+                    std::collections::HashMap::new();
+                for row in &rows {
+                    let name = match &row[0] { Value::Str(s) => s.clone(), _ => panic!() };
+                    by_name.insert(name, as_float(&row[1]));
+                }
+                assert!((by_name["Apple"]  - 11.5).abs() < 1e-9);
+                assert!((by_name["Banana"] -  4.25).abs() < 1e-9);
+                assert!((by_name["Cherry"] -  5.0).abs() < 1e-9);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_arith_float_div_int() {
+        let mut engine = product_mix_engine();
+        let result = engine.execute_powql(
+            "Product { .name, unit: .price / .stock }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                let mut by_name: std::collections::HashMap<String, f64> =
+                    std::collections::HashMap::new();
+                for row in &rows {
+                    let name = match &row[0] { Value::Str(s) => s.clone(), _ => panic!() };
+                    by_name.insert(name, as_float(&row[1]));
+                }
+                assert!((by_name["Apple"]  - 0.15).abs() < 1e-9);
+                assert!((by_name["Banana"] - 0.0625).abs() < 1e-9);
+                assert!((by_name["Cherry"] - (2.0 / 3.0)).abs() < 1e-9);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_arith_int_minus_float() {
+        let mut engine = product_mix_engine();
+        let result = engine.execute_powql(
+            "Product { .name, delta: .stock - .price }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                let mut by_name: std::collections::HashMap<String, f64> =
+                    std::collections::HashMap::new();
+                for row in &rows {
+                    let name = match &row[0] { Value::Str(s) => s.clone(), _ => panic!() };
+                    by_name.insert(name, as_float(&row[1]));
+                }
+                assert!((by_name["Apple"]  -  8.5).abs() < 1e-9);
+                assert!((by_name["Banana"] -  3.75).abs() < 1e-9);
+                assert!((by_name["Cherry"] -  1.0).abs() < 1e-9);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    // Regression: sum() on a Float column must return the actual
+    // floating-point sum, not Int(0). The old slow-path loops filtered
+    // out Value::Float and only summed Ints, silently dropping every
+    // value in a Float column.
+    #[test]
+    fn test_sum_float_scalar() {
+        let mut engine = product_mix_engine();
+        let result = engine.execute_powql("sum(Product { .price })").unwrap();
+        match result {
+            QueryResult::Scalar(v) => {
+                // 1.5 + 0.25 + 2.0 = 3.75
+                assert!((as_float(&v) - 3.75).abs() < 1e-9,
+                        "expected 3.75, got {v:?}");
+            }
+            _ => panic!("expected scalar result, got {result:?}"),
+        }
+    }
+
+    // Regression: sum() of a Float column inside a GROUP BY must work
+    // the same way. compute_group_aggregate had the identical Int-only
+    // bug as the scalar path.
+    #[test]
+    fn test_sum_float_group_by() {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("powdb_sum_float_gb_{}_{}", std::process::id(), id));
+        let mut engine = Engine::new(&dir).unwrap();
+        engine.execute_powql(
+            "type Sale { required region: str, required amount: float }"
+        ).unwrap();
+        engine.execute_powql(r#"insert Sale { region := "E", amount := 1.5 }"#).unwrap();
+        engine.execute_powql(r#"insert Sale { region := "E", amount := 2.25 }"#).unwrap();
+        engine.execute_powql(r#"insert Sale { region := "W", amount := 4.0 }"#).unwrap();
+        engine.execute_powql(r#"insert Sale { region := "W", amount := 0.5 }"#).unwrap();
+
+        let result = engine.execute_powql(
+            "Sale group .region { .region, total: sum(.amount) }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["region", "total"]);
+                let mut by_region: std::collections::HashMap<String, f64> =
+                    std::collections::HashMap::new();
+                for row in &rows {
+                    let region = match &row[0] { Value::Str(s) => s.clone(), _ => panic!() };
+                    by_region.insert(region, as_float(&row[1]));
+                }
+                assert!((by_region["E"] - 3.75).abs() < 1e-9, "E: {:?}", by_region.get("E"));
+                assert!((by_region["W"] - 4.5).abs()  < 1e-9, "W: {:?}", by_region.get("W"));
+            }
+            _ => panic!("expected rows, got {result:?}"),
+        }
     }
 }
