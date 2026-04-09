@@ -627,6 +627,34 @@ impl Parser {
         Ok(Expr::InList { expr: Box::new(expr), list, negated })
     }
 
+    /// Try to parse a `(subquery)` tail for `exists` / `not exists`.
+    /// A subquery is detected when the next tokens are `( Ident ...` —
+    /// bare identifiers inside parens are always table/view names in
+    /// PowQL (column refs start with `.`). Returns `Ok(Some(query))` if
+    /// consumed, `Ok(None)` if the shape doesn't match (so the caller
+    /// falls back to parsing a scalar primary for the legacy
+    /// `exists <expr>` form).
+    fn try_parse_exists_subquery(&mut self) -> Result<Option<QueryExpr>, ParseError> {
+        if *self.peek() != Token::LParen {
+            return Ok(None);
+        }
+        // Peek one token inside the paren. Anything starting with `Ident`
+        // is a source name — PowQL column references use `DotIdent`, so
+        // an `exists (X ...)` with a bare `X` is unambiguously a subquery.
+        let after_lparen = self.tokens.get(self.pos + 1);
+        if !matches!(after_lparen, Some(Token::Ident(_))) {
+            return Ok(None);
+        }
+        self.expect(&Token::LParen)?;
+        let source = match self.advance() {
+            Token::Ident(name) => name,
+            _ => unreachable!(),
+        };
+        let subquery = self.parse_query_tail(source)?;
+        self.expect(&Token::RParen)?;
+        Ok(Some(subquery))
+    }
+
     /// Parse `low and high` after `between` / `not between`.
     /// Desugars into `expr >= low AND expr <= high` (or negated:
     /// `expr < low OR expr > high`).
@@ -749,6 +777,15 @@ impl Parser {
                 self.advance();
                 if *self.peek() == Token::Exists {
                     self.advance();
+                    // `not exists (Q)` → ExistsSubquery{ negated: true } when
+                    // followed by `( Ident ...` (subquery form). Otherwise
+                    // fall back to the scalar `is not null` unary op.
+                    if let Some(sub) = self.try_parse_exists_subquery()? {
+                        return Ok(Expr::ExistsSubquery {
+                            subquery: Box::new(sub),
+                            negated: true,
+                        });
+                    }
                     let expr = self.parse_primary()?;
                     Ok(Expr::UnaryOp(UnaryOp::NotExists, Box::new(expr)))
                 } else {
@@ -758,6 +795,15 @@ impl Parser {
             }
             Token::Exists => {
                 self.advance();
+                // `exists (Q)` → ExistsSubquery when followed by a
+                // parenthesised query. Scalar `exists .field` still parses
+                // as UnaryOp::Exists for backwards compatibility.
+                if let Some(sub) = self.try_parse_exists_subquery()? {
+                    return Ok(Expr::ExistsSubquery {
+                        subquery: Box::new(sub),
+                        negated: false,
+                    });
+                }
                 let expr = self.parse_primary()?;
                 Ok(Expr::UnaryOp(UnaryOp::Exists, Box::new(expr)))
             }
