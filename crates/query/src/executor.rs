@@ -1355,10 +1355,17 @@ impl Engine {
         }
 
         let fast = FastLayout::new(&schema);
-        let reader = match compile_int_reader(col_idx, &fast) {
-            Some(r) => r,
+        // Mission C Phase 20b: inline the int-column reader instead of
+        // building a `Box<dyn Fn>`. Eliminates 100K vtable dispatches per
+        // 100K-row agg scan — every reader call folds directly into the
+        // hot loop below.
+        let byte_offset = match fast.fixed_offsets[col_idx] {
+            Some(o) => o,
             None => return Ok(None),
         };
+        let bitmap_byte = col_idx / 8;
+        let bitmap_bit = (col_idx % 8) as u32;
+        let data_offset = 2 + fast.bitmap_size + byte_offset;
 
         // Optional compiled filter.
         let compiled_pred: Option<CompiledPredicate> = match predicate {
@@ -1369,49 +1376,83 @@ impl Engine {
             None => None,
         };
 
-        let mut sum_i128: i128 = 0;
-        let mut count: i64 = 0;
-        let mut min_v: Option<i64> = None;
-        let mut max_v: Option<i64> = None;
-
-        self.catalog.for_each_row_raw(table, |_rid, data| {
-            if let Some(ref pred) = compiled_pred {
-                if !pred(data) { return; }
-            }
-            if let Some(v) = reader(data) {
-                count += 1;
-                match function {
-                    AggFunc::Sum | AggFunc::Avg => {
-                        sum_i128 += v as i128;
-                    }
-                    AggFunc::Min => {
-                        min_v = Some(match min_v { Some(m) => m.min(v), None => v });
-                    }
-                    AggFunc::Max => {
-                        max_v = Some(match max_v { Some(m) => m.max(v), None => v });
-                    }
-                    AggFunc::Count => {}
-                }
-            }
-        }).map_err(|e| e.to_string())?;
-
+        // Mission C Phase 20b: specialize the inner loop per aggregate
+        // function. The previous version ran a `match function { ... }`
+        // *inside* the closure, which kept LLVM from producing optimal
+        // scalar code for each variant (agg_max regressed ~23% vs the
+        // baseline Box<dyn Fn> version even though per-row vtable cost
+        // should have been strictly lower). Pushing the match out of the
+        // hot loop lets each specialized body fold cleanly into
+        // `for_each_row_raw` and removes a captured `AggFunc` + match
+        // dispatch per row.
         let result = match function {
-            AggFunc::Sum => {
-                // Saturating clamp to i64 range.
-                let clamped = sum_i128.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
-                QueryResult::Scalar(Value::Int(clamped))
-            }
-            AggFunc::Avg => {
-                if count == 0 {
+            AggFunc::Sum | AggFunc::Avg => {
+                let mut sum_i128: i128 = 0;
+                let mut count: i64 = 0;
+                self.catalog.for_each_row_raw(table, |_rid, data| {
+                    if let Some(ref pred) = compiled_pred {
+                        if !pred(data) { return; }
+                    }
+                    let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
+                    if is_null { return; }
+                    let v = i64::from_le_bytes(
+                        data[data_offset..data_offset + 8].try_into().unwrap(),
+                    );
+                    count += 1;
+                    sum_i128 += v as i128;
+                }).map_err(|e| e.to_string())?;
+                if matches!(function, AggFunc::Sum) {
+                    let clamped = sum_i128.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+                    QueryResult::Scalar(Value::Int(clamped))
+                } else if count == 0 {
                     QueryResult::Scalar(Value::Empty)
                 } else {
                     let avg = (sum_i128 as f64) / (count as f64);
                     QueryResult::Scalar(Value::Float(avg))
                 }
             }
-            AggFunc::Min => QueryResult::Scalar(min_v.map(Value::Int).unwrap_or(Value::Empty)),
-            AggFunc::Max => QueryResult::Scalar(max_v.map(Value::Int).unwrap_or(Value::Empty)),
-            AggFunc::Count => QueryResult::Scalar(Value::Int(count)),
+            AggFunc::Min => {
+                let mut min_v: Option<i64> = None;
+                self.catalog.for_each_row_raw(table, |_rid, data| {
+                    if let Some(ref pred) = compiled_pred {
+                        if !pred(data) { return; }
+                    }
+                    let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
+                    if is_null { return; }
+                    let v = i64::from_le_bytes(
+                        data[data_offset..data_offset + 8].try_into().unwrap(),
+                    );
+                    min_v = Some(match min_v { Some(m) => m.min(v), None => v });
+                }).map_err(|e| e.to_string())?;
+                QueryResult::Scalar(min_v.map(Value::Int).unwrap_or(Value::Empty))
+            }
+            AggFunc::Max => {
+                let mut max_v: Option<i64> = None;
+                self.catalog.for_each_row_raw(table, |_rid, data| {
+                    if let Some(ref pred) = compiled_pred {
+                        if !pred(data) { return; }
+                    }
+                    let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
+                    if is_null { return; }
+                    let v = i64::from_le_bytes(
+                        data[data_offset..data_offset + 8].try_into().unwrap(),
+                    );
+                    max_v = Some(match max_v { Some(m) => m.max(v), None => v });
+                }).map_err(|e| e.to_string())?;
+                QueryResult::Scalar(max_v.map(Value::Int).unwrap_or(Value::Empty))
+            }
+            AggFunc::Count => {
+                let mut count: i64 = 0;
+                self.catalog.for_each_row_raw(table, |_rid, data| {
+                    if let Some(ref pred) = compiled_pred {
+                        if !pred(data) { return; }
+                    }
+                    let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
+                    if is_null { return; }
+                    count += 1;
+                }).map_err(|e| e.to_string())?;
+                QueryResult::Scalar(Value::Int(count))
+            }
         };
         Ok(Some(result))
     }
@@ -1532,10 +1573,14 @@ impl Engine {
 
         let fast = FastLayout::new(&schema);
         let row_layout = RowLayout::new(&schema);
-        let reader = match compile_int_reader(sort_idx, &fast) {
-            Some(r) => r,
+        // Mission C Phase 20b: inline int-column reader (no Box<dyn Fn>).
+        let sort_byte_offset = match fast.fixed_offsets[sort_idx] {
+            Some(o) => o,
             None => return Ok(None),
         };
+        let sort_bitmap_byte = sort_idx / 8;
+        let sort_bitmap_bit = (sort_idx % 8) as u32;
+        let sort_data_offset = 2 + fast.bitmap_size + sort_byte_offset;
 
         let compiled_pred: Option<CompiledPredicate> = match predicate {
             Some(pred) => match compile_predicate(pred, &all_columns, &fast, &schema) {
@@ -1561,10 +1606,14 @@ impl Engine {
             if let Some(ref pred) = compiled_pred {
                 if !pred(data) { return; }
             }
-            let key = match reader(data) {
-                Some(k) => k,
-                None => return, // null sort key: skip
-            };
+            // Inlined int-column reader: null check + i64 decode.
+            let is_null = (data[2 + sort_bitmap_byte] >> sort_bitmap_bit) & 1 == 1;
+            if is_null {
+                return;
+            }
+            let key = i64::from_le_bytes(
+                data[sort_data_offset..sort_data_offset + 8].try_into().unwrap(),
+            );
             let id = seq;
             seq += 1;
 
@@ -1950,8 +1999,6 @@ impl FastLayout {
 }
 
 type CompiledPredicate = Box<dyn Fn(&[u8]) -> bool>;
-type IntReader = Box<dyn Fn(&[u8]) -> Option<i64>>;
-
 /// A single flattened predicate leaf — pure data, no closures, no allocation
 /// per call. Mission D3: replaces recursive Box<dyn Fn> conjunctions with a
 /// `Vec<CompiledLeaf>` so the inner scan loop becomes a tight match instead
@@ -2179,27 +2226,6 @@ fn build_str_eq_leaf(
         negate,
         needle: literal_str.into_bytes(),
     })
-}
-
-/// Build a closure that reads the value of a single fixed-size int column
-/// straight from row bytes. Returns None for nulls (caller decides what to do).
-fn compile_int_reader(
-    col_idx: usize,
-    layout: &FastLayout,
-) -> Option<IntReader> {
-    let byte_offset = layout.fixed_offsets[col_idx]?;
-    let bitmap_byte = col_idx / 8;
-    let bitmap_bit = col_idx % 8;
-    let data_offset = 2 + layout.bitmap_size + byte_offset;
-    Some(Box::new(move |data: &[u8]| {
-        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
-        if is_null {
-            return None;
-        }
-        Some(i64::from_le_bytes(
-            data[data_offset..data_offset + 8].try_into().unwrap(),
-        ))
-    }))
 }
 
 /// Collect the column indices referenced by a predicate expression.
