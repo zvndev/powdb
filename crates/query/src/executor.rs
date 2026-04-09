@@ -3033,7 +3033,7 @@ fn flatten_and_compile(
             Some(())
         }
         Expr::BinaryOp(left, op, right) => {
-            if let Some(leaf) = build_int_leaf(left, *op, right, columns, layout) {
+            if let Some(leaf) = build_int_leaf(left, *op, right, columns, layout, schema) {
                 out.push(leaf);
                 return Some(());
             }
@@ -3060,12 +3060,21 @@ fn flatten_and_compile(
 }
 
 /// Build an `Int` leaf from `.field <op> literal_int` (or reversed).
+///
+/// Only fires for columns whose declared type is `TypeId::Int`. If the
+/// column is a different numeric type (Float, DateTime) we return `None`
+/// so the caller falls back to the generic `Value::cmp` evaluation path,
+/// which correctly handles cross-type numeric comparison (e.g. Int literal
+/// vs Float column in `BETWEEN 100 AND 500` on a `price: float` column).
+/// Previously this function read 8 bytes of a Float column as little-endian
+/// i64, producing nonsense comparisons.
 fn build_int_leaf(
     left: &Expr,
     op: BinOp,
     right: &Expr,
     columns: &[String],
     layout: &FastLayout,
+    schema: &Schema,
 ) -> Option<CompiledLeaf> {
     let (field_name, literal_val, op) = match (left, right) {
         (Expr::Field(name), Expr::Literal(Literal::Int(v))) => (name, *v, op),
@@ -3083,6 +3092,11 @@ fn build_int_leaf(
     };
 
     let col_idx = columns.iter().position(|c| c == field_name)?;
+    // Guard: the compiled Int leaf reads the column's 8 bytes as i64.
+    // Only valid when the column is actually an Int column.
+    if schema.columns[col_idx].type_id != TypeId::Int {
+        return None;
+    }
     let byte_offset = layout.fixed_offsets[col_idx]?;
     let bitmap_byte = col_idx / 8;
     let bitmap_bit = (col_idx % 8) as u8;
@@ -4091,6 +4105,39 @@ mod tests {
             QueryResult::Rows { rows, .. } => {
                 // Alice is 30 (inclusive), Bob is 25 (inclusive).
                 assert_eq!(rows.len(), 2);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_between_filter_float_column_int_literals() {
+        // Regression for Value::Ord cross-type bug: BETWEEN on a Float column
+        // with Int literals previously returned zero rows because Ord fell
+        // through to TypeId discriminant comparison instead of promoting Int
+        // to f64. Verifies the fix end-to-end through the query engine.
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("powdb_exec_between_float_{}_{}", std::process::id(), id));
+        let mut engine = Engine::new(&dir).unwrap();
+        engine.execute_powql("type Product { required name: str, required price: float }").unwrap();
+        engine.execute_powql(r#"insert Product { name := "Cable",   price := 29.0 }"#).unwrap();
+        engine.execute_powql(r#"insert Product { name := "Speaker", price := 175.5 }"#).unwrap();
+        engine.execute_powql(r#"insert Product { name := "Monitor", price := 450.0 }"#).unwrap();
+        engine.execute_powql(r#"insert Product { name := "Laptop",  price := 1299.0 }"#).unwrap();
+
+        let result = engine.execute_powql(
+            "Product filter .price between 100 and 500 { .name, .price }",
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2, "expected 2 rows in [100, 500] range, got {}: {:?}", rows.len(), rows);
+                // Sorted by insert order: Speaker (175.5), Monitor (450.0).
+                let names: Vec<&str> = rows.iter().map(|r| match &r[0] {
+                    Value::Str(s) => s.as_str(),
+                    _ => panic!("expected string name"),
+                }).collect();
+                assert!(names.contains(&"Speaker"));
+                assert!(names.contains(&"Monitor"));
             }
             _ => panic!("expected rows"),
         }

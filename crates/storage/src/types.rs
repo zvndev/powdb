@@ -61,6 +61,14 @@ impl Value {
     }
 }
 
+// NOTE on cross-numeric equality: `PartialEq` (and `Hash`) deliberately do
+// NOT treat `Int(100)` and `Float(100.0)` as equal. Making them equal would
+// require a consistent `Hash` — if `a == b` then `hash(a) == hash(b)` — and
+// the canonical fix (normalise ints that fit exactly to f64 bits) is subtle
+// enough that we intentionally keep equality/hashing strictly typed. The
+// cross-type fix lives in `Ord::cmp` (below), which is what BETWEEN, ORDER
+// BY, and range predicates actually call. If you need numeric equality
+// across Int/Float, use `cmp(...) == Ordering::Equal` explicitly.
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -111,6 +119,13 @@ impl Ord for Value {
         match (self, other) {
             (Value::Int(a), Value::Int(b))           => a.cmp(b),
             (Value::Float(a), Value::Float(b))       => a.total_cmp(b),
+            // Cross-type numeric comparison: promote Int -> f64 and use
+            // total_cmp so BETWEEN / ORDER BY / range predicates work on
+            // mixed Int literals vs Float columns (and vice versa).
+            // `i64 as f64` can lose precision above 2^53, but the result is
+            // still monotonic, which is what comparison needs.
+            (Value::Int(a), Value::Float(b))         => (*a as f64).total_cmp(b),
+            (Value::Float(a), Value::Int(b))         => a.total_cmp(&(*b as f64)),
             (Value::Bool(a), Value::Bool(b))         => a.cmp(b),
             (Value::Str(a), Value::Str(b))           => a.cmp(b),
             (Value::DateTime(a), Value::DateTime(b)) => a.cmp(b),
@@ -233,6 +248,53 @@ mod tests {
     fn test_empty_is_less_than_values() {
         assert!(Value::Empty < Value::Int(0));
         assert!(Value::Empty < Value::Str("".into()));
+    }
+
+    #[test]
+    fn test_ord_int_vs_float() {
+        // Regression: prior to the cross-type fix, `Int(100) < Float(175.5)`
+        // fell through to comparing TypeId discriminants (Int=1 vs Float=2),
+        // which happened to return Less for this case but Greater for others,
+        // breaking BETWEEN on Float columns with Int literals.
+        assert!(Value::Int(100) < Value::Float(175.5));
+        assert!(Value::Int(500) > Value::Float(450.0));
+        assert!(Value::Int(100) < Value::Float(100.5));
+        assert!(Value::Int(100) > Value::Float(99.9));
+        // Equal magnitudes compare equal across types.
+        assert_eq!(Value::Int(100).cmp(&Value::Float(100.0)), Ordering::Equal);
+        assert_eq!(Value::Int(0).cmp(&Value::Float(0.0)), Ordering::Equal);
+        // Negative numbers.
+        assert!(Value::Int(-10) < Value::Float(-5.5));
+        assert!(Value::Int(-1) > Value::Float(-1.5));
+    }
+
+    #[test]
+    fn test_ord_float_vs_int() {
+        assert!(Value::Float(175.5) > Value::Int(100));
+        assert!(Value::Float(450.0) < Value::Int(500));
+        assert!(Value::Float(100.5) > Value::Int(100));
+        assert!(Value::Float(99.9) < Value::Int(100));
+        assert_eq!(Value::Float(100.0).cmp(&Value::Int(100)), Ordering::Equal);
+        assert!(Value::Float(-5.5) > Value::Int(-10));
+        assert!(Value::Float(-1.5) < Value::Int(-1));
+    }
+
+    #[test]
+    fn test_ord_between_simulation() {
+        // Simulates the Product.price BETWEEN 100 AND 500 case: Int literals
+        // bounding a Float column. All of 175.5 and 450.0 must be in range.
+        let lo = Value::Int(100);
+        let hi = Value::Int(500);
+        let prices = [29.0_f64, 175.5, 450.0, 1299.0];
+        let in_range: Vec<f64> = prices
+            .iter()
+            .copied()
+            .filter(|p| {
+                let v = Value::Float(*p);
+                v >= lo && v <= hi
+            })
+            .collect();
+        assert_eq!(in_range, vec![175.5, 450.0]);
     }
 
     #[test]
