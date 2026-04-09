@@ -302,7 +302,15 @@ pub fn decode_column(schema: &Schema, layout: &RowLayout, data: &[u8], col_idx: 
         let bytes = &data[start..end];
 
         match col.type_id {
-            TypeId::Str => Value::Str(String::from_utf8_lossy(bytes).into_owned()),
+            // SAFETY: every byte written into a `TypeId::Str` column's slot
+            // originates from `String::as_bytes()` (see `encode_row_into_with_layout`
+            // above and `executor::patch_var_col_in_place` in the update fast path),
+            // so the bytes are guaranteed to be valid UTF-8. Skipping the UTF-8
+            // check saves ~5-15ns per projected string, which is measurable on
+            // string-heavy workloads like `multi_col_and_filter` (30K strings).
+            TypeId::Str => {
+                Value::Str(unsafe { std::str::from_utf8_unchecked(bytes) }.to_owned())
+            }
             TypeId::Bytes => Value::Bytes(bytes.to_vec()),
             _ => unreachable!(),
         }
@@ -489,7 +497,11 @@ pub fn decode_row(schema: &Schema, data: &[u8]) -> Row {
         let end = var_data_start + var_offsets[vi + 1];
         let bytes = &data[start..end];
         values[col_idx] = match schema.columns[col_idx].type_id {
-            TypeId::Str => Value::Str(String::from_utf8_lossy(bytes).into_owned()),
+            // SAFETY: see `decode_column` — the encoder is the only writer
+            // and always writes valid UTF-8 for `TypeId::Str` columns.
+            TypeId::Str => {
+                Value::Str(unsafe { std::str::from_utf8_unchecked(bytes) }.to_owned())
+            }
             TypeId::Bytes => Value::Bytes(bytes.to_vec()),
             _ => unreachable!(),
         };
