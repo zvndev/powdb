@@ -1027,7 +1027,7 @@ impl Engine {
                 // Fast path: sum/avg/min/max over a single fixed-size int
                 // column with an optional compiled filter predicate. Walks
                 // raw row bytes, zero allocation per row.
-                if matches!(function, AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max) {
+                if matches!(function, AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max | AggFunc::CountDistinct) {
                     if let Some(col) = field.as_ref() {
                         // Shape: Aggregate(SeqScan) or Aggregate(Filter(SeqScan))
                         let (table_opt, pred_opt): (Option<&str>, Option<&Expr>) = match input.as_ref() {
@@ -1058,6 +1058,16 @@ impl Engine {
                     QueryResult::Rows { columns, rows } => {
                         match function {
                             AggFunc::Count => Ok(QueryResult::Scalar(Value::Int(rows.len() as i64))),
+                            AggFunc::CountDistinct => {
+                                let col = field.as_ref().ok_or("count distinct requires field")?;
+                                let idx = columns.iter().position(|c| c == col).ok_or("col not found")?;
+                                let mut seen = std::collections::HashSet::new();
+                                for row in &rows {
+                                    let v = &row[idx];
+                                    if !v.is_empty() { seen.insert(v.clone()); }
+                                }
+                                Ok(QueryResult::Scalar(Value::Int(seen.len() as i64)))
+                            }
                             AggFunc::Avg => {
                                 let col = field.as_ref().ok_or("avg requires field")?;
                                 let idx = columns.iter().position(|c| c == col).ok_or("col not found")?;
@@ -1950,6 +1960,21 @@ impl Engine {
                 }).map_err(|e| e.to_string())?;
                 QueryResult::Scalar(Value::Int(count))
             }
+            AggFunc::CountDistinct => {
+                let mut seen = rustc_hash::FxHashSet::default();
+                self.catalog.for_each_row_raw(table, |_rid, data| {
+                    if let Some(ref pred) = compiled_pred {
+                        if !pred(data) { return; }
+                    }
+                    let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
+                    if is_null { return; }
+                    let v = i64::from_le_bytes(
+                        data[data_offset..data_offset + 8].try_into().unwrap(),
+                    );
+                    seen.insert(v);
+                }).map_err(|e| e.to_string())?;
+                QueryResult::Scalar(Value::Int(seen.len() as i64))
+            }
         };
         Ok(Some(result))
     }
@@ -2584,6 +2609,14 @@ fn compute_group_aggregate(
                 .filter(|&&ri| !all_rows[ri][col_idx].is_empty())
                 .count();
             Value::Int(count as i64)
+        }
+        AggFunc::CountDistinct => {
+            let mut seen = std::collections::HashSet::new();
+            for &ri in row_indices {
+                let v = &all_rows[ri][col_idx];
+                if !v.is_empty() { seen.insert(v.clone()); }
+            }
+            Value::Int(seen.len() as i64)
         }
         AggFunc::Sum => {
             let mut sum: i64 = 0;
@@ -4906,6 +4939,57 @@ mod tests {
                 assert_eq!(rows.len(), 2);
             }
             _ => panic!("expected rows"),
+        }
+    }
+
+    // ── COUNT DISTINCT tests ───────────────────────────────────
+
+    #[test]
+    fn test_count_distinct_standalone() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Color { name: str }").unwrap();
+        engine.execute_powql(r#"insert Color { name := "red" }"#).unwrap();
+        engine.execute_powql(r#"insert Color { name := "blue" }"#).unwrap();
+        engine.execute_powql(r#"insert Color { name := "red" }"#).unwrap();
+        engine.execute_powql(r#"insert Color { name := "green" }"#).unwrap();
+        let result = engine.execute_powql("count(distinct Color { .name })").unwrap();
+        match result {
+            QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 3), // red, blue, green
+            _ => panic!("expected scalar int"),
+        }
+    }
+
+    #[test]
+    fn test_count_distinct_in_group_by() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Sale { dept: str, item: str }").unwrap();
+        engine.execute_powql(r#"insert Sale { dept := "eng", item := "laptop" }"#).unwrap();
+        engine.execute_powql(r#"insert Sale { dept := "eng", item := "laptop" }"#).unwrap();
+        engine.execute_powql(r#"insert Sale { dept := "eng", item := "monitor" }"#).unwrap();
+        engine.execute_powql(r#"insert Sale { dept := "sales", item := "phone" }"#).unwrap();
+        let result = engine.execute_powql(
+            "Sale group .dept { .dept, count(distinct .item) }"
+        ).unwrap();
+        let rows = match result { QueryResult::Rows { rows, .. } => rows, _ => panic!() };
+        // eng: 2 distinct items (laptop, monitor), sales: 1 (phone)
+        let eng_row = rows.iter().find(|r| r[0] == Value::Str("eng".into())).unwrap();
+        let sales_row = rows.iter().find(|r| r[0] == Value::Str("sales".into())).unwrap();
+        assert_eq!(eng_row[1], Value::Int(2));
+        assert_eq!(sales_row[1], Value::Int(1));
+    }
+
+    #[test]
+    fn test_count_distinct_with_filter() {
+        let mut engine = test_engine();
+        // Use test_engine which creates User with name, email, age
+        engine.execute_powql(r#"insert User { name := "Dave", email := "d@e.com", age := 30 }"#).unwrap();
+        let result = engine.execute_powql("count(distinct User { .age })").unwrap();
+        match result {
+            QueryResult::Scalar(Value::Int(n)) => {
+                // 30(alice), 25(bob), 35(charlie), 30(dave) → 3 distinct
+                assert_eq!(n, 3);
+            }
+            _ => panic!("expected scalar int"),
         }
     }
 }

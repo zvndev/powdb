@@ -346,7 +346,7 @@ impl Parser {
                     }
                     Token::DotIdent(name) => Expr::Field(name),
                     Token::Count | Token::Avg | Token::Sum | Token::Min | Token::Max => {
-                        let func = match first {
+                        let mut func = match first {
                             Token::Count => AggFunc::Count,
                             Token::Avg   => AggFunc::Avg,
                             Token::Sum   => AggFunc::Sum,
@@ -355,6 +355,11 @@ impl Parser {
                             _ => unreachable!(),
                         };
                         self.expect(&Token::LParen)?;
+                        // count(distinct .field) → CountDistinct
+                        if func == AggFunc::Count && *self.peek() == Token::Distinct {
+                            self.advance();
+                            func = AggFunc::CountDistinct;
+                        }
                         let inner = self.parse_expr()?;
                         self.expect(&Token::RParen)?;
                         Expr::FunctionCall(func, Box::new(inner))
@@ -432,7 +437,7 @@ impl Parser {
     }
 
     fn parse_aggregate_query(&mut self) -> Result<Statement, ParseError> {
-        let func = match self.advance() {
+        let mut func = match self.advance() {
             Token::Count => AggFunc::Count,
             Token::Avg => AggFunc::Avg,
             Token::Sum => AggFunc::Sum,
@@ -441,6 +446,11 @@ impl Parser {
             t => return Err(ParseError { message: format!("expected aggregate function, got {t:?}") }),
         };
         self.expect(&Token::LParen)?;
+        // count(distinct User ...) → CountDistinct
+        if func == AggFunc::Count && *self.peek() == Token::Distinct {
+            self.advance();
+            func = AggFunc::CountDistinct;
+        }
         let source = match self.advance() {
             Token::Ident(name) => name,
             t => return Err(ParseError { message: format!("expected type name, got {t:?}") }),
@@ -451,12 +461,12 @@ impl Parser {
         let mut query = self.parse_query_tail(source)?;
         self.expect(&Token::RParen)?;
 
-        // For non-count aggregates, the caller typically writes the target
-        // column via the trailing projection form:
+        // For non-count aggregates (and count distinct), the caller typically
+        // writes the target column via the trailing projection form:
         //     sum(User filter .age > 30 { .age })
+        //     count(distinct User { .name })
         // We lift that single unaliased `.field` into AggregateExpr.field so
-        // the executor's aggregate fast paths can see it. count() keeps its
-        // projection if present (projection under count is silly but legal).
+        // the executor's aggregate fast paths can see it.
         let mut agg_field: Option<String> = None;
         if func != AggFunc::Count {
             if let Some(proj) = &query.projection {
@@ -765,7 +775,7 @@ impl Parser {
             // Top-level `count(User)` still routes through parse_aggregate_query
             // in parse_statement; this arm handles `count(.id)`, `sum(.age)`, etc.
             Token::Count | Token::Avg | Token::Sum | Token::Min | Token::Max => {
-                let func = match self.advance() {
+                let mut func = match self.advance() {
                     Token::Count => AggFunc::Count,
                     Token::Avg   => AggFunc::Avg,
                     Token::Sum   => AggFunc::Sum,
@@ -779,6 +789,11 @@ impl Parser {
                     self.advance();
                     self.expect(&Token::RParen)?;
                     return Ok(Expr::FunctionCall(AggFunc::Count, Box::new(Expr::Field("*".into()))));
+                }
+                // count(distinct .field) → CountDistinct
+                if func == AggFunc::Count && *self.peek() == Token::Distinct {
+                    self.advance();
+                    func = AggFunc::CountDistinct;
                 }
                 let inner = self.parse_expr()?;
                 self.expect(&Token::RParen)?;
@@ -2217,6 +2232,37 @@ mod tests {
                 }
             }
             _ => panic!("expected Union"),
+        }
+    }
+
+    #[test]
+    fn test_parse_count_distinct_standalone() {
+        let stmt = parse("count(distinct User { .name })").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let agg = q.aggregation.unwrap();
+                assert_eq!(agg.function, AggFunc::CountDistinct);
+                assert_eq!(agg.field.as_deref(), Some("name"));
+            }
+            _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_count_distinct_in_projection() {
+        let stmt = parse("User group .dept { .dept, count(distinct .name) }").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let proj = q.projection.unwrap();
+                assert_eq!(proj.len(), 2);
+                match &proj[1].expr {
+                    Expr::FunctionCall(func, _) => {
+                        assert_eq!(*func, AggFunc::CountDistinct);
+                    }
+                    _ => panic!("expected FunctionCall"),
+                }
+            }
+            _ => panic!("expected Query"),
         }
     }
 }

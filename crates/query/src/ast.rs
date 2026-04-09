@@ -178,6 +178,7 @@ pub struct AggregateExpr {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AggFunc {
     Count,
+    CountDistinct,
     Avg,
     Sum,
     Min,
