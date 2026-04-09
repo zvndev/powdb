@@ -148,10 +148,26 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
         PlanNode::AlterTable { .. } => {}
         PlanNode::DropTable { .. } => {}
         PlanNode::Limit { input, count } => {
-            substitute_plan(input, literals, idx);
-            substitute_expr(count, literals, idx);
+            // Source order for `filter ... limit N offset M` is
+            // [filter literals, N, M]. The planner now builds
+            // Limit(Offset(...)) so that execution skips M rows *before*
+            // taking N. Naively walking "input then count" would yield
+            // [filter, M, N] — wrong. Special-case `Limit(Offset(...))`
+            // to descend into Offset's own input (which holds the filter
+            // literals), then visit Limit.count, then Offset.count, so
+            // the literal stream stays in source order.
+            if let PlanNode::Offset { input: inner, count: off_count } = input.as_mut() {
+                substitute_plan(inner, literals, idx);
+                substitute_expr(count, literals, idx);
+                substitute_expr(off_count, literals, idx);
+            } else {
+                substitute_plan(input, literals, idx);
+                substitute_expr(count, literals, idx);
+            }
         }
         PlanNode::Offset { input, count } => {
+            // Bare Offset (no wrapping Limit) — source order is
+            // [..., offset literal] so descend first then visit count.
             substitute_plan(input, literals, idx);
             substitute_expr(count, literals, idx);
         }
@@ -237,8 +253,18 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
         }
         PlanNode::Sort { input, .. } => count_plan(input, n),
         PlanNode::Limit { input, count } => {
-            count_plan(input, n);
-            count_expr(count, n);
+            // Mirror the substitute walk: `Limit(Offset(...))` descends
+            // into the offset's child first, then counts Limit.count,
+            // then Offset.count. Source order is
+            // [..., limit literal, offset literal].
+            if let PlanNode::Offset { input: inner, count: off_count } = input.as_ref() {
+                count_plan(inner, n);
+                count_expr(count, n);
+                count_expr(off_count, n);
+            } else {
+                count_plan(input, n);
+                count_expr(count, n);
+            }
         }
         PlanNode::Offset { input, count } => {
             count_plan(input, n);

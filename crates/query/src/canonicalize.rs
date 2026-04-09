@@ -59,6 +59,16 @@ fn hash_bytes(mut h: u64, bytes: &[u8]) -> u64 {
 /// new literals into the cached plan.
 pub fn canonicalize(input: &str) -> Result<(u64, Vec<Literal>), LexError> {
     let tokens = lex(input)?;
+    // Normalize `offset <lit> limit <lit>` → `limit <lit> offset <lit>`.
+    // The planner always builds the same plan shape for both orderings
+    // (`Limit(Offset(...))`), and the substitute walk visits literals in
+    // that fixed plan order. Without this normalization, the two source
+    // orderings would hash to different cache entries and also disagree
+    // with the walk order of the second — leading to limit/offset swaps
+    // on cache hits for the `offset-before-limit` form. Hashing the
+    // normalized token stream collapses the two orderings to one entry
+    // and keeps the literal vector in `[limit_lit, offset_lit]` order.
+    let tokens = normalize_limit_offset_order(tokens);
     let mut hash = FNV_OFFSET;
     // Most queries hold 0-3 literals; we pre-size to avoid allocation
     // churn on the bench's tight loops.
@@ -67,6 +77,70 @@ pub fn canonicalize(input: &str) -> Result<(u64, Vec<Literal>), LexError> {
         hash = hash_token(hash, tok, &mut literals);
     }
     Ok((hash, literals))
+}
+
+/// If the token stream contains `offset <expr> limit <expr>` as a contiguous
+/// tail segment (the normal shape for queries that use both clauses), swap
+/// them in place so that the canonical form is always `limit <expr> offset
+/// <expr>`. Bails out (no change) for any unusual shape the planner/parser
+/// would also reject or reorder identically — the worst-case is two cache
+/// entries instead of one, not incorrect substitution.
+fn normalize_limit_offset_order(mut tokens: Vec<Token>) -> Vec<Token> {
+    // Find the `offset` and `limit` keyword positions. We only reorder
+    // when *both* are present and `offset` comes first. Multiple
+    // limit/offset keywords are a parse error downstream, so we only
+    // look at the first of each.
+    let mut limit_pos: Option<usize> = None;
+    let mut offset_pos: Option<usize> = None;
+    for (i, tok) in tokens.iter().enumerate() {
+        match tok {
+            Token::Limit if limit_pos.is_none() => limit_pos = Some(i),
+            Token::Offset if offset_pos.is_none() => offset_pos = Some(i),
+            _ => {}
+        }
+    }
+    let (Some(off_at), Some(lim_at)) = (offset_pos, limit_pos) else {
+        return tokens;
+    };
+    if off_at >= lim_at {
+        // Already in canonical `limit ... offset ...` order (or adjacent
+        // the wrong way — handled by the generic walk).
+        return tokens;
+    }
+    // Delimit each clause's expression region. The expression ends at the
+    // next pipeline keyword or structural token that terminates a tail
+    // clause (`filter`, `order`, `group`, `limit`, `offset`, `{`, `update`,
+    // `delete`, or EOF).
+    fn clause_end(tokens: &[Token], start: usize) -> usize {
+        let mut i = start;
+        while i < tokens.len() {
+            match &tokens[i] {
+                Token::Limit | Token::Offset | Token::Filter | Token::Order
+                | Token::Group | Token::LBrace | Token::Update | Token::Delete
+                | Token::Eof => return i,
+                _ => i += 1,
+            }
+        }
+        i
+    }
+    let off_expr_end = clause_end(&tokens, off_at + 1);
+    if off_expr_end != lim_at {
+        // Offset's expression runs up to something other than `limit` —
+        // bail out, the shape is unusual.
+        return tokens;
+    }
+    let lim_expr_end = clause_end(&tokens, lim_at + 1);
+    // Extract the two chunks and splice them back in swapped order:
+    // [..., OFFSET_KW, off_expr..., LIMIT_KW, lim_expr..., tail]
+    //   →  [..., LIMIT_KW, lim_expr..., OFFSET_KW, off_expr..., tail]
+    let tail: Vec<Token> = tokens.drain(lim_expr_end..).collect();
+    let limit_chunk: Vec<Token> = tokens.drain(lim_at..lim_expr_end).collect();
+    let offset_chunk: Vec<Token> = tokens.drain(off_at..lim_at).collect();
+    // `tokens` now holds [..prefix..] up to just before OFFSET_KW.
+    tokens.extend(limit_chunk);
+    tokens.extend(offset_chunk);
+    tokens.extend(tail);
+    tokens
 }
 
 fn hash_token(h: u64, tok: &Token, literals: &mut Vec<Literal>) -> u64 {
