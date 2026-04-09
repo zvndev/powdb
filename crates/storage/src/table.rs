@@ -1,6 +1,8 @@
 use crate::btree::BTree;
 use crate::heap::HeapFile;
-use crate::row::{decode_column, decode_row, encode_row_into, patch_var_column_in_place, RowLayout};
+use crate::row::{
+    decode_column, decode_row, encode_row_into_with_layout, patch_var_column_in_place, RowLayout,
+};
 use crate::types::*;
 use std::io;
 use std::path::Path;
@@ -141,7 +143,12 @@ impl Table {
     /// straight through `BTree::insert_int` to skip the generic
     /// `Value::Ord` dispatch on every binary-search comparison.
     pub fn insert(&mut self, values: &Row) -> io::Result<RowId> {
-        encode_row_into(&self.schema, values, &mut self.encode_scratch);
+        encode_row_into_with_layout(
+            &self.schema,
+            &self.row_layout,
+            values,
+            &mut self.encode_scratch,
+        );
         let rid = self.heap.insert(&self.encode_scratch)?;
 
         // Fast path: no indexes — skip the whole loop entirely.
@@ -443,7 +450,12 @@ impl Table {
 
         let old_row = if touches_index { self.get(rid) } else { None };
 
-        encode_row_into(&self.schema, values, &mut self.encode_scratch);
+        encode_row_into_with_layout(
+            &self.schema,
+            &self.row_layout,
+            values,
+            &mut self.encode_scratch,
+        );
         let new_rid = self.heap.update(rid, &self.encode_scratch)?;
 
         if touches_index {

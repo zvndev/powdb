@@ -25,114 +25,158 @@ pub fn encode_row(schema: &Schema, values: &[Value]) -> Vec<u8> {
 /// rewrite below walks the schema twice and writes straight into `out`,
 /// reusing the buffer's backing store between calls.
 ///
+/// Mission C Phase 19: thin wrapper around [`encode_row_into_with_layout`]
+/// that builds a transient `RowLayout` on every call. Hot callers (inserts,
+/// updates) should construct the layout once on `Table` and pass it in
+/// directly — that skips the schema-walk entirely and fuses the sizing pass
+/// with the bitmap pass.
+///
 /// Contract:
 /// - `out` is cleared and filled with exactly the encoded row bytes.
 /// - No allocations happen if `out.capacity()` is already large enough
 ///   (the common case after the first insert of a given shape).
 pub fn encode_row_into(schema: &Schema, values: &[Value], out: &mut Vec<u8>) {
+    let layout = RowLayout::new(schema);
+    encode_row_into_with_layout(schema, &layout, values, out);
+}
+
+/// Encode a row using a precomputed [`RowLayout`].
+///
+/// Mission C Phase 19: the former `encode_row_into` walked `schema.columns`
+/// four separate times (size, fixed, var offsets, var data) and the value
+/// slice three times (size, bitmap, fixed/var). For the `insert_batch_1k`
+/// bench this added up to ~117ns out of a 232ns per-row budget. This
+/// rewrite:
+///
+///   1. Takes the layout as an argument so we skip recomputing
+///      `fixed_region_size`, `n_var`, and `bitmap_size` on every call.
+///   2. Fuses the sizing pass with the bitmap pass: a single walk over
+///      `values[]` both computes `var_data_size` and materialises the null
+///      bitmap into a stack-local `[u8; 32]` buffer (supports ≤256 cols).
+///   3. `resize`s `out` to the final size exactly once, all zeroed. That
+///      automatically handles placeholder-zero writes for null fixed
+///      columns — no branches, no per-column `extend_from_slice`.
+///   4. Walks `schema.columns` one final time to emit fixed columns at
+///      their precomputed offsets and var columns with fused offset-table
+///      + payload writes (no second pass over var cols for data).
+///
+/// All mutation into `out` is via indexed writes, so the compiler can
+/// hoist bounds checks and vectorise the common `copy_from_slice` calls.
+#[inline]
+pub fn encode_row_into_with_layout(
+    schema: &Schema,
+    layout: &RowLayout,
+    values: &[Value],
+    out: &mut Vec<u8>,
+) {
     debug_assert_eq!(values.len(), schema.columns.len());
 
-    out.clear();
-
     let n_cols = schema.columns.len();
-    let bitmap_size = (n_cols + 7) / 8;
-
-    // First pass: compute sizes so we can reserve once and avoid any
-    // intermediate growth. The pass walks the same value slice twice, but
-    // the second pass writes without branching on capacity.
-    let mut fixed_region_size = 0usize;
-    let mut n_var = 0usize;
-    let mut var_data_size = 0usize;
-    for (i, col) in schema.columns.iter().enumerate() {
-        if is_fixed_size(col.type_id) {
-            fixed_region_size += fixed_size(col.type_id).unwrap();
-        } else {
-            n_var += 1;
-            if !values[i].is_empty() {
-                match &values[i] {
-                    Value::Str(s) => var_data_size += s.len(),
-                    Value::Bytes(b) => var_data_size += b.len(),
-                    _ => {}
-                }
-            }
-        }
-    }
-
+    let bitmap_size = layout.bitmap_size;
+    let fixed_region_size = layout.fixed_region_size;
+    let n_var = layout.n_var;
     let n_offsets = n_var + 1;
-    let body_size = bitmap_size + fixed_region_size + n_offsets * 2 + var_data_size;
-    let total_size = 2 + body_size;
 
-    out.reserve(total_size);
+    // Fused pre-pass: compute null bitmap + var data size in a single walk.
+    // Stack-local bitmap supports schemas up to 256 columns without any
+    // heap touch. Wider schemas fall back to the (rare) heap path below.
+    let mut bitmap_stack = [0u8; 32];
+    let mut bitmap_heap: Vec<u8>;
+    let bitmap_slice: &mut [u8] = if bitmap_size <= 32 {
+        &mut bitmap_stack[..bitmap_size]
+    } else {
+        bitmap_heap = vec![0u8; bitmap_size];
+        &mut bitmap_heap[..]
+    };
 
-    // Length prefix — placeholder that we'll fill in after writing. The
-    // total is already known, so just write it directly.
-    out.extend_from_slice(&(total_size as u16).to_le_bytes());
-
-    // Null bitmap — write byte at a time.
-    let bitmap_start = out.len();
-    out.resize(bitmap_start + bitmap_size, 0);
+    let mut var_data_size: usize = 0;
     for (i, val) in values.iter().enumerate() {
-        if val.is_empty() {
-            out[bitmap_start + i / 8] |= 1 << (i % 8);
-        }
-    }
-
-    // Fixed columns packed in schema order.
-    for (i, col) in schema.columns.iter().enumerate() {
-        if !is_fixed_size(col.type_id) {
-            continue;
-        }
-        let sz = fixed_size(col.type_id).unwrap();
-        if values[i].is_empty() {
-            // Placeholder zeros so offsets stay predictable.
-            out.resize(out.len() + sz, 0);
-        } else {
-            match &values[i] {
-                Value::Int(v)      => out.extend_from_slice(&v.to_le_bytes()),
-                Value::Float(v)    => out.extend_from_slice(&v.to_le_bytes()),
-                Value::Bool(v)     => out.push(if *v { 1 } else { 0 }),
-                Value::DateTime(v) => out.extend_from_slice(&v.to_le_bytes()),
-                Value::Uuid(v)     => out.extend_from_slice(v),
-                _ => unreachable!("fixed column with non-fixed value"),
+        match val {
+            Value::Empty => {
+                bitmap_slice[i >> 3] |= 1 << (i & 7);
             }
-        }
-    }
-
-    // Variable-column offset table. Compute as we go.
-    let offsets_start = out.len();
-    out.resize(offsets_start + n_offsets * 2, 0);
-
-    let mut var_cursor: u16 = 0;
-    let mut off_slot = 0usize;
-    for (i, col) in schema.columns.iter().enumerate() {
-        if is_fixed_size(col.type_id) {
-            continue;
-        }
-        let pos = offsets_start + off_slot * 2;
-        out[pos..pos + 2].copy_from_slice(&var_cursor.to_le_bytes());
-        off_slot += 1;
-        match &values[i] {
-            Value::Str(s) => var_cursor += s.len() as u16,
-            Value::Bytes(b) => var_cursor += b.len() as u16,
+            Value::Str(s) => var_data_size += s.len(),
+            Value::Bytes(b) => var_data_size += b.len(),
             _ => {}
         }
     }
-    // End sentinel.
-    let end_pos = offsets_start + off_slot * 2;
-    out[end_pos..end_pos + 2].copy_from_slice(&var_cursor.to_le_bytes());
 
-    // Variable-column data.
-    for (i, col) in schema.columns.iter().enumerate() {
-        if is_fixed_size(col.type_id) {
-            continue;
-        }
-        match &values[i] {
-            Value::Str(s) => out.extend_from_slice(s.as_bytes()),
-            Value::Bytes(b) => out.extend_from_slice(b),
-            Value::Empty => {} // zero-length
-            _ => unreachable!("variable column with non-variable value"),
+    let body_size = bitmap_size + fixed_region_size + n_offsets * 2 + var_data_size;
+    let total_size = 2 + body_size;
+
+    // One resize → zeroed buffer. This subsumes: placeholder zeros for
+    // null fixed columns, zero-init of the offset table, and the end
+    // sentinel (implicitly zero if no var cols).
+    out.clear();
+    out.resize(total_size, 0);
+
+    // Length prefix.
+    out[0..2].copy_from_slice(&(total_size as u16).to_le_bytes());
+
+    // Bitmap — bulk copy from the stack/heap scratch buffer.
+    let bitmap_start = 2;
+    out[bitmap_start..bitmap_start + bitmap_size].copy_from_slice(bitmap_slice);
+
+    let fixed_start = bitmap_start + bitmap_size;
+    let offsets_start = fixed_start + fixed_region_size;
+    let var_data_start = offsets_start + n_offsets * 2;
+
+    // Single pass over columns: fixed writes at precomputed offsets, var
+    // writes update the offset table and stream payload into var data.
+    let mut var_cursor: u16 = 0;
+    let mut off_slot: usize = 0;
+
+    for i in 0..n_cols {
+        if let Some(off) = layout.fixed_offsets[i] {
+            // Nulls already zero from the up-front resize.
+            let pos = fixed_start + off;
+            match &values[i] {
+                Value::Empty => {}
+                Value::Int(v) => {
+                    out[pos..pos + 8].copy_from_slice(&v.to_le_bytes());
+                }
+                Value::Float(v) => {
+                    out[pos..pos + 8].copy_from_slice(&v.to_le_bytes());
+                }
+                Value::Bool(v) => {
+                    out[pos] = if *v { 1 } else { 0 };
+                }
+                Value::DateTime(v) => {
+                    out[pos..pos + 8].copy_from_slice(&v.to_le_bytes());
+                }
+                Value::Uuid(v) => {
+                    out[pos..pos + 16].copy_from_slice(v);
+                }
+                _ => unreachable!("fixed column with non-fixed value"),
+            }
+        } else {
+            // Variable column — write offset, then stream payload.
+            let off_pos = offsets_start + off_slot * 2;
+            out[off_pos..off_pos + 2].copy_from_slice(&var_cursor.to_le_bytes());
+            off_slot += 1;
+
+            match &values[i] {
+                Value::Empty => {} // zero-length, nothing to append
+                Value::Str(s) => {
+                    let len = s.len();
+                    let abs = var_data_start + var_cursor as usize;
+                    out[abs..abs + len].copy_from_slice(s.as_bytes());
+                    var_cursor += len as u16;
+                }
+                Value::Bytes(b) => {
+                    let len = b.len();
+                    let abs = var_data_start + var_cursor as usize;
+                    out[abs..abs + len].copy_from_slice(b);
+                    var_cursor += len as u16;
+                }
+                _ => unreachable!("variable column with non-variable value"),
+            }
         }
     }
+
+    // End sentinel for the offset table.
+    let end_pos = offsets_start + off_slot * 2;
+    out[end_pos..end_pos + 2].copy_from_slice(&var_cursor.to_le_bytes());
 
     debug_assert_eq!(out.len(), total_size);
 }
