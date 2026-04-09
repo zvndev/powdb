@@ -3223,21 +3223,31 @@ fn eval_binop(left: &Value, op: BinOp, right: &Value) -> Value {
             _ => Value::Bool(false),
         },
         BinOp::Add => match (left, right) {
-            (Value::Int(a), Value::Int(b)) => Value::Int(a + b),
+            (Value::Int(a), Value::Int(b)) => Value::Int(a.saturating_add(*b)),
             (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
+            (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 + b),
+            (Value::Float(a), Value::Int(b)) => Value::Float(a + *b as f64),
             _ => Value::Empty,
         },
         BinOp::Sub => match (left, right) {
-            (Value::Int(a), Value::Int(b)) => Value::Int(a - b),
+            (Value::Int(a), Value::Int(b)) => Value::Int(a.saturating_sub(*b)),
             (Value::Float(a), Value::Float(b)) => Value::Float(a - b),
+            (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 - b),
+            (Value::Float(a), Value::Int(b)) => Value::Float(a - *b as f64),
             _ => Value::Empty,
         },
         BinOp::Mul => match (left, right) {
-            (Value::Int(a), Value::Int(b)) => Value::Int(a * b),
+            (Value::Int(a), Value::Int(b)) => Value::Int(a.saturating_mul(*b)),
+            (Value::Float(a), Value::Float(b)) => Value::Float(a * b),
+            (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 * b),
+            (Value::Float(a), Value::Int(b)) => Value::Float(a * *b as f64),
             _ => Value::Empty,
         },
         BinOp::Div => match (left, right) {
             (Value::Int(a), Value::Int(b)) if *b != 0 => Value::Int(a / b),
+            (Value::Float(a), Value::Float(b)) => Value::Float(a / b),
+            (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 / b),
+            (Value::Float(a), Value::Int(b)) => Value::Float(a / *b as f64),
             _ => Value::Empty,
         },
         BinOp::Like => match (left, right) {
@@ -5101,5 +5111,125 @@ mod tests {
         let rows = match result { QueryResult::Rows { rows, .. } => rows, _ => panic!() };
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Value::Int(30)); // only age=30 has count > 1
+    }
+
+    // ── Mixed-type arithmetic (Int <-> Float) regression tests ─────────
+
+    /// Engine with a Product type containing price:float + stock:int.
+    /// Exercises mixed numeric promotion in `eval_binop`.
+    fn product_mix_engine() -> Engine {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("powdb_product_mix_{}_{}", std::process::id(), id));
+        let mut engine = Engine::new(&dir).unwrap();
+        engine.execute_powql(
+            "type Product { required name: str, required price: float, required stock: int }"
+        ).unwrap();
+        engine.execute_powql(
+            r#"insert Product { name := "Apple",  price := 1.5, stock := 10 }"#
+        ).unwrap();
+        engine.execute_powql(
+            r#"insert Product { name := "Banana", price := 0.25, stock := 4 }"#
+        ).unwrap();
+        engine.execute_powql(
+            r#"insert Product { name := "Cherry", price := 2.0, stock := 3 }"#
+        ).unwrap();
+        engine
+    }
+
+    fn as_float(v: &Value) -> f64 {
+        match v {
+            Value::Float(f) => *f,
+            other => panic!("expected Float, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_arith_float_times_int() {
+        let mut engine = product_mix_engine();
+        let result = engine.execute_powql(
+            "Product { .name, total: .price * .stock }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["name", "total"]);
+                let mut by_name: std::collections::HashMap<String, f64> =
+                    std::collections::HashMap::new();
+                for row in &rows {
+                    let name = match &row[0] { Value::Str(s) => s.clone(), _ => panic!() };
+                    by_name.insert(name, as_float(&row[1]));
+                }
+                assert!((by_name["Apple"]  - 15.0).abs() < 1e-9);
+                assert!((by_name["Banana"] -  1.0).abs() < 1e-9);
+                assert!((by_name["Cherry"] -  6.0).abs() < 1e-9);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_arith_int_plus_float() {
+        let mut engine = product_mix_engine();
+        // stock:int + price:float → should promote to float
+        let result = engine.execute_powql(
+            "Product { .name, bumped: .stock + .price }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                let mut by_name: std::collections::HashMap<String, f64> =
+                    std::collections::HashMap::new();
+                for row in &rows {
+                    let name = match &row[0] { Value::Str(s) => s.clone(), _ => panic!() };
+                    by_name.insert(name, as_float(&row[1]));
+                }
+                assert!((by_name["Apple"]  - 11.5).abs() < 1e-9);
+                assert!((by_name["Banana"] -  4.25).abs() < 1e-9);
+                assert!((by_name["Cherry"] -  5.0).abs() < 1e-9);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_arith_float_div_int() {
+        let mut engine = product_mix_engine();
+        let result = engine.execute_powql(
+            "Product { .name, unit: .price / .stock }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                let mut by_name: std::collections::HashMap<String, f64> =
+                    std::collections::HashMap::new();
+                for row in &rows {
+                    let name = match &row[0] { Value::Str(s) => s.clone(), _ => panic!() };
+                    by_name.insert(name, as_float(&row[1]));
+                }
+                assert!((by_name["Apple"]  - 0.15).abs() < 1e-9);
+                assert!((by_name["Banana"] - 0.0625).abs() < 1e-9);
+                assert!((by_name["Cherry"] - (2.0 / 3.0)).abs() < 1e-9);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_arith_int_minus_float() {
+        let mut engine = product_mix_engine();
+        let result = engine.execute_powql(
+            "Product { .name, delta: .stock - .price }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                let mut by_name: std::collections::HashMap<String, f64> =
+                    std::collections::HashMap::new();
+                for row in &rows {
+                    let name = match &row[0] { Value::Str(s) => s.clone(), _ => panic!() };
+                    by_name.insert(name, as_float(&row[1]));
+                }
+                assert!((by_name["Apple"]  -  8.5).abs() < 1e-9);
+                assert!((by_name["Banana"] -  3.75).abs() < 1e-9);
+                assert!((by_name["Cherry"] -  1.0).abs() < 1e-9);
+            }
+            _ => panic!("expected rows"),
+        }
     }
 }
