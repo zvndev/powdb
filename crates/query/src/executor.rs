@@ -7,6 +7,7 @@ use crate::result::QueryResult;
 use powdb_storage::catalog::Catalog;
 use powdb_storage::row::{RowLayout, decode_column, decode_row};
 use powdb_storage::types::*;
+use powdb_storage::view::{ViewDef, ViewRegistry};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::io;
@@ -30,6 +31,10 @@ pub struct Engine {
     /// fresh `vec![Value::Empty; n_cols]` on every insert; recycling this
     /// buffer shaves one heap alloc per row on `insert_batch_1k`.
     insert_values_scratch: Vec<Value>,
+    /// Materialized view registry: tracks view definitions, dependencies,
+    /// and dirty state. Views are backed by regular catalog tables; this
+    /// registry adds the lifecycle metadata.
+    view_registry: ViewRegistry,
 }
 
 /// Mission C Phase 5: a pre-parsed, pre-planned query. The caller holds
@@ -150,10 +155,13 @@ impl Engine {
             }
             Err(e) => return Err(e),
         };
+        let view_registry = ViewRegistry::open(data_dir)
+            .unwrap_or_else(|_| ViewRegistry::new(data_dir));
         Ok(Engine {
             catalog,
             plan_cache: PlanCache::new(PLAN_CACHE_CAPACITY),
             insert_values_scratch: Vec::new(),
+            view_registry,
         })
     }
 
@@ -430,6 +438,10 @@ impl Engine {
         // the generic substitute-and-execute path below.
         if let Some(fast) = &prep.update_pk_fast {
             if let Some(result) = self.try_execute_update_pk_fast(fast, literals)? {
+                // Mark dependent views dirty for prepared update fast path.
+                if let PlanNode::Update { table, .. } = &prep.plan_template {
+                    self.view_registry.mark_dependents_dirty(table);
+                }
                 return Ok(result);
             }
         }
@@ -467,6 +479,10 @@ impl Engine {
             values.clear();
             self.insert_values_scratch = values;
             res?;
+            // Mark dependent views dirty for prepared insert fast path.
+            if let PlanNode::Insert { table, .. } = &prep.plan_template {
+                self.view_registry.mark_dependents_dirty(table);
+            }
             return Ok(QueryResult::Modified(1));
         }
 
@@ -654,6 +670,10 @@ impl Engine {
     pub fn execute_plan(&mut self, plan: &PlanNode) -> Result<QueryResult, String> {
         match plan {
             PlanNode::SeqScan { table } => {
+                // Auto-refresh dirty materialized views on read.
+                if self.view_registry.is_dirty(table) {
+                    self.refresh_view(table)?;
+                }
                 let schema = self.catalog.schema(table)
                     .ok_or_else(|| format!("table '{table}' not found"))?
                     .clone();
@@ -681,6 +701,10 @@ impl Engine {
                 // the columns it references, avoiding heap allocations for
                 // String/Bytes columns that aren't part of the filter.
                 if let PlanNode::SeqScan { table } = input.as_ref() {
+                    // Auto-refresh dirty materialized views.
+                    if self.view_registry.is_dirty(table) {
+                        self.refresh_view(table)?;
+                    }
                     let schema = self.catalog.schema(table)
                         .ok_or_else(|| format!("table '{table}' not found"))?
                         .clone();
@@ -1090,6 +1114,7 @@ impl Engine {
                     values
                 };
                 self.catalog.insert(table, &values).map_err(|e| e.to_string())?;
+                self.view_registry.mark_dependents_dirty(table);
                 Ok(QueryResult::Modified(1))
             }
 
@@ -1184,6 +1209,7 @@ impl Engine {
                             count += 1;
                         }
                     }
+                    self.view_registry.mark_dependents_dirty(table);
                     return Ok(QueryResult::Modified(count));
                 }
 
@@ -1252,6 +1278,7 @@ impl Engine {
                             .map_err(|e| e.to_string())?;
                         count += 1;
                     }
+                    self.view_registry.mark_dependents_dirty(table);
                     return Ok(QueryResult::Modified(count));
                 }
 
@@ -1269,6 +1296,7 @@ impl Engine {
                         .map_err(|e| e.to_string())?;
                     count += 1;
                 }
+                self.view_registry.mark_dependents_dirty(table);
                 Ok(QueryResult::Modified(count))
             }
 
@@ -1304,6 +1332,7 @@ impl Engine {
                                 let count = self.catalog
                                     .scan_delete_matching(table, |data| compiled(data))
                                     .map_err(|e| e.to_string())?;
+                                self.view_registry.mark_dependents_dirty(table);
                                 return Ok(QueryResult::Modified(count));
                             }
                         }
@@ -1315,6 +1344,7 @@ impl Engine {
                         let count = self.catalog
                             .scan_delete_matching(table, |_| true)
                             .map_err(|e| e.to_string())?;
+                        self.view_registry.mark_dependents_dirty(table);
                         return Ok(QueryResult::Modified(count));
                     }
                 }
@@ -1324,6 +1354,7 @@ impl Engine {
                     .catalog
                     .delete_many(table, &matching_rids)
                     .map_err(|e| e.to_string())?;
+                self.view_registry.mark_dependents_dirty(table);
                 Ok(QueryResult::Modified(count))
             }
 
@@ -1565,6 +1596,27 @@ impl Engine {
                 })
             }
 
+            PlanNode::CreateView { name, query_text } => {
+                self.create_view(name, query_text)?;
+                Ok(QueryResult::Executed {
+                    message: format!("materialized view '{name}' created"),
+                })
+            }
+
+            PlanNode::RefreshView { name } => {
+                self.refresh_view(name)?;
+                Ok(QueryResult::Executed {
+                    message: format!("materialized view '{name}' refreshed"),
+                })
+            }
+
+            PlanNode::DropView { name } => {
+                self.drop_view(name)?;
+                Ok(QueryResult::Executed {
+                    message: format!("materialized view '{name}' dropped"),
+                })
+            }
+
             PlanNode::IndexScan { table, column, key } => {
                 let schema = self.catalog.schema(table)
                     .ok_or_else(|| format!("table '{table}' not found"))?
@@ -1633,6 +1685,109 @@ impl Engine {
                     .collect();
                 Ok(QueryResult::Rows { columns, rows })
             }
+        }
+    }
+
+    // ─── Materialized view operations ──────────────────────────────────────
+
+    /// Create a materialized view: execute the source query, store results
+    /// in a new backing table, and register the view.
+    fn create_view(&mut self, name: &str, query_text: &str) -> Result<(), String> {
+        if self.view_registry.is_view(name) {
+            return Err(format!("materialized view '{name}' already exists"));
+        }
+        // Execute the source query to get the result set.
+        let result = self.execute_powql(query_text)?;
+        let (columns, rows) = match result {
+            QueryResult::Rows { columns, rows } => (columns, rows),
+            _ => return Err("view source query must be a SELECT".into()),
+        };
+        // Derive a schema for the backing table from the query result columns.
+        let schema = self.derive_view_schema(name, &columns, &rows);
+        // Create the backing table and insert the result rows.
+        self.catalog.create_table(schema).map_err(|e| e.to_string())?;
+        for row in &rows {
+            self.catalog.insert(name, row).map_err(|e| e.to_string())?;
+        }
+        // Determine which base tables this view depends on by parsing the query.
+        let depends_on = self.extract_view_deps(query_text);
+        self.view_registry.register(ViewDef {
+            name: name.to_string(),
+            query: query_text.to_string(),
+            depends_on,
+            dirty: false,
+        }).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Refresh a materialized view: re-execute its source query and replace
+    /// the backing table's contents.
+    fn refresh_view(&mut self, name: &str) -> Result<(), String> {
+        let def = self.view_registry.get(name)
+            .ok_or_else(|| format!("materialized view '{name}' not found"))?;
+        let query_text = def.query.clone();
+        // Execute the source query.
+        let result = self.execute_powql(&query_text)?;
+        let (_columns, rows) = match result {
+            QueryResult::Rows { columns, rows } => (columns, rows),
+            _ => return Err("view source query must be a SELECT".into()),
+        };
+        // Clear old data and insert fresh results.
+        self.catalog
+            .scan_delete_matching(name, |_| true)
+            .map_err(|e| e.to_string())?;
+        for row in &rows {
+            self.catalog.insert(name, row).map_err(|e| e.to_string())?;
+        }
+        self.view_registry.mark_clean(name);
+        Ok(())
+    }
+
+    /// Drop a materialized view: remove the backing table and unregister.
+    fn drop_view(&mut self, name: &str) -> Result<(), String> {
+        if !self.view_registry.is_view(name) {
+            return Err(format!("materialized view '{name}' not found"));
+        }
+        self.view_registry.unregister(name).map_err(|e| e.to_string())?;
+        self.catalog.drop_table(name).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Derive a storage `Schema` for a view's backing table from query
+    /// result column names and the first row's types.
+    fn derive_view_schema(&self, name: &str, columns: &[String], rows: &[Vec<Value>]) -> Schema {
+        use powdb_storage::types::{ColumnDef, TypeId};
+        let cols: Vec<ColumnDef> = columns.iter().enumerate().map(|(i, col_name)| {
+            let type_id = rows.first()
+                .and_then(|row| row.get(i))
+                .map(|v| v.type_id())
+                .unwrap_or(TypeId::Str);
+            ColumnDef {
+                name: col_name.clone(),
+                type_id,
+                required: false,
+                position: i as u16,
+            }
+        }).collect();
+        Schema {
+            table_name: name.to_string(),
+            columns: cols,
+        }
+    }
+
+    /// Extract base table dependencies from a view's source query by
+    /// parsing it and collecting the source table name.
+    fn extract_view_deps(&self, query_text: &str) -> Vec<String> {
+        use crate::parser::parse;
+        match parse(query_text) {
+            Ok(Statement::Query(q)) => {
+                let mut deps = vec![q.source.clone()];
+                for j in &q.joins {
+                    deps.push(j.source.clone());
+                }
+                deps
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -4482,5 +4637,167 @@ mod tests {
             }
             _ => panic!("expected rows"),
         }
+    }
+
+    // ─── Materialized view tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_create_materialized_view() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql(
+            r#"materialize OldUsers as User filter .age > 28"#,
+        ).unwrap();
+        match result {
+            QueryResult::Executed { message } => {
+                assert!(message.contains("OldUsers"));
+            }
+            _ => panic!("expected Executed"),
+        }
+        // Query the view like a table.
+        let result = engine.execute_powql("OldUsers").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2); // Alice (30) and Charlie (35)
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_view_auto_refresh_on_insert() {
+        let mut engine = test_engine();
+        engine.execute_powql(r#"materialize OldUsers as User filter .age > 28"#).unwrap();
+        // Insert a new qualifying row.
+        engine.execute_powql(r#"insert User { name := "Dave", email := "dave@ex.com", age := 40 }"#).unwrap();
+        // The view should auto-refresh and include Dave.
+        let result = engine.execute_powql("OldUsers").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3); // Alice, Charlie, Dave
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_view_auto_refresh_on_delete() {
+        let mut engine = test_engine();
+        engine.execute_powql(r#"materialize OldUsers as User filter .age > 28"#).unwrap();
+        // Delete Alice (age 30) from the base table.
+        engine.execute_powql(r#"User filter .name = "Alice" delete"#).unwrap();
+        // View should auto-refresh: only Charlie remains.
+        let result = engine.execute_powql("OldUsers").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_view_auto_refresh_on_update() {
+        let mut engine = test_engine();
+        engine.execute_powql(r#"materialize OldUsers as User filter .age > 28"#).unwrap();
+        // Update Bob's age to make him qualify.
+        engine.execute_powql(r#"User filter .name = "Bob" update { age := 50 }"#).unwrap();
+        let result = engine.execute_powql("OldUsers").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3); // Alice, Charlie, Bob
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_explicit_refresh() {
+        let mut engine = test_engine();
+        engine.execute_powql(r#"materialize OldUsers as User filter .age > 28"#).unwrap();
+        engine.execute_powql(r#"insert User { name := "Eve", email := "eve@ex.com", age := 55 }"#).unwrap();
+        // Explicit refresh.
+        let result = engine.execute_powql("refresh OldUsers").unwrap();
+        match result {
+            QueryResult::Executed { message } => {
+                assert!(message.contains("refreshed"));
+            }
+            _ => panic!("expected Executed"),
+        }
+        // Now query — should include Eve.
+        let result = engine.execute_powql("OldUsers").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_drop_view() {
+        let mut engine = test_engine();
+        engine.execute_powql(r#"materialize OldUsers as User filter .age > 28"#).unwrap();
+        let result = engine.execute_powql("drop view OldUsers").unwrap();
+        match result {
+            QueryResult::Executed { message } => {
+                assert!(message.contains("dropped"));
+            }
+            _ => panic!("expected Executed"),
+        }
+        // Querying the dropped view should fail.
+        let err = engine.execute_powql("OldUsers").unwrap_err();
+        assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn test_view_with_projection() {
+        let mut engine = test_engine();
+        engine.execute_powql(
+            r#"materialize UserNames as User { .name }"#,
+        ).unwrap();
+        let result = engine.execute_powql("UserNames").unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["name".to_string()]);
+                assert_eq!(rows.len(), 3);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_view_no_stale_reads() {
+        let mut engine = test_engine();
+        engine.execute_powql(r#"materialize AllUsers as User"#).unwrap();
+        // Verify initial state.
+        let result = engine.execute_powql("AllUsers").unwrap();
+        match &result {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 3),
+            _ => panic!("expected rows"),
+        }
+        // Insert two more.
+        engine.execute_powql(r#"insert User { name := "D", email := "d@ex.com", age := 1 }"#).unwrap();
+        engine.execute_powql(r#"insert User { name := "E", email := "e@ex.com", age := 2 }"#).unwrap();
+        // First insert marks dirty, second stays dirty. Auto-refresh fires on read.
+        let result = engine.execute_powql("AllUsers").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 5),
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_duplicate_view_creation_fails() {
+        let mut engine = test_engine();
+        engine.execute_powql(r#"materialize V as User"#).unwrap();
+        let err = engine.execute_powql(r#"materialize V as User"#).unwrap_err();
+        assert!(err.contains("already exists"));
+    }
+
+    #[test]
+    fn test_drop_nonexistent_view_fails() {
+        let mut engine = test_engine();
+        let err = engine.execute_powql("drop view NoSuchView").unwrap_err();
+        assert!(err.contains("not found"));
     }
 }

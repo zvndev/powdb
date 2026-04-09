@@ -189,6 +189,9 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
             substitute_plan(input, literals, idx);
         }
         PlanNode::CreateTable { .. } => {}
+        PlanNode::CreateView { .. } => {}
+        PlanNode::RefreshView { .. } => {}
+        PlanNode::DropView { .. } => {}
     }
 }
 
@@ -267,6 +270,9 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
         PlanNode::CreateTable { .. } => {}
         PlanNode::AlterTable { .. } => {}
         PlanNode::DropTable { .. } => {}
+        PlanNode::CreateView { .. } => {}
+        PlanNode::RefreshView { .. } => {}
+        PlanNode::DropView { .. } => {}
     }
 }
 
@@ -543,6 +549,9 @@ mod tests {
             PlanNode::CreateTable { .. } => {}
             PlanNode::AlterTable { .. } => {}
             PlanNode::DropTable { .. } => {}
+            PlanNode::CreateView { .. } => {}
+            PlanNode::RefreshView { .. } => {}
+            PlanNode::DropView { .. } => {}
         }
     }
 

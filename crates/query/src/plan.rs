@@ -49,6 +49,12 @@ pub enum PlanNode {
     Update { input: Box<PlanNode>, table: String, assignments: Vec<Assignment> },
     Delete { input: Box<PlanNode>, table: String },
     CreateTable { name: String, fields: Vec<(String, String, bool)> },
+    /// Create a materialized view: execute query, store results, register.
+    CreateView { name: String, query_text: String },
+    /// Explicitly refresh a materialized view.
+    RefreshView { name: String },
+    /// Drop a materialized view (backing table + registry entry).
+    DropView { name: String },
 }
 
 #[derive(Debug, Clone)]

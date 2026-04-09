@@ -8,6 +8,9 @@ pub enum Statement {
     CreateType(CreateTypeExpr),
     AlterTable(AlterTableExpr),
     DropTable(DropTableExpr),
+    CreateView(CreateViewExpr),
+    RefreshView(RefreshViewExpr),
+    DropView(DropViewExpr),
 }
 
 /// `alter User add column status: str` / `alter User drop column status`
@@ -28,6 +31,27 @@ pub enum AlterAction {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropTableExpr {
     pub table: String,
+}
+
+/// `create [materialized] view ActiveUsers as User filter .active = true`
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateViewExpr {
+    pub name: String,
+    pub query: QueryExpr,
+    /// The original source query text, stored for re-execution on refresh.
+    pub query_text: String,
+}
+
+/// `refresh ActiveUsers`
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefreshViewExpr {
+    pub name: String,
+}
+
+/// `drop view ActiveUsers`
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropViewExpr {
+    pub name: String,
 }
 
 /// A query expression: Type [join ...]* [filter ...] [order ...] [limit ...] [{ projection }]

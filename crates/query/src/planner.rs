@@ -27,6 +27,12 @@ pub fn plan_statement(stmt: Statement) -> Result<PlanNode, PlanError> {
         Statement::CreateType(ct) => plan_create_type(ct),
         Statement::AlterTable(at) => Ok(PlanNode::AlterTable { table: at.table, action: at.action }),
         Statement::DropTable(dt) => Ok(PlanNode::DropTable { name: dt.table }),
+        Statement::CreateView(cv) => Ok(PlanNode::CreateView {
+            name: cv.name,
+            query_text: cv.query_text,
+        }),
+        Statement::RefreshView(rv) => Ok(PlanNode::RefreshView { name: rv.name }),
+        Statement::DropView(dv) => Ok(PlanNode::DropView { name: dv.name }),
     }
 }
 

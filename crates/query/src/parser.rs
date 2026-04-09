@@ -43,7 +43,9 @@ impl Parser {
             Token::Insert => self.parse_insert(),
             Token::Type => self.parse_create_type(),
             Token::Alter => self.parse_alter_table(),
-            Token::Drop => self.parse_drop_table(),
+            Token::Drop => self.parse_drop_or_drop_view(),
+            Token::Materialized => self.parse_create_view(),
+            Token::Refresh => self.parse_refresh_view(),
             Token::Count | Token::Avg | Token::Sum | Token::Min | Token::Max => {
                 self.parse_aggregate_query()
             }
@@ -873,14 +875,55 @@ impl Parser {
         }
     }
 
-    /// `drop <Table>`
-    fn parse_drop_table(&mut self) -> Result<Statement, ParseError> {
+    /// `drop <Table>` or `drop view <ViewName>`
+    fn parse_drop_or_drop_view(&mut self) -> Result<Statement, ParseError> {
         self.expect(&Token::Drop)?;
+        if *self.peek() == Token::View {
+            self.advance(); // consume `view`
+            let name = match self.advance() {
+                Token::Ident(name) => name,
+                t => return Err(ParseError { message: format!("expected view name after drop view, got {t:?}") }),
+            };
+            return Ok(Statement::DropView(DropViewExpr { name }));
+        }
         let table = match self.advance() {
             Token::Ident(name) => name,
             t => return Err(ParseError { message: format!("expected table name after drop, got {t:?}") }),
         };
         Ok(Statement::DropTable(DropTableExpr { table }))
+    }
+
+    /// `materialize <ViewName> as <Query>`
+    ///
+    /// The source query text is captured by slicing the original token stream
+    /// from the position after `as` to the end.
+    fn parse_create_view(&mut self) -> Result<Statement, ParseError> {
+        self.expect(&Token::Materialized)?;
+        let name = match self.advance() {
+            Token::Ident(name) => name,
+            t => return Err(ParseError { message: format!("expected view name after materialize, got {t:?}") }),
+        };
+        self.expect(&Token::As)?;
+        // Record position so we can reconstruct the query text for storage.
+        let query_start = self.pos;
+        let source = match self.advance() {
+            Token::Ident(s) => s,
+            t => return Err(ParseError { message: format!("expected source table name, got {t:?}") }),
+        };
+        let query = self.parse_query_tail(source)?;
+        // Reconstruct query text from tokens for storage and re-execution.
+        let query_text = tokens_to_text(&self.tokens[query_start..self.pos]);
+        Ok(Statement::CreateView(CreateViewExpr { name, query, query_text }))
+    }
+
+    /// `refresh <ViewName>`
+    fn parse_refresh_view(&mut self) -> Result<Statement, ParseError> {
+        self.expect(&Token::Refresh)?;
+        let name = match self.advance() {
+            Token::Ident(name) => name,
+            t => return Err(ParseError { message: format!("expected view name after refresh, got {t:?}") }),
+        };
+        Ok(Statement::RefreshView(RefreshViewExpr { name }))
     }
 
     fn parse_create_type(&mut self) -> Result<Statement, ParseError> {
@@ -915,6 +958,112 @@ impl Parser {
         self.expect(&Token::RBrace)?;
         Ok(Statement::CreateType(CreateTypeExpr { name, fields }))
     }
+}
+
+/// Reconstruct PowQL source text from a slice of tokens. Used to store the
+/// view's source query for re-execution on refresh. Not perfectly
+/// round-trippable (whitespace is normalised) but semantically identical.
+fn tokens_to_text(tokens: &[Token]) -> String {
+    let mut out = String::with_capacity(64);
+    for tok in tokens {
+        if !out.is_empty() && !matches!(tok, Token::Eof) {
+            out.push(' ');
+        }
+        match tok {
+            Token::Ident(s) => out.push_str(s),
+            Token::DotIdent(s) => { out.push('.'); out.push_str(s); }
+            Token::IntLit(v) => out.push_str(&v.to_string()),
+            Token::FloatLit(v) => out.push_str(&v.to_string()),
+            Token::StringLit(s) => { out.push('"'); out.push_str(s); out.push('"'); }
+            Token::BoolLit(v) => out.push_str(if *v { "true" } else { "false" }),
+            Token::Param(s) => { out.push('$'); out.push_str(s); }
+            Token::Type => out.push_str("type"),
+            Token::Filter => out.push_str("filter"),
+            Token::Order => out.push_str("order"),
+            Token::Limit => out.push_str("limit"),
+            Token::Offset => out.push_str("offset"),
+            Token::Insert => out.push_str("insert"),
+            Token::Update => out.push_str("update"),
+            Token::Delete => out.push_str("delete"),
+            Token::Upsert => out.push_str("upsert"),
+            Token::Select => out.push_str("select"),
+            Token::Required => out.push_str("required"),
+            Token::Multi => out.push_str("multi"),
+            Token::Link => out.push_str("link"),
+            Token::Index => out.push_str("index"),
+            Token::On => out.push_str("on"),
+            Token::Asc => out.push_str("asc"),
+            Token::Desc => out.push_str("desc"),
+            Token::And => out.push_str("and"),
+            Token::Or => out.push_str("or"),
+            Token::Not => out.push_str("not"),
+            Token::Exists => out.push_str("exists"),
+            Token::Let => out.push_str("let"),
+            Token::As => out.push_str("as"),
+            Token::Match => out.push_str("match"),
+            Token::Group => out.push_str("group"),
+            Token::Join => out.push_str("join"),
+            Token::Inner => out.push_str("inner"),
+            Token::LeftKw => out.push_str("left"),
+            Token::RightKw => out.push_str("right"),
+            Token::Outer => out.push_str("outer"),
+            Token::Cross => out.push_str("cross"),
+            Token::Transaction => out.push_str("transaction"),
+            Token::View => out.push_str("view"),
+            Token::Materialized => out.push_str("materialized"),
+            Token::Refresh => out.push_str("refresh"),
+            Token::Having => out.push_str("having"),
+            Token::Distinct => out.push_str("distinct"),
+            Token::In => out.push_str("in"),
+            Token::Between => out.push_str("between"),
+            Token::Like => out.push_str("like"),
+            Token::Count => out.push_str("count"),
+            Token::Avg => out.push_str("avg"),
+            Token::Sum => out.push_str("sum"),
+            Token::Min => out.push_str("min"),
+            Token::Max => out.push_str("max"),
+            Token::Is => out.push_str("is"),
+            Token::Null => out.push_str("null"),
+            Token::Upper => out.push_str("upper"),
+            Token::Lower => out.push_str("lower"),
+            Token::Length => out.push_str("length"),
+            Token::Trim => out.push_str("trim"),
+            Token::Substring => out.push_str("substring"),
+            Token::Concat => out.push_str("concat"),
+            Token::Case => out.push_str("case"),
+            Token::When => out.push_str("when"),
+            Token::Then => out.push_str("then"),
+            Token::Else => out.push_str("else"),
+            Token::End => out.push_str("end"),
+            Token::Alter => out.push_str("alter"),
+            Token::Drop => out.push_str("drop"),
+            Token::Add => out.push_str("add"),
+            Token::Column => out.push_str("column"),
+            Token::Eq => out.push('='),
+            Token::Neq => out.push_str("!="),
+            Token::Lt => out.push('<'),
+            Token::Gt => out.push('>'),
+            Token::Lte => out.push_str("<="),
+            Token::Gte => out.push_str(">="),
+            Token::Assign => out.push_str(":="),
+            Token::Arrow => out.push_str("->"),
+            Token::Pipe => out.push('|'),
+            Token::Coalesce => out.push_str("??"),
+            Token::Plus => out.push('+'),
+            Token::Minus => out.push('-'),
+            Token::Star => out.push('*'),
+            Token::Slash => out.push('/'),
+            Token::LBrace => out.push('{'),
+            Token::RBrace => out.push('}'),
+            Token::LParen => out.push('('),
+            Token::RParen => out.push(')'),
+            Token::Comma => out.push(','),
+            Token::Colon => out.push(':'),
+            Token::Dot => out.push('.'),
+            Token::Eof => {}
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1866,6 +2015,67 @@ mod tests {
                 }
             }
             _ => panic!("expected query"),
+        }
+    }
+
+    // ---- Materialized view parser tests ------------------------------------
+
+    #[test]
+    fn test_parse_create_view() {
+        let stmt = parse("materialize OldUsers as User filter .age > 28").unwrap();
+        match stmt {
+            Statement::CreateView(cv) => {
+                assert_eq!(cv.name, "OldUsers");
+                assert_eq!(cv.query.source, "User");
+                assert!(cv.query.filter.is_some());
+                assert!(!cv.query_text.is_empty());
+            }
+            _ => panic!("expected CreateView"),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_view_with_projection() {
+        let stmt = parse("materialize UserNames as User { .name }").unwrap();
+        match stmt {
+            Statement::CreateView(cv) => {
+                assert_eq!(cv.name, "UserNames");
+                assert!(cv.query.projection.is_some());
+            }
+            _ => panic!("expected CreateView"),
+        }
+    }
+
+    #[test]
+    fn test_parse_refresh_view() {
+        let stmt = parse("refresh OldUsers").unwrap();
+        match stmt {
+            Statement::RefreshView(rv) => {
+                assert_eq!(rv.name, "OldUsers");
+            }
+            _ => panic!("expected RefreshView"),
+        }
+    }
+
+    #[test]
+    fn test_parse_drop_view() {
+        let stmt = parse("drop view OldUsers").unwrap();
+        match stmt {
+            Statement::DropView(dv) => {
+                assert_eq!(dv.name, "OldUsers");
+            }
+            _ => panic!("expected DropView"),
+        }
+    }
+
+    #[test]
+    fn test_parse_drop_table_still_works() {
+        let stmt = parse("drop Users").unwrap();
+        match stmt {
+            Statement::DropTable(dt) => {
+                assert_eq!(dt.table, "Users");
+            }
+            _ => panic!("expected DropTable"),
         }
     }
 }

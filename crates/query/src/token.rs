@@ -44,6 +44,7 @@ pub enum Token {
     Transaction,// transaction
     View,       // view
     Materialized,// materialized
+    Refresh,    // refresh
     Having,     // having
     Distinct,   // distinct
     In,         // in

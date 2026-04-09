@@ -172,6 +172,7 @@ fn hash_token(h: u64, tok: &Token, literals: &mut Vec<Literal>) -> u64 {
         Token::Drop         => hash_byte(h, 0x5C),
         Token::Add          => hash_byte(h, 0x5D),
         Token::Column       => hash_byte(h, 0x5E),
+        Token::Refresh      => hash_byte(h, 0x5F),
 
         // Operators.
         Token::Eq       => hash_byte(h, 0x40),
