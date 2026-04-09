@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "updated": "2026-04-07",
+  "updated": "2026-04-09",
   "_README": [
     "This file is HAND-EDITED ONLY. No script writes to it.",
     "Each ratio enforces a structural property of PowDB that should not silently degrade.",
@@ -11,33 +11,33 @@
     "powql_point_over_btree_lookup": {
       "numerator": "powql_point",
       "denominator": "btree_lookup",
-      "ceiling": 2.5,
-      "observed_at_last_edit": 2.055,
-      "meaning": "Full PowQL parser+planner+executor overhead over the raw B-tree probe. This is THE thesis metric. First captured from GHA run 24065496323 on ubuntu-24.04: 3764ns / 1832ns = 2.055x. Ceiling 2.5 leaves ~22% headroom for incidental overhead but not enough to hide a planner regression that un-folds .field=literal into SeqScan+Filter. Smoke bench on M1 measured this same ratio at 1.897-2.14x — the ratio is hardware-stable."
+      "ceiling": 6.0,
+      "observed_at_last_edit": 5.004,
+      "meaning": "Full PowQL parser+planner+executor overhead over the raw B-tree probe. This was originally a 2.5x ceiling (2.055x observed) when btree_lookup was 1832ns. Mission D + LTO dropped btree_lookup to 262ns (-85.68%) while powql_point only dropped to 1311ns (-65% from an implied pre-Mission-D ~3764ns). The DENOMINATOR shrank faster than the numerator — the absolute parser/planner overhead (~1049ns) is structurally unchanged; the ratio rose mechanically. Ceiling raised 2.5 -> 6.0 to reflect the new hardware-level numbers. If parser/planner overhead grows beyond ~1.6μs this ratio will cross 6x and re-trip. Tightening further requires either a plan cache hit that short-circuits the parser (future Mission) or re-targeting the thesis at absolute ns instead of a ratio."
     },
 
     "scan_filter_count_over_btree_lookup": {
       "numerator": "powql_aggregation",
       "denominator": "btree_lookup",
-      "ceiling": 8000.0,
-      "observed_at_last_edit": 400.1,
-      "meaning": "Sanity ceiling: a count-filter aggregate over 100K rows vs a single B-tree probe. A healthy compiled predicate + raw-bytes walker puts this ratio in the low hundreds (M1 local captured 400.1x; GHA is in similar territory). Ceiling 8000 catches a regression that drops the compiled predicate or re-materialises per-row Vec<Value>. Tighten in a follow-up rebaseline once CI confirms the number on ubuntu-24.04."
+      "ceiling": 2500.0,
+      "observed_at_last_edit": 2079.734,
+      "meaning": "Sanity ceiling: a count-filter aggregate over 100K rows vs a single B-tree probe. Previous ceiling was 8000 (pre-CI-capture). Post-Mission-D10 on ubuntu-24.04: 545729ns / 262ns = 2079.734x. Tightened 8000 -> 2500 to reflect reality with ~20% headroom. A regression here almost certainly means the compiled predicate or raw-bytes walker got un-wired."
     },
 
     "update_by_pk_over_powql_point": {
       "numerator": "update_by_pk",
       "denominator": "powql_point",
-      "ceiling": 15000.0,
-      "observed_at_last_edit": 9130.1,
-      "meaning": "After FASTPATH's Update(IndexScan) fold lands, an indexed update should be within 4x of an indexed read. The pre-FASTPATH generic path is O(N) per update (full re-scan to match RIDs by value equality), so the current observed ratio is ~9130x on M1 against a 100K-row fixture. Ceiling 15000 keeps CI green pre-FASTPATH; the rebaseline commit that lands the Update(IndexScan) fold MUST also tighten this ceiling to 4.0 per the plan. This ratio is explicitly a 'thesis-tripwire' not an absolute guard — it measures the structural relationship, not the absolute number."
+      "ceiling": 2.0,
+      "observed_at_last_edit": 1.218,
+      "meaning": "An indexed update should be within a small multiple of an indexed read. Previous ceiling was 15000 (pre-FASTPATH, when update_by_pk was an O(N) full-rescan). Mission C Phase 14 (update_pk prepared fast path) landed the Update(IndexScan) fold and collapsed the ratio from ~9130x to 1.218x (1596ns / 1311ns). Tightened 15000 -> 2.0 to lock in the structural win — any future regression that loses the Update(IndexScan) fold will blow past this instantly."
     },
 
     "insert_single_over_btree_lookup": {
       "numerator": "insert_single",
       "denominator": "btree_lookup",
-      "ceiling": 10.0,
-      "observed_at_last_edit": 5.51,
-      "meaning": "Insert hot path should stay within a small multiple of a B-tree probe. M1 local captured 5.51x (8248 ns / 1497 ns). Ceiling 10.0 is first-capture-safe; after the first CI run populates the ubuntu-24.04 baseline the integrator tightens this to match the observed number + ~20% headroom. The goal is to catch regressions in the parse+plan+exec cost of the insert hot path, not to pin an absolute nanosecond figure."
+      "ceiling": 12.0,
+      "observed_at_last_edit": 10.871,
+      "meaning": "Insert hot path should stay within a small multiple of a B-tree probe. Previous ceiling was 10.0 (5.51x observed on M1). On ubuntu-24.04 post-Mission-D: 2853ns / 262ns = 10.871x. Same dynamic as powql_point_over_btree_lookup — btree_lookup shrank faster than insert_single, so the ratio crept up despite insert_single itself improving in absolute terms (pre-Mission-C insert_single was ~8248ns on M1). Relaxed 10.0 -> 12.0 to leave ~10% headroom above the current 10.871x. The goal remains catching parse+plan+exec regressions in the insert hot path, not pinning absolute nanoseconds."
     }
   }
 }
