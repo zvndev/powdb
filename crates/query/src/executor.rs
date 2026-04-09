@@ -4768,6 +4768,116 @@ mod tests {
     }
 
     #[test]
+    fn test_alter_add_column_reads_old_rows() {
+        // Regression: before the catalog rewrite path existed, rows
+        // inserted before `alter ... add column` were left on disk
+        // with the pre-alter variable-offset-table layout. A bare
+        // `Type` scan then walked `decode_row` which read
+        // `n_var + 1` offsets using the NEW schema and panicked with
+        // "range end index X out of range for slice of length Y".
+        //
+        // This test reproduces that exactly: insert, alter, bare scan.
+        // Any panic or wrong row count means the rewrite regressed.
+        let mut engine = test_engine();
+        engine
+            .execute_powql("alter User add column country: str")
+            .unwrap();
+        // Bare scan: NO filter, so the planner cannot skip old rows.
+        let result = engine.execute_powql("User").unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert!(columns.contains(&"country".to_string()));
+                assert_eq!(rows.len(), 3, "three old rows must still be readable");
+                let country_idx = columns
+                    .iter()
+                    .position(|c| c == "country")
+                    .expect("country column");
+                for row in &rows {
+                    assert_eq!(
+                        row[country_idx],
+                        Value::Empty,
+                        "backfilled column must be Empty"
+                    );
+                }
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_alter_add_required_column_fails() {
+        // Adding a required column to a non-empty table has no
+        // default value to backfill with, so storing `Empty` would
+        // silently violate the required invariant. The catalog must
+        // reject it.
+        let mut engine = test_engine();
+        let err = engine
+            .execute_powql("alter User add column required country: str")
+            .expect_err("required-column add on non-empty table must fail");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("required") || msg.contains("backfill"),
+            "error should mention required/backfill, got: {err}"
+        );
+        // And the schema must NOT have silently gained the column.
+        let result = engine.execute_powql("User").unwrap();
+        if let QueryResult::Rows { columns, .. } = result {
+            assert!(
+                !columns.contains(&"country".to_string()),
+                "failed alter must not mutate the schema"
+            );
+        }
+    }
+
+    #[test]
+    fn test_alter_add_column_then_update_old_row() {
+        // Regression-plus: after the rewrite path backfills Empty, an
+        // UPDATE against an old row's new column must round-trip.
+        // This exercises encode/decode with the new schema shape on a
+        // row that was originally written with the old shape.
+        let mut engine = test_engine();
+        engine
+            .execute_powql("alter User add column country: str")
+            .unwrap();
+        engine
+            .execute_powql(r#"User filter .name = "Alice" update { country := "US" }"#)
+            .unwrap();
+
+        let result = engine
+            .execute_powql(r#"User filter .name = "Alice" { .name, .country }"#)
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Str("Alice".into()));
+                assert_eq!(rows[0][1], Value::Str("US".into()));
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+
+        // The other two rows should still decode cleanly with Empty.
+        let result = engine.execute_powql("User").unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(rows.len(), 3);
+                let country_idx = columns
+                    .iter()
+                    .position(|c| c == "country")
+                    .expect("country column");
+                let empties = rows
+                    .iter()
+                    .filter(|r| r[country_idx] == Value::Empty)
+                    .count();
+                assert_eq!(
+                    empties, 2,
+                    "two unchanged old rows must still read as Empty"
+                );
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_alter_drop_column() {
         let mut engine = test_engine();
         engine.execute_powql("alter User drop column email").unwrap();
