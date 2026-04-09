@@ -1131,34 +1131,40 @@ impl Engine {
             PlanNode::Update { input, table, assignments } => {
                 // Mission C Phase 3: resolve assignments against a borrowed
                 // schema, then drop the borrow before the mutation loop.
-                // `collect_rids_for_mutation` now looks up schema internally
-                // so we avoid cloning it at all on this hot path.
-                let resolved_assignments: Vec<(usize, Value)> = {
+                // Try literal-only path first; fall back to per-row expression
+                // evaluation if any assignment contains a non-literal expression
+                // (e.g., `age := .age + 1`).
+                let (col_indices, literal_vals): (Vec<usize>, Option<Vec<Value>>) = {
                     let schema_ref = self.catalog.schema(table)
                         .ok_or_else(|| format!("table '{table}' not found"))?;
-                    assignments.iter()
-                        .map(|a| {
-                            let idx = schema_ref.column_index(&a.field)
-                                .ok_or_else(|| format!("column '{}' not found", a.field))?;
-                            let val = literal_to_value(&a.value)?;
-                            Ok::<_, String>((idx, val))
-                        })
-                        .collect::<Result<_, _>>()?
+                    let indices: Vec<usize> = assignments.iter()
+                        .map(|a| schema_ref.column_index(&a.field)
+                            .ok_or_else(|| format!("column '{}' not found", a.field)))
+                        .collect::<Result<_, _>>()?;
+                    let vals: Result<Vec<Value>, _> = assignments.iter()
+                        .map(|a| literal_to_value(&a.value))
+                        .collect();
+                    (indices, vals.ok())
                 };
+                let resolved_assignments: Option<Vec<(usize, Value)>> = literal_vals.map(|vals|
+                    col_indices.iter().copied().zip(vals).collect()
+                );
 
                 // Mission C Phase 2: the hint Table::update_hinted needs to
                 // decide whether to read the old row for index diff.
-                let changed_cols: Vec<usize> =
-                    resolved_assignments.iter().map(|(i, _)| *i).collect();
+                let changed_cols: Vec<usize> = col_indices.clone();
+
+                // Collect matching RowIds in a single pass.
+                let matching_rids = self.collect_rids_for_mutation(input, table)?;
+
+                // ── Literal-only fast paths ─────────────────────────────
+                if let Some(ref resolved_assignments) = resolved_assignments {
 
                 // Mission C Phase 4: in-place byte-patch fast path. If every
                 // assignment targets a fixed-size non-null column AND none of
                 // them is indexed, we can skip decode_row / Vec<Value> /
                 // encode_row_into entirely and patch the row's raw bytes on
-                // the hot page. For `update_by_pk age := N` on a 6-col User
-                // row this drops ~700ns of per-row work down to a handful of
-                // copies. Precomputed patch metadata is reused across every
-                // matching rid.
+                // the hot page.
                 let fast_patch: Option<Vec<FastPatch>> = {
                     let tbl = self.catalog.get_table(table)
                         .ok_or_else(|| format!("table '{table}' not found"))?;
@@ -1197,18 +1203,11 @@ impl Engine {
                     }
                 };
 
-                // Collect matching RowIds in a single pass (fixes the old
-                // O(N*M) value-equality join against a materialised row set).
-                let matching_rids = self.collect_rids_for_mutation(input, table)?;
-
                 if let Some(patches) = fast_patch {
                     let mut count = 0u64;
                     for rid in matching_rids {
                         let ok = self.catalog.with_row_bytes_mut(table, rid, |row| {
                             for p in &patches {
-                                // Idempotent null-bit clear — safe even when
-                                // the column was already non-null, which is
-                                // the overwhelmingly common case.
                                 row[p.bitmap_byte_off] &= !p.bit_mask;
                                 let field_bytes = p.bytes.as_slice();
                                 row[p.field_off..p.field_off + field_bytes.len()]
@@ -1224,14 +1223,6 @@ impl Engine {
                 }
 
                 // Mission C Phase 10: var-column in-place shrink fast path.
-                // If the update is a single assignment targeting a var-length
-                // Str/Bytes column that isn't indexed, try to patch the row's
-                // raw bytes directly via `patch_var_col_in_place`. The helper
-                // returns false when the new value would grow the row — those
-                // rids get collected and processed by the generic slow path
-                // below. For `update_by_filter status := "senior"` on the
-                // Mission A bench every row either matches (6→6) or shrinks
-                // (7→6, 8→6), so the fast path claims ~100% of rows.
                 let var_fast: Option<(usize, Option<Vec<u8>>)> = {
                     let tbl = self.catalog.get_table(table)
                         .ok_or_else(|| format!("table '{table}' not found"))?;
@@ -1273,14 +1264,12 @@ impl Engine {
                             fallback_rids.push(*rid);
                         }
                     }
-                    // Handle rids that needed to grow (or have been
-                    // concurrently deleted — cheap extra `get` call).
                     for rid in fallback_rids {
                         let mut row = match self.catalog.get(table, rid) {
                             Some(r) => r,
                             None => continue,
                         };
-                        for (idx, val) in &resolved_assignments {
+                        for (idx, val) in resolved_assignments.iter() {
                             row[*idx] = val.clone();
                         }
                         self.catalog
@@ -1292,14 +1281,43 @@ impl Engine {
                     return Ok(QueryResult::Modified(count));
                 }
 
+                // Generic literal path: decode row, apply literal values.
                 let mut count = 0u64;
                 for rid in matching_rids {
                     let mut row = match self.catalog.get(table, rid) {
                         Some(r) => r,
-                        None => continue, // concurrently gone
+                        None => continue,
                     };
-                    for (idx, val) in &resolved_assignments {
+                    for (idx, val) in resolved_assignments.iter() {
                         row[*idx] = val.clone();
+                    }
+                    self.catalog
+                        .update_hinted(table, rid, &row, Some(&changed_cols))
+                        .map_err(|e| e.to_string())?;
+                    count += 1;
+                }
+                self.view_registry.mark_dependents_dirty(table);
+                return Ok(QueryResult::Modified(count));
+
+                } // end if let Some(resolved_assignments)
+
+                // ── Expression-based update path ────────────────────────
+                // At least one assignment contains a non-literal expression
+                // (e.g., `age := .age + 1`). Evaluate per-row.
+                let col_names: Vec<String> = {
+                    let schema_ref = self.catalog.schema(table)
+                        .ok_or_else(|| format!("table '{table}' not found"))?;
+                    schema_ref.columns.iter().map(|c| c.name.clone()).collect()
+                };
+                let mut count = 0u64;
+                for rid in matching_rids {
+                    let mut row = match self.catalog.get(table, rid) {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    for (i, asgn) in assignments.iter().enumerate() {
+                        let val = eval_expr(&asgn.value, &row, &col_names);
+                        row[col_indices[i]] = val;
                     }
                     self.catalog
                         .update_hinted(table, rid, &row, Some(&changed_cols))
@@ -4991,5 +5009,57 @@ mod tests {
             }
             _ => panic!("expected scalar int"),
         }
+    }
+
+    // ── UPDATE with expressions tests ──────────────────────────
+
+    #[test]
+    fn test_update_with_arithmetic_expression() {
+        let mut engine = test_engine();
+        // Alice starts at age 30
+        engine.execute_powql(
+            r#"User filter .name = "Alice" update { age := .age + 5 }"#
+        ).unwrap();
+        let result = engine.execute_powql(r#"User filter .name = "Alice""#).unwrap();
+        let rows = match result { QueryResult::Rows { rows, .. } => rows, _ => panic!() };
+        assert_eq!(rows[0][2], Value::Int(35)); // 30 + 5 = 35
+    }
+
+    #[test]
+    fn test_update_with_multiply_expression() {
+        let mut engine = test_engine();
+        // Double everyone's age
+        engine.execute_powql("User update { age := .age * 2 }").unwrap();
+        let result = engine.execute_powql("User").unwrap();
+        let rows = match result { QueryResult::Rows { rows, .. } => rows, _ => panic!() };
+        let ages: Vec<i64> = rows.iter().map(|r| match &r[2] { Value::Int(v) => *v, _ => 0 }).collect();
+        assert!(ages.contains(&60));  // Alice: 30*2
+        assert!(ages.contains(&50));  // Bob: 25*2
+        assert!(ages.contains(&70));  // Charlie: 35*2
+    }
+
+    #[test]
+    fn test_update_expression_with_filter() {
+        let mut engine = test_engine();
+        // Increment age only for people over 28
+        engine.execute_powql("User filter .age > 28 update { age := .age + 1 }").unwrap();
+        let result = engine.execute_powql(r#"User filter .name = "Alice""#).unwrap();
+        let rows = match result { QueryResult::Rows { rows, .. } => rows, _ => panic!() };
+        assert_eq!(rows[0][2], Value::Int(31)); // Alice was 30, now 31
+        let result = engine.execute_powql(r#"User filter .name = "Bob""#).unwrap();
+        let rows = match result { QueryResult::Rows { rows, .. } => rows, _ => panic!() };
+        assert_eq!(rows[0][2], Value::Int(25)); // Bob was 25, unchanged
+    }
+
+    #[test]
+    fn test_update_literal_still_uses_fast_path() {
+        // Verify the literal path still works after the refactor
+        let mut engine = test_engine();
+        engine.execute_powql(
+            r#"User filter .name = "Alice" update { age := 99 }"#
+        ).unwrap();
+        let result = engine.execute_powql(r#"User filter .name = "Alice""#).unwrap();
+        let rows = match result { QueryResult::Rows { rows, .. } => rows, _ => panic!() };
+        assert_eq!(rows[0][2], Value::Int(99));
     }
 }
