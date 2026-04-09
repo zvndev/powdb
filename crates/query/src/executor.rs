@@ -1270,13 +1270,16 @@ impl Engine {
             }
 
             PlanNode::NestedLoopJoin { left, right, on, kind } => {
-                // Mission E1.2: correctness-first O(L × R) nested-loop join.
-                // Materialise both sides, then for every left row iterate the
-                // right side, compose a combined row, and (for non-cross
-                // joins) evaluate the `on` predicate. LeftOuter emits a
-                // synthetic all-Empty right row when no right match fires.
-                //
-                // Hash-join fast path for equi-joins lands in Mission E1.3.
+                // Materialise both sides. The executor ships two strategies:
+                //   1. Hash join (E1.3) — when the `on` predicate is a
+                //      simple equi-predicate `left_col = right_col`, build a
+                //      FxHashMap<Value, Vec<row_idx>> over the right side
+                //      and probe with the left side. O(L + R) instead of
+                //      O(L × R). Handles Inner and LeftOuter.
+                //   2. Nested loop (E1.2) — fallback for Cross, non-equi
+                //      predicates, or `on` expressions that reference
+                //      either side with something more complex than a
+                //      QualifiedField.
                 let left_result = self.execute_plan(left)?;
                 let right_result = self.execute_plan(right)?;
                 let (left_columns, left_rows) = match left_result {
@@ -1288,13 +1291,29 @@ impl Engine {
                     _ => return Err("join right side must produce rows".into()),
                 };
 
+                // Hash-join fast path.
+                if !matches!(kind, JoinKind::Cross) {
+                    if let Some(pred) = on {
+                        if let Some((l_idx, r_idx)) = try_extract_equi_join_keys(
+                            pred, &left_columns, &right_columns,
+                        ) {
+                            return Ok(hash_join(
+                                left_columns, left_rows,
+                                right_columns, right_rows,
+                                l_idx, r_idx,
+                                *kind,
+                            ));
+                        }
+                    }
+                }
+
+                // Nested-loop fallback.
                 let n_left = left_columns.len();
                 let n_right = right_columns.len();
                 let mut columns = Vec::with_capacity(n_left + n_right);
                 columns.extend(left_columns);
                 columns.extend(right_columns);
 
-                // Reasonable default capacity — we'll grow if needed.
                 let mut rows: Vec<Vec<Value>> = Vec::with_capacity(left_rows.len());
                 let mut combined: Vec<Value> = Vec::with_capacity(n_left + n_right);
 
@@ -1325,9 +1344,6 @@ impl Engine {
                         }
                     }
                     if !matched && matches!(kind, JoinKind::LeftOuter) {
-                        // Emit the left row padded with Empty on the right
-                        // side so downstream projections still get a fixed
-                        // column count.
                         let mut row = Vec::with_capacity(n_left + n_right);
                         row.extend_from_slice(left_row);
                         row.resize(n_left + n_right, Value::Empty);
@@ -2051,6 +2067,147 @@ fn eval_predicate(expr: &Expr, row: &[Value], columns: &[String]) -> bool {
         Value::Bool(b) => b,
         _ => false,
     }
+}
+
+/// Mission E1.3: try to extract equi-join key indices from a join `on`
+/// predicate. Returns `Some((left_col_idx, right_col_idx))` when the
+/// predicate is exactly `L = R` (or `R = L`) and both sides resolve
+/// cleanly — `L` to the left subtree's column list and `R` to the right
+/// subtree's column list.
+///
+/// This is deliberately narrow. We only recognise the two shapes:
+///   * `QualifiedField = QualifiedField`  (`u.id = o.user_id`)
+///   * `Field = Field`                    (`.id = .user_id`, unqualified)
+/// Anything else — conjunctions, constants, function calls, or predicates
+/// that touch the same side on both halves — falls through to the
+/// nested-loop path unchanged.
+fn try_extract_equi_join_keys(
+    pred: &Expr,
+    left_columns: &[String],
+    right_columns: &[String],
+) -> Option<(usize, usize)> {
+    let (lhs, op, rhs) = match pred {
+        Expr::BinaryOp(l, op, r) => (l.as_ref(), *op, r.as_ref()),
+        _ => return None,
+    };
+    if op != BinOp::Eq {
+        return None;
+    }
+    // Normal orientation: lhs in left, rhs in right.
+    if let (Some(li), Some(ri)) = (
+        resolve_side_column(lhs, left_columns),
+        resolve_side_column(rhs, right_columns),
+    ) {
+        return Some((li, ri));
+    }
+    // Swapped: rhs in left, lhs in right. Both sides of `=` are
+    // commutative so this is safe.
+    if let (Some(li), Some(ri)) = (
+        resolve_side_column(rhs, left_columns),
+        resolve_side_column(lhs, right_columns),
+    ) {
+        return Some((li, ri));
+    }
+    None
+}
+
+fn resolve_side_column(expr: &Expr, columns: &[String]) -> Option<usize> {
+    match expr {
+        Expr::QualifiedField { qualifier, field } => {
+            // Byte-level match so we don't allocate a fresh `format!` on
+            // every call — this runs once per plan, so allocation would be
+            // cheap, but the match is trivial enough to keep inline with
+            // the eval_expr version.
+            let q = qualifier.as_bytes();
+            let f = field.as_bytes();
+            columns.iter().position(|c| {
+                let b = c.as_bytes();
+                b.len() == q.len() + 1 + f.len()
+                    && b[..q.len()] == *q
+                    && b[q.len()] == b'.'
+                    && b[q.len() + 1..] == *f
+            })
+        }
+        Expr::Field(name) => columns.iter().position(|c| c == name),
+        _ => None,
+    }
+}
+
+/// Mission E1.3: O(L + R) hash join. Builds a `FxHashMap<Value, Vec<usize>>`
+/// over the right (inner) side's join keys, then streams the left (outer)
+/// side and for each probe row emits every combined row whose right-side
+/// key matches. For `JoinKind::LeftOuter`, unmatched left rows are emitted
+/// padded with `Value::Empty` on the right side.
+///
+/// The right side is always the build side. That choice is forced for
+/// LeftOuter (the left side must stream so we can detect orphans), and
+/// for Inner it's a reasonable default — left-deep plans tend to grow the
+/// left side with each join, so the un-joined right leaf is often the
+/// smaller of the two at each level.
+fn hash_join(
+    left_columns: Vec<String>,
+    left_rows: Vec<Vec<Value>>,
+    right_columns: Vec<String>,
+    right_rows: Vec<Vec<Value>>,
+    left_key_idx: usize,
+    right_key_idx: usize,
+    kind: JoinKind,
+) -> QueryResult {
+    use rustc_hash::FxHashMap;
+
+    let n_left = left_columns.len();
+    let n_right = right_columns.len();
+    let mut columns = Vec::with_capacity(n_left + n_right);
+    columns.extend(left_columns);
+    columns.extend(right_columns);
+
+    // Build: right_key -> list of right-row indices. Pre-size to the row
+    // count so the map doesn't rehash mid-build.
+    let mut build: FxHashMap<Value, Vec<usize>> =
+        FxHashMap::with_capacity_and_hasher(right_rows.len(), Default::default());
+    for (i, row) in right_rows.iter().enumerate() {
+        // Skip Empty keys on the build side — they can never match under
+        // SQL semantics (NULL ≠ NULL) and would collapse all nullables to
+        // one bucket.
+        if matches!(row[right_key_idx], Value::Empty) {
+            continue;
+        }
+        build.entry(row[right_key_idx].clone()).or_default().push(i);
+    }
+
+    // Reasonable starting capacity — inner joins produce ≥ left_rows.len()
+    // rows in the common 1:1 case, left-outer always emits ≥ left_rows.len().
+    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(left_rows.len());
+
+    for left_row in &left_rows {
+        let key = &left_row[left_key_idx];
+        let matched = if matches!(key, Value::Empty) {
+            None
+        } else {
+            build.get(key)
+        };
+        match matched {
+            Some(matches) if !matches.is_empty() => {
+                for &ri in matches {
+                    let right_row = &right_rows[ri];
+                    let mut combined = Vec::with_capacity(n_left + n_right);
+                    combined.extend_from_slice(left_row);
+                    combined.extend_from_slice(right_row);
+                    rows.push(combined);
+                }
+            }
+            _ => {
+                if matches!(kind, JoinKind::LeftOuter) {
+                    let mut row = Vec::with_capacity(n_left + n_right);
+                    row.extend_from_slice(left_row);
+                    row.resize(n_left + n_right, Value::Empty);
+                    rows.push(row);
+                }
+            }
+        }
+    }
+
+    QueryResult::Rows { columns, rows }
 }
 
 /// Executor-local row layout — computes the layout facts the compiled
@@ -3054,6 +3211,87 @@ mod tests {
         match result {
             QueryResult::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 3 * 4);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_hash_join_handles_swapped_predicate_orientation() {
+        // `on o.user_id = u.id` should resolve the same as `u.id = o.user_id`
+        // — exercises the swapped-orientation branch in
+        // `try_extract_equi_join_keys`.
+        let mut engine = join_engine();
+        let result = engine.execute_powql(
+            "User as u join Order as o on o.user_id = u.id { u.name, o.total }",
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, columns } => {
+                assert_eq!(columns, vec!["u.name", "o.total"]);
+                assert_eq!(rows.len(), 3);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_non_equi_join_falls_back_to_nested_loop() {
+        // `u.id < o.user_id` isn't an equi-join, so the executor must
+        // drop into the nested-loop path and still return correct rows.
+        let mut engine = join_engine();
+        let result = engine.execute_powql(
+            "User as u join Order as o on u.id < o.user_id",
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, columns } => {
+                // Pairs where u.id < o.user_id:
+                //   User 1 < orders 2,99 = 2 rows (o.user_id=2 twice? no, only one order for user 2)
+                //   Actually: orders have user_ids [1,1,2,99].
+                //   User 1 (id=1): 1<1 no, 1<1 no, 1<2 yes, 1<99 yes → 2
+                //   User 2 (id=2): 2<1 no, 2<1 no, 2<2 no, 2<99 yes → 1
+                //   User 3 (id=3): 3<1 no, 3<1 no, 3<2 no, 3<99 yes → 1
+                // Total 4.
+                assert_eq!(rows.len(), 4);
+                let u_id_idx = columns.iter().position(|c| c == "u.id").unwrap();
+                let o_uid_idx = columns.iter().position(|c| c == "o.user_id").unwrap();
+                for row in &rows {
+                    match (&row[u_id_idx], &row[o_uid_idx]) {
+                        (Value::Int(u), Value::Int(o)) => assert!(u < o),
+                        _ => panic!("expected int columns"),
+                    }
+                }
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_hash_join_with_string_key() {
+        // Exercise the Value::Str hash path — plus verifies Hash impl for
+        // Value works end to end via FxHashMap.
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir()
+            .join(format!("powdb_strjoin_{}_{}", std::process::id(), id));
+        let mut engine = Engine::new(&dir).unwrap();
+        engine.execute_powql(
+            "type A { required code: str, required label: str }"
+        ).unwrap();
+        engine.execute_powql(
+            "type B { required code: str, required score: int }"
+        ).unwrap();
+        engine.execute_powql(r#"insert A { code := "x", label := "X-label" }"#).unwrap();
+        engine.execute_powql(r#"insert A { code := "y", label := "Y-label" }"#).unwrap();
+        engine.execute_powql(r#"insert B { code := "x", score := 100 }"#).unwrap();
+        engine.execute_powql(r#"insert B { code := "y", score := 200 }"#).unwrap();
+        engine.execute_powql(r#"insert B { code := "z", score := 300 }"#).unwrap();
+
+        let result = engine.execute_powql(
+            "A as a join B as b on a.code = b.code { a.label, b.score }",
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                // x→100, y→200. z has no matching A.
+                assert_eq!(rows.len(), 2);
             }
             _ => panic!("expected rows"),
         }
