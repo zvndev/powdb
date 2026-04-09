@@ -641,6 +641,23 @@ impl Engine {
                     negated: *negated,
                 })
             }
+            Expr::ExistsSubquery { subquery, negated } => {
+                // Uncorrelated EXISTS: run the subquery once and collapse
+                // into a Bool literal. Correlated subqueries (referencing
+                // outer columns) aren't supported yet — the planner would
+                // fail on the unknown field reference, surfacing a clear
+                // error rather than silently misbehaving.
+                let sub_plan = crate::planner::plan_statement(
+                    Statement::Query(*subquery.clone()),
+                ).map_err(|e| e.message)?;
+                let result = self.execute_plan(&sub_plan)?;
+                let has_rows = match result {
+                    QueryResult::Rows { rows, .. } => !rows.is_empty(),
+                    _ => false,
+                };
+                let truth = if *negated { !has_rows } else { has_rows };
+                Ok(Expr::Literal(Literal::Bool(truth)))
+            }
             Expr::BinaryOp(l, op, r) => {
                 let l = self.materialize_subqueries(l)?;
                 let r = self.materialize_subqueries(r)?;
@@ -2418,6 +2435,7 @@ fn type_name_to_id(name: &str) -> TypeId {
 fn contains_subquery(expr: &Expr) -> bool {
     match expr {
         Expr::InSubquery { .. } => true,
+        Expr::ExistsSubquery { .. } => true,
         Expr::BinaryOp(l, _, r) => contains_subquery(l) || contains_subquery(r),
         Expr::UnaryOp(_, inner) => contains_subquery(inner),
         Expr::InList { expr, list, .. } => {
@@ -2533,6 +2551,11 @@ fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value {
         }
         Expr::InSubquery { .. } => {
             // Should have been materialized into InList before eval_expr.
+            Value::Empty
+        }
+        Expr::ExistsSubquery { .. } => {
+            // Should have been materialized into a Bool literal before
+            // eval_expr (see materialize_subqueries).
             Value::Empty
         }
         Expr::UnaryOp(op, inner) => {
@@ -4727,6 +4750,109 @@ mod tests {
                 assert!(names.contains(&&Value::Str("Alice".into())));
                 assert!(names.contains(&&Value::Str("Charlie".into())));
             }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    // ─── EXISTS subquery tests (uncorrelated) ───────────────────────────
+
+    #[test]
+    fn test_exists_subquery_uncorrelated_true() {
+        let mut engine = test_engine();
+        // A side table with at least one row → EXISTS(...) = true, so the
+        // filter passes every User row through.
+        engine.execute_powql("type VIP { required name: str }").unwrap();
+        engine.execute_powql(r#"insert VIP { name := "Alice" }"#).unwrap();
+
+        let result = engine.execute_powql(
+            "User filter exists (VIP) { .name }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3, "all users should pass when EXISTS is true");
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_exists_subquery_uncorrelated_false() {
+        let mut engine = test_engine();
+        // An empty side table → EXISTS(...) = false, so no User rows pass.
+        engine.execute_powql("type VIP { required name: str }").unwrap();
+
+        let result = engine.execute_powql(
+            "User filter exists (VIP) { .name }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 0, "no rows should pass when EXISTS is false");
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_not_exists_subquery() {
+        let mut engine = test_engine();
+        // NOT EXISTS over an empty table → true → all rows pass.
+        engine.execute_powql("type VIP { required name: str }").unwrap();
+
+        let result = engine.execute_powql(
+            "User filter not exists (VIP) { .name }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3);
+            }
+            _ => panic!("expected rows"),
+        }
+
+        // Now add a row — NOT EXISTS becomes false → no rows pass.
+        engine.execute_powql(r#"insert VIP { name := "Alice" }"#).unwrap();
+        let result = engine.execute_powql(
+            "User filter not exists (VIP) { .name }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 0);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_exists_subquery_with_inner_filter() {
+        let mut engine = test_engine();
+        // Subquery with its own filter: only rows matching the inner
+        // predicate count toward EXISTS.
+        engine.execute_powql("type Score { required name: str, required points: int }").unwrap();
+        engine.execute_powql(r#"insert Score { name := "Alice", points := 100 }"#).unwrap();
+
+        // Inner filter matches → EXISTS true → all users pass.
+        let result = engine.execute_powql(
+            "User filter exists (Score filter .points > 50) { .name }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 3),
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_exists_subquery_with_inner_filter_no_match() {
+        // Fresh engine so the plan cache doesn't collide with the
+        // `> 50` shape from the sibling test.
+        let mut engine = test_engine();
+        engine.execute_powql("type Score { required name: str, required points: int }").unwrap();
+        engine.execute_powql(r#"insert Score { name := "Alice", points := 100 }"#).unwrap();
+
+        // Inner filter matches nothing → EXISTS false → no users pass.
+        let result = engine.execute_powql(
+            "User filter exists (Score filter .points > 1000) { .name }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 0),
             _ => panic!("expected rows"),
         }
     }

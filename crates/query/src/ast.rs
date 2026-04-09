@@ -218,6 +218,10 @@ pub enum Expr {
     /// `expr [not] in (subquery)` — the subquery is a full QueryExpr
     /// that produces a single column.
     InSubquery { expr: Box<Expr>, subquery: Box<QueryExpr>, negated: bool },
+    /// `[not] exists (subquery)` — the subquery is a full QueryExpr.
+    /// Currently uncorrelated only: the executor runs the subquery once
+    /// before the scan loop and replaces this node with a Bool literal.
+    ExistsSubquery { subquery: Box<QueryExpr>, negated: bool },
     /// CASE WHEN ... THEN ... [ELSE ...] END
     Case {
         whens: Vec<(Box<Expr>, Box<Expr>)>,

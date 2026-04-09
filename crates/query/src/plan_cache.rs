@@ -323,6 +323,10 @@ fn count_expr(expr: &Expr, n: &mut usize) {
             // Subquery literals are not counted — the subquery is
             // re-planned/executed separately.
         }
+        Expr::ExistsSubquery { .. } => {
+            // Subquery literals are not counted — the subquery is
+            // re-planned/executed separately.
+        }
     }
 }
 
@@ -372,6 +376,10 @@ fn substitute_expr(expr: &mut Expr, literals: &[Literal], idx: &mut usize) {
         }
         Expr::InSubquery { expr, .. } => {
             substitute_expr(expr, literals, idx);
+        }
+        Expr::ExistsSubquery { .. } => {
+            // Subquery has its own literal list; nothing to substitute
+            // at this level.
         }
     }
 }
@@ -604,6 +612,7 @@ mod tests {
             Expr::InSubquery { expr, .. } => {
                 collect_expr_literals(expr, out);
             }
+            Expr::ExistsSubquery { .. } => {}
         }
     }
 }
