@@ -29,13 +29,13 @@ pub fn plan_statement(stmt: Statement) -> Result<PlanNode, PlanError> {
 }
 
 fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
-    // Mission E1.1: JOIN parser landed, but execution isn't wired yet. Error
-    // out cleanly so users see a helpful message instead of silently wrong
-    // results. E1.2 will replace this with a NestedLoopJoin planner.
+    // Mission E1.2: if the query has joins, build a left-deep nested-loop
+    // plan. Correctness first — hash-join optimization is E1.3. We also
+    // don't try to fold an IndexScan under a joined query yet (the
+    // leaf-level fast paths all match on `PlanNode::SeqScan { .. }`
+    // literally, so mixing them into a join plan would silently break).
     if !q.joins.is_empty() {
-        return Err(PlanError {
-            message: "JOIN is parsed but not yet executable (Mission E1.2)".into(),
-        });
+        return plan_joined_query(q);
     }
     // Try to fold `filter .col = literal` into an IndexScan. The executor
     // decides at run time whether the column actually has an index — if not,
@@ -56,6 +56,103 @@ fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
 
     if let Some(pred) = filter {
         node = PlanNode::Filter { input: Box::new(node), predicate: pred };
+    }
+
+    if let Some(order) = q.order {
+        node = PlanNode::Sort {
+            input: Box::new(node),
+            field: order.field,
+            descending: order.descending,
+        };
+    }
+
+    if let Some(lim) = q.limit {
+        node = PlanNode::Limit { input: Box::new(node), count: lim };
+    }
+
+    if let Some(off) = q.offset {
+        node = PlanNode::Offset { input: Box::new(node), count: off };
+    }
+
+    if let Some(proj) = q.projection {
+        let fields = proj.into_iter().map(|pf| ProjectField {
+            alias: pf.alias,
+            expr: pf.expr,
+        }).collect();
+        node = PlanNode::Project { input: Box::new(node), fields };
+    }
+
+    if let Some(agg) = q.aggregation {
+        node = PlanNode::Aggregate {
+            input: Box::new(node),
+            function: agg.function,
+            field: agg.field,
+        };
+    }
+
+    Ok(node)
+}
+
+/// Build a left-deep nested-loop join plan for a query with 1+ join clauses.
+///
+/// The plan shape for `T1 as a [inner|left|cross] join T2 as b on <pred> ...` is:
+///
+///   Project? (optional, from q.projection)
+///   └─ Offset? / Limit? / Sort?
+///      └─ Filter? (the top-level q.filter, using qualified columns)
+///         └─ NestedLoopJoin { kind, on }
+///            ├─ AliasScan { T1, a }
+///            └─ AliasScan { T2, b }
+///
+/// Multi-join chains extend left-deep: a third join adds a second
+/// `NestedLoopJoin` on top, with the first join's output as its `left`.
+///
+/// Aliases default to the source table name when the query didn't write
+/// `as <name>` explicitly — that way users can always write `T.field`
+/// without being forced to alias every source.
+///
+/// RightOuter is rewritten into LeftOuter with inputs swapped — the two
+/// differ only in which side survives non-matching rows, and swapping
+/// inputs lets the executor ship a single LeftOuter path.
+fn plan_joined_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
+    let primary_alias = q.alias.clone().unwrap_or_else(|| q.source.clone());
+    let mut node = PlanNode::AliasScan {
+        table: q.source.clone(),
+        alias: primary_alias,
+    };
+
+    for join in q.joins {
+        let right_alias = join.alias.unwrap_or_else(|| join.source.clone());
+        let right = PlanNode::AliasScan {
+            table: join.source,
+            alias: right_alias,
+        };
+        match join.kind {
+            JoinKind::Inner | JoinKind::LeftOuter | JoinKind::Cross => {
+                node = PlanNode::NestedLoopJoin {
+                    left: Box::new(node),
+                    right: Box::new(right),
+                    on: join.on,
+                    kind: join.kind,
+                };
+            }
+            JoinKind::RightOuter => {
+                // `a RIGHT OUTER JOIN b ON <p>` ≡ `b LEFT OUTER JOIN a ON <p>`.
+                node = PlanNode::NestedLoopJoin {
+                    left: Box::new(right),
+                    right: Box::new(node),
+                    on: join.on,
+                    kind: JoinKind::LeftOuter,
+                };
+            }
+        }
+    }
+
+    if let Some(pred) = q.filter {
+        node = PlanNode::Filter {
+            input: Box::new(node),
+            predicate: pred,
+        };
     }
 
     if let Some(order) = q.order {
@@ -302,15 +399,74 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_join_errors_cleanly() {
-        // Mission E1.1: parser accepts joins but the planner rejects them
-        // until E1.2 wires up execution. The error message should be
-        // actionable, not a panic or confusing type error.
-        let err = plan("User as u join Order as o on u.id = o.user_id").unwrap_err();
-        assert!(
-            err.message.contains("JOIN"),
-            "expected JOIN error, got: {}",
-            err.message
-        );
+    fn test_plan_inner_join_builds_nested_loop() {
+        // Mission E1.2: a join query should plan to NestedLoopJoin with
+        // AliasScan leaves on both sides.
+        let plan = plan("User as u join Order as o on u.id = o.user_id").unwrap();
+        match plan {
+            PlanNode::NestedLoopJoin { left, right, on, kind } => {
+                assert_eq!(kind, JoinKind::Inner);
+                assert!(on.is_some());
+                assert!(matches!(*left, PlanNode::AliasScan { .. }));
+                assert!(matches!(*right, PlanNode::AliasScan { .. }));
+            }
+            other => panic!("expected NestedLoopJoin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_plan_right_join_rewritten_as_left_with_swapped_inputs() {
+        let plan = plan("User as u right join Order as o on u.id = o.user_id").unwrap();
+        match plan {
+            PlanNode::NestedLoopJoin { left, right, kind, .. } => {
+                assert_eq!(kind, JoinKind::LeftOuter);
+                // Swapped: Order is now on the left, User on the right.
+                match *left {
+                    PlanNode::AliasScan { table, .. } => assert_eq!(table, "Order"),
+                    other => panic!("expected AliasScan(Order), got {other:?}"),
+                }
+                match *right {
+                    PlanNode::AliasScan { table, .. } => assert_eq!(table, "User"),
+                    other => panic!("expected AliasScan(User), got {other:?}"),
+                }
+            }
+            other => panic!("expected NestedLoopJoin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_plan_multi_join_is_left_deep() {
+        // Three sources → two NestedLoopJoins, left-deep.
+        let plan = plan(
+            "User as u join Order as o on u.id = o.user_id \
+             join Product as p on o.product_id = p.id",
+        )
+        .unwrap();
+        match plan {
+            PlanNode::NestedLoopJoin { left, right, .. } => {
+                // Outer (Product) join: right is AliasScan(Product)
+                match *right {
+                    PlanNode::AliasScan { table, .. } => assert_eq!(table, "Product"),
+                    other => panic!("expected AliasScan(Product), got {other:?}"),
+                }
+                // Outer.left is inner (Order) NestedLoopJoin
+                assert!(matches!(*left, PlanNode::NestedLoopJoin { .. }));
+            }
+            other => panic!("expected NestedLoopJoin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_plan_join_with_filter_tail_wraps_filter_on_top() {
+        let plan = plan(
+            "User as u join Order as o on u.id = o.user_id filter o.total > 100",
+        )
+        .unwrap();
+        match plan {
+            PlanNode::Filter { input, .. } => {
+                assert!(matches!(*input, PlanNode::NestedLoopJoin { .. }));
+            }
+            other => panic!("expected Filter(NestedLoopJoin), got {other:?}"),
+        }
     }
 }

@@ -809,6 +809,12 @@ impl Engine {
                         let proj_columns: Vec<String> = fields.iter().map(|f| {
                             f.alias.clone().unwrap_or_else(|| match &f.expr {
                                 Expr::Field(name) => name.clone(),
+                                // Mission E1.2: `{ u.name }` projects as the
+                                // qualified column name so callers can still
+                                // disambiguate across the join output.
+                                Expr::QualifiedField { qualifier, field } => {
+                                    format!("{qualifier}.{field}")
+                                }
                                 _ => "?".into(),
                             })
                         }).collect();
@@ -1238,6 +1244,98 @@ impl Engine {
                     .delete_many(table, &matching_rids)
                     .map_err(|e| e.to_string())?;
                 Ok(QueryResult::Modified(count))
+            }
+
+            PlanNode::AliasScan { table, alias } => {
+                // Mission E1.2: scan `table` and rename every output column
+                // to `alias.field`. Used as a join leaf so downstream
+                // NestedLoopJoin + Filter + Project nodes can resolve
+                // `Expr::QualifiedField` lookups by direct column-name match.
+                //
+                // We don't bother with a fused zero-copy loop here yet — the
+                // whole join path is nested-loop and correctness-first
+                // (Phase E1.3 will introduce hash join and at that point we
+                // can revisit whether to specialise AliasScan).
+                let schema = self.catalog.schema(table)
+                    .ok_or_else(|| format!("table '{table}' not found"))?
+                    .clone();
+                let columns: Vec<String> = schema.columns.iter()
+                    .map(|c| format!("{alias}.{}", c.name))
+                    .collect();
+                let rows: Vec<Vec<Value>> = self.catalog.scan(table)
+                    .map_err(|e| e.to_string())?
+                    .map(|(_, row)| row)
+                    .collect();
+                Ok(QueryResult::Rows { columns, rows })
+            }
+
+            PlanNode::NestedLoopJoin { left, right, on, kind } => {
+                // Mission E1.2: correctness-first O(L × R) nested-loop join.
+                // Materialise both sides, then for every left row iterate the
+                // right side, compose a combined row, and (for non-cross
+                // joins) evaluate the `on` predicate. LeftOuter emits a
+                // synthetic all-Empty right row when no right match fires.
+                //
+                // Hash-join fast path for equi-joins lands in Mission E1.3.
+                let left_result = self.execute_plan(left)?;
+                let right_result = self.execute_plan(right)?;
+                let (left_columns, left_rows) = match left_result {
+                    QueryResult::Rows { columns, rows } => (columns, rows),
+                    _ => return Err("join left side must produce rows".into()),
+                };
+                let (right_columns, right_rows) = match right_result {
+                    QueryResult::Rows { columns, rows } => (columns, rows),
+                    _ => return Err("join right side must produce rows".into()),
+                };
+
+                let n_left = left_columns.len();
+                let n_right = right_columns.len();
+                let mut columns = Vec::with_capacity(n_left + n_right);
+                columns.extend(left_columns);
+                columns.extend(right_columns);
+
+                // Reasonable default capacity — we'll grow if needed.
+                let mut rows: Vec<Vec<Value>> = Vec::with_capacity(left_rows.len());
+                let mut combined: Vec<Value> = Vec::with_capacity(n_left + n_right);
+
+                for left_row in &left_rows {
+                    let mut matched = false;
+                    for right_row in &right_rows {
+                        combined.clear();
+                        combined.extend_from_slice(left_row);
+                        combined.extend_from_slice(right_row);
+                        let keep = match kind {
+                            JoinKind::Cross => true,
+                            JoinKind::Inner | JoinKind::LeftOuter => match on {
+                                Some(pred) => eval_predicate(pred, &combined, &columns),
+                                // Missing `on` for non-cross joins is a
+                                // parser error, but if it slips through we
+                                // treat it as "match everything".
+                                None => true,
+                            },
+                            // RightOuter is rewritten to LeftOuter by the
+                            // planner, so we never see it here.
+                            JoinKind::RightOuter => unreachable!(
+                                "planner rewrites RightOuter to LeftOuter"
+                            ),
+                        };
+                        if keep {
+                            rows.push(combined.clone());
+                            matched = true;
+                        }
+                    }
+                    if !matched && matches!(kind, JoinKind::LeftOuter) {
+                        // Emit the left row padded with Empty on the right
+                        // side so downstream projections still get a fixed
+                        // column count.
+                        let mut row = Vec::with_capacity(n_left + n_right);
+                        row.extend_from_slice(left_row);
+                        row.resize(n_left + n_right, Value::Empty);
+                        rows.push(row);
+                    }
+                }
+
+                Ok(QueryResult::Rows { columns, rows })
             }
 
             PlanNode::CreateTable { name, fields } => {
@@ -1911,6 +2009,23 @@ fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value {
             columns.iter().position(|c| c == name)
                 .map(|i| row[i].clone())
                 .unwrap_or(Value::Empty)
+        }
+        Expr::QualifiedField { qualifier, field } => {
+            // Mission E1.2: join queries emit columns named `alias.field`,
+            // so the lookup is a direct prefix+tail match. We compare in
+            // pieces to avoid allocating a fresh `format!("{q}.{f}")` on
+            // every row — the join loop can evaluate this tens of thousands
+            // of times per query.
+            let q = qualifier.as_bytes();
+            let f = field.as_bytes();
+            let idx = columns.iter().position(|c| {
+                let b = c.as_bytes();
+                b.len() == q.len() + 1 + f.len()
+                    && b[..q.len()] == *q
+                    && b[q.len()] == b'.'
+                    && b[q.len() + 1..] == *f
+            });
+            idx.map(|i| row[i].clone()).unwrap_or(Value::Empty)
         }
         Expr::Literal(lit) => match lit {
             Literal::Int(v) => Value::Int(*v),
@@ -2817,5 +2932,157 @@ mod tests {
         assert_eq!(prep.param_count, 1);
         let err = engine.execute_prepared(&prep, &[]).unwrap_err();
         assert!(err.contains("expects 1 literal"));
+    }
+
+    // ─── Mission E1.2 join executor tests ───────────────────────────────────
+    //
+    // Fixture: two-table User + Order schema. User has 3 rows; Order has 4
+    // rows referencing users 1 and 2 (plus one orphan user_id 99 so we can
+    // probe LEFT OUTER semantics). Charlie (user 3) has no orders.
+
+    fn join_engine() -> Engine {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("powdb_join_{}_{}", std::process::id(), id));
+        let mut engine = Engine::new(&dir).unwrap();
+        engine.execute_powql(
+            "type User { required id: int, required name: str }"
+        ).unwrap();
+        engine.execute_powql(
+            "type Order { required id: int, required user_id: int, required total: int }"
+        ).unwrap();
+        engine.execute_powql(r#"insert User { id := 1, name := "Alice" }"#).unwrap();
+        engine.execute_powql(r#"insert User { id := 2, name := "Bob" }"#).unwrap();
+        engine.execute_powql(r#"insert User { id := 3, name := "Charlie" }"#).unwrap();
+        engine.execute_powql(r#"insert Order { id := 10, user_id := 1, total := 100 }"#).unwrap();
+        engine.execute_powql(r#"insert Order { id := 11, user_id := 1, total := 200 }"#).unwrap();
+        engine.execute_powql(r#"insert Order { id := 12, user_id := 2, total := 50  }"#).unwrap();
+        engine.execute_powql(r#"insert Order { id := 13, user_id := 99, total := 999 }"#).unwrap();
+        engine
+    }
+
+    #[test]
+    fn test_inner_join_matches_rows() {
+        let mut engine = join_engine();
+        let result = engine.execute_powql(
+            "User as u join Order as o on u.id = o.user_id",
+        ).unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                // 3 matches: Alice has 2 orders, Bob has 1. Charlie + orphan
+                // are dropped under INNER semantics.
+                assert_eq!(rows.len(), 3);
+                // Columns are concatenated alias.field for both sides.
+                assert!(columns.contains(&"u.id".to_string()));
+                assert!(columns.contains(&"u.name".to_string()));
+                assert!(columns.contains(&"o.id".to_string()));
+                assert!(columns.contains(&"o.user_id".to_string()));
+                assert!(columns.contains(&"o.total".to_string()));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_inner_join_with_qualified_projection_and_filter() {
+        let mut engine = join_engine();
+        let result = engine.execute_powql(
+            "User as u join Order as o on u.id = o.user_id \
+             filter o.total > 75 { u.name, o.total }",
+        ).unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["u.name", "o.total"]);
+                // Alice/100, Alice/200 (Bob's 50 filtered out).
+                assert_eq!(rows.len(), 2);
+                let names: Vec<_> = rows.iter().map(|r| r[0].clone()).collect();
+                assert!(names.iter().all(|v| matches!(v, Value::Str(s) if s == "Alice")));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_left_outer_join_emits_orphan_left_rows() {
+        let mut engine = join_engine();
+        let result = engine.execute_powql(
+            "User as u left join Order as o on u.id = o.user_id",
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, columns } => {
+                // Alice(2) + Bob(1) + Charlie(padding) = 4 rows.
+                assert_eq!(rows.len(), 4);
+                // Find Charlie's row and verify the right-side columns are Empty.
+                let u_name_idx = columns.iter().position(|c| c == "u.name").unwrap();
+                let o_total_idx = columns.iter().position(|c| c == "o.total").unwrap();
+                let charlie = rows.iter().find(|r| {
+                    matches!(&r[u_name_idx], Value::Str(s) if s == "Charlie")
+                }).expect("Charlie row present");
+                assert_eq!(charlie[o_total_idx], Value::Empty);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_right_outer_join_emits_orphan_right_rows() {
+        let mut engine = join_engine();
+        // The orphan order (user_id = 99) has no matching User; RIGHT OUTER
+        // should still emit it with the left-side (User) columns as Empty.
+        let result = engine.execute_powql(
+            "User as u right join Order as o on u.id = o.user_id",
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, columns } => {
+                // All 4 orders appear (3 matched + 1 orphan).
+                assert_eq!(rows.len(), 4);
+                let u_name_idx = columns.iter().position(|c| c == "u.name").unwrap();
+                let o_total_idx = columns.iter().position(|c| c == "o.total").unwrap();
+                let orphan = rows.iter().find(|r| r[o_total_idx] == Value::Int(999))
+                    .expect("orphan order row present");
+                assert_eq!(orphan[u_name_idx], Value::Empty);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_cross_join_emits_full_product() {
+        let mut engine = join_engine();
+        let result = engine.execute_powql(
+            "User as u cross join Order as o",
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3 * 4);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_multi_join_chain() {
+        // Third source — verify left-deep chains compose correctly.
+        let mut engine = join_engine();
+        engine.execute_powql(
+            "type Product { required id: int, required name: str }"
+        ).unwrap();
+        engine.execute_powql(r#"insert Product { id := 100, name := "Widget" }"#).unwrap();
+        engine.execute_powql(r#"insert Product { id := 200, name := "Gadget" }"#).unwrap();
+        // Re-create Orders with a product_id column wouldn't work without
+        // table alter; instead we pick a test that exercises the shape only.
+        let result = engine.execute_powql(
+            "User as u join Order as o on u.id = o.user_id \
+             cross join Product as p",
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, columns } => {
+                // 3 inner matches × 2 products = 6 rows.
+                assert_eq!(rows.len(), 6);
+                assert!(columns.contains(&"u.name".to_string()));
+                assert!(columns.contains(&"o.total".to_string()));
+                assert!(columns.contains(&"p.name".to_string()));
+            }
+            _ => panic!("expected rows"),
+        }
     }
 }

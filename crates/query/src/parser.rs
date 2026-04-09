@@ -303,7 +303,17 @@ impl Parser {
                 fields.push(ProjectionField { alias: Some(alias), expr });
             } else {
                 let expr = match first {
-                    Token::Ident(name) => Expr::Field(name),
+                    // Mission E1.2: `{ u.name }` — a qualifier followed by
+                    // `.field` folds into a QualifiedField so join projections
+                    // can pull from a specific source.
+                    Token::Ident(name) => {
+                        if let Token::DotIdent(field) = self.peek().clone() {
+                            self.advance();
+                            Expr::QualifiedField { qualifier: name, field }
+                        } else {
+                            Expr::Field(name)
+                        }
+                    }
                     Token::DotIdent(name) => Expr::Field(name),
                     _ => return Err(ParseError { message: format!("expected field, got {first:?}") }),
                 };

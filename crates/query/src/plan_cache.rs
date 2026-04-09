@@ -130,6 +130,7 @@ impl PlanCache {
 pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &mut usize) {
     match plan {
         PlanNode::SeqScan { .. } => {}
+        PlanNode::AliasScan { .. } => {}
         PlanNode::IndexScan { key, .. } => {
             substitute_expr(key, literals, idx);
         }
@@ -156,6 +157,17 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
         }
         PlanNode::Aggregate { input, .. } => {
             substitute_plan(input, literals, idx);
+        }
+        PlanNode::NestedLoopJoin { left, right, on, .. } => {
+            // Walk order: left subtree → right subtree → on predicate.
+            // Matches canonicalise's source-order literal collection for
+            // joined queries: left source tokens come first, then right
+            // source tokens, then the `on` expression's literals (if any).
+            substitute_plan(left, literals, idx);
+            substitute_plan(right, literals, idx);
+            if let Some(pred) = on {
+                substitute_expr(pred, literals, idx);
+            }
         }
         PlanNode::Insert { assignments, .. } => {
             substitute_assignments(assignments, literals, idx);
@@ -195,6 +207,7 @@ pub(crate) fn count_literal_slots(plan: &PlanNode) -> usize {
 fn count_plan(plan: &PlanNode, n: &mut usize) {
     match plan {
         PlanNode::SeqScan { .. } => {}
+        PlanNode::AliasScan { .. } => {}
         PlanNode::IndexScan { key, .. } => count_expr(key, n),
         PlanNode::Filter { input, predicate } => {
             count_plan(input, n);
@@ -216,6 +229,13 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
             count_expr(count, n);
         }
         PlanNode::Aggregate { input, .. } => count_plan(input, n),
+        PlanNode::NestedLoopJoin { left, right, on, .. } => {
+            count_plan(left, n);
+            count_plan(right, n);
+            if let Some(pred) = on {
+                count_expr(pred, n);
+            }
+        }
         PlanNode::Insert { assignments, .. } => {
             for a in assignments {
                 count_expr(&a.value, n);
@@ -406,6 +426,7 @@ mod tests {
     fn collect_literals_for_test(plan: &PlanNode, out: &mut Vec<Literal>) {
         match plan {
             PlanNode::SeqScan { .. } => {}
+            PlanNode::AliasScan { .. } => {}
             PlanNode::IndexScan { key, .. } => collect_expr_literals(key, out),
             PlanNode::Filter { input, predicate } => {
                 collect_literals_for_test(input, out);
@@ -427,6 +448,13 @@ mod tests {
                 collect_expr_literals(count, out);
             }
             PlanNode::Aggregate { input, .. } => collect_literals_for_test(input, out),
+            PlanNode::NestedLoopJoin { left, right, on, .. } => {
+                collect_literals_for_test(left, out);
+                collect_literals_for_test(right, out);
+                if let Some(pred) = on {
+                    collect_expr_literals(pred, out);
+                }
+            }
             PlanNode::Insert { assignments, .. } => {
                 for a in assignments {
                     collect_expr_literals(&a.value, out);
