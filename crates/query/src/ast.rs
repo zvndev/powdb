@@ -6,6 +6,28 @@ pub enum Statement {
     UpdateQuery(UpdateExpr),
     DeleteQuery(DeleteExpr),
     CreateType(CreateTypeExpr),
+    AlterTable(AlterTableExpr),
+    DropTable(DropTableExpr),
+}
+
+/// `alter User add column status: str` / `alter User drop column status`
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTableExpr {
+    pub table: String,
+    pub action: AlterAction,
+}
+
+/// An individual ALTER TABLE action.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterAction {
+    AddColumn { name: String, type_name: String, required: bool },
+    DropColumn { name: String },
+}
+
+/// `drop User`
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropTableExpr {
+    pub table: String,
 }
 
 /// A query expression: Type [join ...]* [filter ...] [order ...] [limit ...] [{ projection }]
@@ -66,6 +88,11 @@ pub struct ProjectionField {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrderClause {
+    pub keys: Vec<OrderKey>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderKey {
     pub field: String,
     pub descending: bool,
 }
@@ -153,6 +180,9 @@ pub enum Expr {
     Coalesce(Box<Expr>, Box<Expr>),
     /// `expr in (val1, val2, ...)` or `expr not in (val1, val2, ...)`
     InList { expr: Box<Expr>, list: Vec<Expr>, negated: bool },
+    /// `expr [not] in (subquery)` — the subquery is a full QueryExpr
+    /// that produces a single column.
+    InSubquery { expr: Box<Expr>, subquery: Box<QueryExpr>, negated: bool },
     /// CASE WHEN ... THEN ... [ELSE ...] END
     Case {
         whens: Vec<(Box<Expr>, Box<Expr>)>,

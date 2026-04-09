@@ -42,6 +42,8 @@ impl Parser {
         match self.peek() {
             Token::Insert => self.parse_insert(),
             Token::Type => self.parse_create_type(),
+            Token::Alter => self.parse_alter_table(),
+            Token::Drop => self.parse_drop_table(),
             Token::Count | Token::Avg | Token::Sum | Token::Min | Token::Max => {
                 self.parse_aggregate_query()
             }
@@ -404,16 +406,25 @@ impl Parser {
     }
 
     fn parse_order(&mut self) -> Result<OrderClause, ParseError> {
-        let field = match self.advance() {
-            Token::DotIdent(name) => name,
-            t => return Err(ParseError { message: format!("expected .field after order, got {t:?}") }),
-        };
-        let descending = match self.peek() {
-            Token::Desc => { self.advance(); true }
-            Token::Asc => { self.advance(); false }
-            _ => false,
-        };
-        Ok(OrderClause { field, descending })
+        let mut keys = Vec::new();
+        loop {
+            let field = match self.advance() {
+                Token::DotIdent(name) => name,
+                t => return Err(ParseError { message: format!("expected .field after order, got {t:?}") }),
+            };
+            let descending = match self.peek() {
+                Token::Desc => { self.advance(); true }
+                Token::Asc => { self.advance(); false }
+                _ => false,
+            };
+            keys.push(OrderKey { field, descending });
+            if *self.peek() == Token::Comma {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(OrderClause { keys })
     }
 
     fn parse_aggregate_query(&mut self) -> Result<Statement, ParseError> {
@@ -558,9 +569,32 @@ impl Parser {
         Ok(Expr::BinaryOp(Box::new(left), op, Box::new(right)))
     }
 
-    /// Parse `(val1, val2, ...)` after `in` / `not in`.
+    /// Parse `(val1, val2, ...)` or `(subquery)` after `in` / `not in`.
+    /// A subquery is detected by `(` followed by an `Ident` that is NOT
+    /// followed by `,` or `)` — in PowQL, bare identifiers in value lists
+    /// don't appear (field refs start with `.`).
     fn parse_in_list(&mut self, expr: Expr, negated: bool) -> Result<Expr, ParseError> {
         self.expect(&Token::LParen)?;
+        // Detect subquery: `( Ident ...` where the Ident is a table name.
+        if let Token::Ident(_) = self.peek() {
+            // Peek further: if the next token after the Ident is NOT `,` or
+            // `)`, it's a subquery source name.
+            let after = self.tokens.get(self.pos + 1);
+            let is_subquery = !matches!(after, Some(Token::Comma) | Some(Token::RParen));
+            if is_subquery {
+                let source = match self.advance() {
+                    Token::Ident(name) => name,
+                    _ => unreachable!(),
+                };
+                let subquery = self.parse_query_tail(source)?;
+                self.expect(&Token::RParen)?;
+                return Ok(Expr::InSubquery {
+                    expr: Box::new(expr),
+                    subquery: Box::new(subquery),
+                    negated,
+                });
+            }
+        }
         let mut list = Vec::new();
         while *self.peek() != Token::RParen {
             list.push(self.parse_expr()?);
@@ -629,17 +663,32 @@ impl Parser {
     }
 
     fn parse_additive(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.parse_primary()?;
+        let mut left = self.parse_multiplicative()?;
         loop {
             let op = match self.peek() {
                 Token::Plus  => BinOp::Add,
                 Token::Minus => BinOp::Sub,
                 Token::Coalesce => {
                     self.advance();
-                    let right = self.parse_primary()?;
+                    let right = self.parse_multiplicative()?;
                     left = Expr::Coalesce(Box::new(left), Box::new(right));
                     continue;
                 }
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_multiplicative()?;
+            left = Expr::BinaryOp(Box::new(left), op, Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_multiplicative(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_primary()?;
+        loop {
+            let op = match self.peek() {
+                Token::Star  => BinOp::Mul,
+                Token::Slash => BinOp::Div,
                 _ => break,
             };
             self.advance();
@@ -774,6 +823,66 @@ impl Parser {
         }
     }
 
+    /// `alter <Table> add [column] [required] <name>: <type>`
+    /// `alter <Table> drop [column] <name>`
+    fn parse_alter_table(&mut self) -> Result<Statement, ParseError> {
+        self.expect(&Token::Alter)?;
+        let table = match self.advance() {
+            Token::Ident(name) => name,
+            t => return Err(ParseError { message: format!("expected table name after alter, got {t:?}") }),
+        };
+        match self.peek() {
+            Token::Add => {
+                self.advance();
+                // optional `column` keyword
+                if *self.peek() == Token::Column { self.advance(); }
+                let required = if *self.peek() == Token::Required {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                let name = match self.advance() {
+                    Token::Ident(n) => n,
+                    t => return Err(ParseError { message: format!("expected column name, got {t:?}") }),
+                };
+                self.expect(&Token::Colon)?;
+                let type_name = match self.advance() {
+                    Token::Ident(n) => n,
+                    t => return Err(ParseError { message: format!("expected type name, got {t:?}") }),
+                };
+                Ok(Statement::AlterTable(AlterTableExpr {
+                    table,
+                    action: AlterAction::AddColumn { name, type_name, required },
+                }))
+            }
+            Token::Drop => {
+                self.advance();
+                // optional `column` keyword
+                if *self.peek() == Token::Column { self.advance(); }
+                let name = match self.advance() {
+                    Token::Ident(n) => n,
+                    t => return Err(ParseError { message: format!("expected column name, got {t:?}") }),
+                };
+                Ok(Statement::AlterTable(AlterTableExpr {
+                    table,
+                    action: AlterAction::DropColumn { name },
+                }))
+            }
+            t => Err(ParseError { message: format!("expected add or drop after alter <table>, got {t:?}") }),
+        }
+    }
+
+    /// `drop <Table>`
+    fn parse_drop_table(&mut self) -> Result<Statement, ParseError> {
+        self.expect(&Token::Drop)?;
+        let table = match self.advance() {
+            Token::Ident(name) => name,
+            t => return Err(ParseError { message: format!("expected table name after drop, got {t:?}") }),
+        };
+        Ok(Statement::DropTable(DropTableExpr { table }))
+    }
+
     fn parse_create_type(&mut self) -> Result<Statement, ParseError> {
         self.expect(&Token::Type)?;
         let name = match self.advance() {
@@ -855,8 +964,9 @@ mod tests {
             Statement::Query(q) => {
                 assert!(q.filter.is_some());
                 let order = q.order.unwrap();
-                assert_eq!(order.field, "name");
-                assert!(order.descending);
+                assert_eq!(order.keys.len(), 1);
+                assert_eq!(order.keys[0].field, "name");
+                assert!(order.keys[0].descending);
                 assert!(q.limit.is_some());
             }
             _ => panic!("expected query"),
@@ -1535,6 +1645,224 @@ mod tests {
                         assert!(else_expr.is_none());
                     }
                     other => panic!("expected Case expr, got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    // ─── Mul/Div expression tests (E2f) ───────────────────────────────
+
+    #[test]
+    fn test_parse_mul_expr() {
+        let stmt = parse("User filter .price * .quantity > 100").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let filter = q.filter.unwrap();
+                match filter {
+                    Expr::BinaryOp(left, BinOp::Gt, _) => {
+                        match *left {
+                            Expr::BinaryOp(_, BinOp::Mul, _) => {}
+                            other => panic!("expected Mul, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected BinaryOp Gt, got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_div_expr() {
+        let stmt = parse("User { ratio: .total / .count }").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let proj = q.projection.unwrap();
+                assert_eq!(proj[0].alias.as_deref(), Some("ratio"));
+                match &proj[0].expr {
+                    Expr::BinaryOp(_, BinOp::Div, _) => {}
+                    other => panic!("expected Div, got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_mul_div_precedence() {
+        // .a + .b * .c should parse as .a + (.b * .c)
+        let stmt = parse("User filter .a + .b * .c > 0").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let filter = q.filter.unwrap();
+                match filter {
+                    Expr::BinaryOp(left, BinOp::Gt, _) => {
+                        match *left {
+                            Expr::BinaryOp(_, BinOp::Add, right) => {
+                                assert!(matches!(*right, Expr::BinaryOp(_, BinOp::Mul, _)));
+                            }
+                            other => panic!("expected Add, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected Gt, got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    // ─── Multi-column ORDER BY tests (E2f) ────────────────────────────
+
+    #[test]
+    fn test_parse_multi_order() {
+        let stmt = parse("User order .name asc, .age desc").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let order = q.order.unwrap();
+                assert_eq!(order.keys.len(), 2);
+                assert_eq!(order.keys[0].field, "name");
+                assert!(!order.keys[0].descending);
+                assert_eq!(order.keys[1].field, "age");
+                assert!(order.keys[1].descending);
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_order_default_asc() {
+        let stmt = parse("User order .name").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let order = q.order.unwrap();
+                assert_eq!(order.keys.len(), 1);
+                assert!(!order.keys[0].descending);
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    // ─── ALTER TABLE / DROP TABLE parser tests (E2g) ──────────────────
+
+    #[test]
+    fn test_parse_alter_add_column() {
+        let stmt = parse("alter User add column status: str").unwrap();
+        match stmt {
+            Statement::AlterTable(at) => {
+                assert_eq!(at.table, "User");
+                match at.action {
+                    AlterAction::AddColumn { name, type_name, required } => {
+                        assert_eq!(name, "status");
+                        assert_eq!(type_name, "str");
+                        assert!(!required);
+                    }
+                    other => panic!("expected AddColumn, got {other:?}"),
+                }
+            }
+            other => panic!("expected AlterTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_add_required_column() {
+        let stmt = parse("alter User add required status: str").unwrap();
+        match stmt {
+            Statement::AlterTable(at) => {
+                match at.action {
+                    AlterAction::AddColumn { required, .. } => assert!(required),
+                    other => panic!("expected AddColumn, got {other:?}"),
+                }
+            }
+            other => panic!("expected AlterTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_drop_column() {
+        let stmt = parse("alter User drop column status").unwrap();
+        match stmt {
+            Statement::AlterTable(at) => {
+                assert_eq!(at.table, "User");
+                match at.action {
+                    AlterAction::DropColumn { name } => assert_eq!(name, "status"),
+                    other => panic!("expected DropColumn, got {other:?}"),
+                }
+            }
+            other => panic!("expected AlterTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_drop_without_column_keyword() {
+        let stmt = parse("alter User drop status").unwrap();
+        match stmt {
+            Statement::AlterTable(at) => {
+                match at.action {
+                    AlterAction::DropColumn { name } => assert_eq!(name, "status"),
+                    other => panic!("expected DropColumn, got {other:?}"),
+                }
+            }
+            other => panic!("expected AlterTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_drop_table() {
+        let stmt = parse("drop User").unwrap();
+        match stmt {
+            Statement::DropTable(dt) => assert_eq!(dt.table, "User"),
+            other => panic!("expected DropTable, got {other:?}"),
+        }
+    }
+
+    // ─── IN subquery parser tests (E2h) ───────────────────────────────
+
+    #[test]
+    fn test_parse_in_subquery() {
+        let stmt = parse("User filter .name in (VIP { .name })").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let filter = q.filter.unwrap();
+                match filter {
+                    Expr::InSubquery { expr, subquery, negated } => {
+                        assert!(!negated);
+                        assert!(matches!(*expr, Expr::Field(ref f) if f == "name"));
+                        assert_eq!(subquery.source, "VIP");
+                    }
+                    other => panic!("expected InSubquery, got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_not_in_subquery() {
+        let stmt = parse("User filter .id not in (Order { .user_id })").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                match q.filter.unwrap() {
+                    Expr::InSubquery { negated, .. } => assert!(negated),
+                    other => panic!("expected InSubquery, got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_in_literal_list_still_works() {
+        // Ensure existing IN (literal) parsing isn't broken
+        let stmt = parse("User filter .age in (25, 30, 35)").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                match q.filter.unwrap() {
+                    Expr::InList { list, negated, .. } => {
+                        assert!(!negated);
+                        assert_eq!(list.len(), 3);
+                    }
+                    other => panic!("expected InList, got {other:?}"),
                 }
             }
             _ => panic!("expected query"),

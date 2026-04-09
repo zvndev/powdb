@@ -94,6 +94,12 @@ impl Table {
         })
     }
 
+    /// Recalculate the cached row layout from the current schema. Must be
+    /// called after any schema mutation (add/drop column).
+    pub fn refresh_layout(&mut self) {
+        self.row_layout = RowLayout::new(&self.schema);
+    }
+
     /// Look up an index by column name. Returns `None` if no index on
     /// this column. Used by the read-side executor paths (IndexScan,
     /// Project(IndexScan), etc.) that still need name-based resolution;

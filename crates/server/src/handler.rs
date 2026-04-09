@@ -99,6 +99,9 @@ fn query_result_to_message(result: QueryResult) -> Message {
         QueryResult::Created(_name) => {
             Message::ResultOk { affected: 0 }
         }
+        QueryResult::Executed { .. } => {
+            Message::ResultOk { affected: 0 }
+        }
     }
 }
 

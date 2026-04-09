@@ -144,9 +144,9 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
                 substitute_expr(&mut f.expr, literals, idx);
             }
         }
-        PlanNode::Sort { input, .. } => {
-            substitute_plan(input, literals, idx);
-        }
+        PlanNode::Sort { input, .. } => substitute_plan(input, literals, idx),
+        PlanNode::AlterTable { .. } => {}
+        PlanNode::DropTable { .. } => {}
         PlanNode::Limit { input, count } => {
             substitute_plan(input, literals, idx);
             substitute_expr(count, literals, idx);
@@ -265,6 +265,8 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
         }
         PlanNode::Delete { input, .. } => count_plan(input, n),
         PlanNode::CreateTable { .. } => {}
+        PlanNode::AlterTable { .. } => {}
+        PlanNode::DropTable { .. } => {}
     }
 }
 
@@ -301,6 +303,11 @@ fn count_expr(expr: &Expr, n: &mut usize) {
             if let Some(e) = else_expr {
                 count_expr(e, n);
             }
+        }
+        Expr::InSubquery { expr, .. } => {
+            count_expr(expr, n);
+            // Subquery literals are not counted — the subquery is
+            // re-planned/executed separately.
         }
     }
 }
@@ -348,6 +355,9 @@ fn substitute_expr(expr: &mut Expr, literals: &[Literal], idx: &mut usize) {
             if let Some(e) = else_expr {
                 substitute_expr(e, literals, idx);
             }
+        }
+        Expr::InSubquery { expr, .. } => {
+            substitute_expr(expr, literals, idx);
         }
     }
 }
@@ -531,6 +541,8 @@ mod tests {
             }
             PlanNode::Delete { input, .. } => collect_literals_for_test(input, out),
             PlanNode::CreateTable { .. } => {}
+            PlanNode::AlterTable { .. } => {}
+            PlanNode::DropTable { .. } => {}
         }
     }
 
@@ -567,6 +579,9 @@ mod tests {
                 if let Some(e) = else_expr {
                     collect_expr_literals(e, out);
                 }
+            }
+            Expr::InSubquery { expr, .. } => {
+                collect_expr_literals(expr, out);
             }
         }
     }

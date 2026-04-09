@@ -594,6 +594,63 @@ impl Engine {
         self.execute_prepared(prep, literals)
     }
 
+    /// Walk an expression tree and replace every `InSubquery` node with
+    /// an `InList` by executing the subquery and collecting its first
+    /// column as literal values. This must be called before entering
+    /// the row-by-row scan loop because the scan closure can't call back
+    /// into the engine.
+    fn materialize_subqueries(&mut self, expr: &Expr) -> Result<Expr, String> {
+        match expr {
+            Expr::InSubquery { expr: inner, subquery, negated } => {
+                let inner = self.materialize_subqueries(inner)?;
+                // Plan and execute the subquery.
+                let sub_plan = crate::planner::plan_statement(
+                    Statement::Query(*subquery.clone()),
+                ).map_err(|e| e.message)?;
+                let result = self.execute_plan(&sub_plan)?;
+                let values = match result {
+                    QueryResult::Rows { rows, .. } => {
+                        rows.into_iter()
+                            .filter_map(|mut row| {
+                                if row.is_empty() { None }
+                                else { Some(value_to_expr(row.swap_remove(0))) }
+                            })
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                };
+                Ok(Expr::InList {
+                    expr: Box::new(inner),
+                    list: values,
+                    negated: *negated,
+                })
+            }
+            Expr::BinaryOp(l, op, r) => {
+                let l = self.materialize_subqueries(l)?;
+                let r = self.materialize_subqueries(r)?;
+                Ok(Expr::BinaryOp(Box::new(l), *op, Box::new(r)))
+            }
+            Expr::UnaryOp(op, inner) => {
+                let inner = self.materialize_subqueries(inner)?;
+                Ok(Expr::UnaryOp(*op, Box::new(inner)))
+            }
+            Expr::Case { whens, else_expr } => {
+                let whens = whens.iter().map(|(c, r)| {
+                    let c = self.materialize_subqueries(c)?;
+                    let r = self.materialize_subqueries(r)?;
+                    Ok((Box::new(c), Box::new(r)))
+                }).collect::<Result<Vec<_>, String>>()?;
+                let else_expr = match else_expr {
+                    Some(e) => Some(Box::new(self.materialize_subqueries(e)?)),
+                    None => None,
+                };
+                Ok(Expr::Case { whens, else_expr })
+            }
+            // Leaf nodes: no subqueries possible.
+            other => Ok(other.clone()),
+        }
+    }
+
     pub fn execute_plan(&mut self, plan: &PlanNode) -> Result<QueryResult, String> {
         match plan {
             PlanNode::SeqScan { table } => {
@@ -609,6 +666,16 @@ impl Engine {
             }
 
             PlanNode::Filter { input, predicate } => {
+                // Materialize any IN-subqueries in the predicate before the
+                // scan loop — the closure can't call back into the engine.
+                let materialized;
+                let predicate = if contains_subquery(predicate) {
+                    materialized = self.materialize_subqueries(predicate)?;
+                    &materialized
+                } else {
+                    predicate
+                };
+
                 // Fast path: fuse Filter + SeqScan into a zero-copy streaming
                 // loop. Uses decode_column() to evaluate the predicate on only
                 // the columns it references, avoiding heap allocations for
@@ -719,27 +786,32 @@ impl Engine {
                 // keeps at most `limit` rows in a heap. Also handles the
                 // Project(Limit(Sort(SeqScan))) variant (no filter).
                 if let PlanNode::Limit { input: inner, count: limit_expr } = input.as_ref() {
-                    if let PlanNode::Sort { input: sort_input, field: sort_field, descending } = inner.as_ref() {
-                        let limit = match limit_expr {
-                            Expr::Literal(Literal::Int(v)) if *v >= 0 => *v as usize,
-                            _ => usize::MAX,
-                        };
-                        let (table_opt, pred_opt): (Option<&str>, Option<&Expr>) = match sort_input.as_ref() {
-                            PlanNode::SeqScan { table } => (Some(table.as_str()), None),
-                            PlanNode::Filter { input: fi, predicate } => {
-                                if let PlanNode::SeqScan { table } = fi.as_ref() {
-                                    (Some(table.as_str()), Some(predicate))
-                                } else {
-                                    (None, None)
+                    if let PlanNode::Sort { input: sort_input, keys } = inner.as_ref() {
+                        // Fast path only for single-key sorts
+                        if keys.len() == 1 {
+                            let sort_field = &keys[0].field;
+                            let descending = keys[0].descending;
+                            let limit = match limit_expr {
+                                Expr::Literal(Literal::Int(v)) if *v >= 0 => *v as usize,
+                                _ => usize::MAX,
+                            };
+                            let (table_opt, pred_opt): (Option<&str>, Option<&Expr>) = match sort_input.as_ref() {
+                                PlanNode::SeqScan { table } => (Some(table.as_str()), None),
+                                PlanNode::Filter { input: fi, predicate } => {
+                                    if let PlanNode::SeqScan { table } = fi.as_ref() {
+                                        (Some(table.as_str()), Some(predicate))
+                                    } else {
+                                        (None, None)
+                                    }
                                 }
-                            }
-                            _ => (None, None),
-                        };
-                        if let Some(table) = table_opt {
-                            if let Some(result) = self.project_filter_sort_limit_fast(
-                                table, fields, sort_field, *descending, limit, pred_opt,
-                            )? {
-                                return Ok(result);
+                                _ => (None, None),
+                            };
+                            if let Some(table) = table_opt {
+                                if let Some(result) = self.project_filter_sort_limit_fast(
+                                    table, fields, sort_field, descending, limit, pred_opt,
+                                )? {
+                                    return Ok(result);
+                                }
                             }
                         }
                     }
@@ -827,15 +899,24 @@ impl Engine {
                 }
             }
 
-            PlanNode::Sort { input, field, descending } => {
+            PlanNode::Sort { input, keys } => {
                 let result = self.execute_plan(input)?;
                 match result {
                     QueryResult::Rows { columns, mut rows } => {
-                        let col_idx = columns.iter().position(|c| c == field)
-                            .ok_or_else(|| format!("column '{field}' not found"))?;
+                        let key_indices: Vec<(usize, bool)> = keys.iter().map(|k| {
+                            let idx = columns.iter().position(|c| c == &k.field)
+                                .expect(&format!("column '{}' not found", k.field));
+                            (idx, k.descending)
+                        }).collect();
                         rows.sort_by(|a, b| {
-                            let cmp = a[col_idx].cmp(&b[col_idx]);
-                            if *descending { cmp.reverse() } else { cmp }
+                            for &(col_idx, descending) in &key_indices {
+                                let cmp = a[col_idx].cmp(&b[col_idx]);
+                                let cmp = if descending { cmp.reverse() } else { cmp };
+                                if cmp != std::cmp::Ordering::Equal {
+                                    return cmp;
+                                }
+                            }
+                            std::cmp::Ordering::Equal
                         });
                         Ok(QueryResult::Rows { columns, rows })
                     }
@@ -1449,6 +1530,41 @@ impl Engine {
                 Ok(QueryResult::Created(name.clone()))
             }
 
+            PlanNode::AlterTable { table, action } => {
+                match action {
+                    AlterAction::AddColumn { name, type_name, required } => {
+                        let position = self.catalog.schema(table)
+                            .ok_or_else(|| format!("table '{table}' not found"))?
+                            .columns.len() as u16;
+                        let col = ColumnDef {
+                            name: name.clone(),
+                            type_id: type_name_to_id(type_name),
+                            required: *required,
+                            position,
+                        };
+                        self.catalog.alter_table_add_column(table, col)
+                            .map_err(|e| e.to_string())?;
+                        Ok(QueryResult::Executed {
+                            message: format!("column '{name}' added to '{table}'"),
+                        })
+                    }
+                    AlterAction::DropColumn { name } => {
+                        self.catalog.alter_table_drop_column(table, name)
+                            .map_err(|e| e.to_string())?;
+                        Ok(QueryResult::Executed {
+                            message: format!("column '{name}' dropped from '{table}'"),
+                        })
+                    }
+                }
+            }
+
+            PlanNode::DropTable { name } => {
+                self.catalog.drop_table(name).map_err(|e| e.to_string())?;
+                Ok(QueryResult::Executed {
+                    message: format!("table '{name}' dropped"),
+                })
+            }
+
             PlanNode::IndexScan { table, column, key } => {
                 let schema = self.catalog.schema(table)
                     .ok_or_else(|| format!("table '{table}' not found"))?
@@ -2060,6 +2176,39 @@ fn type_name_to_id(name: &str) -> TypeId {
     }
 }
 
+/// Convert a runtime `Value` back into an `Expr::Literal` for InSubquery
+/// materialization. Non-literal-representable values become `Literal::Int(0)`
+/// (shouldn't happen in practice — subqueries return primitive columns).
+/// Check if an expression tree contains any `InSubquery` nodes.
+fn contains_subquery(expr: &Expr) -> bool {
+    match expr {
+        Expr::InSubquery { .. } => true,
+        Expr::BinaryOp(l, _, r) => contains_subquery(l) || contains_subquery(r),
+        Expr::UnaryOp(_, inner) => contains_subquery(inner),
+        Expr::InList { expr, list, .. } => {
+            contains_subquery(expr) || list.iter().any(contains_subquery)
+        }
+        Expr::Case { whens, else_expr } => {
+            whens.iter().any(|(c, r)| contains_subquery(c) || contains_subquery(r))
+                || else_expr.as_ref().map_or(false, |e| contains_subquery(e))
+        }
+        Expr::ScalarFunc(_, args) => args.iter().any(contains_subquery),
+        Expr::FunctionCall(_, inner) => contains_subquery(inner),
+        Expr::Coalesce(l, r) => contains_subquery(l) || contains_subquery(r),
+        _ => false,
+    }
+}
+
+fn value_to_expr(val: Value) -> Expr {
+    match val {
+        Value::Int(v)    => Expr::Literal(Literal::Int(v)),
+        Value::Float(v)  => Expr::Literal(Literal::Float(v)),
+        Value::Str(v)    => Expr::Literal(Literal::String(v)),
+        Value::Bool(v)   => Expr::Literal(Literal::Bool(v)),
+        _ => Expr::Literal(Literal::Int(0)),
+    }
+}
+
 fn literal_to_value(expr: &Expr) -> Result<Value, String> {
     match expr {
         Expr::Literal(Literal::Int(v))    => Ok(Value::Int(*v)),
@@ -2146,6 +2295,10 @@ fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value {
                 val == iv
             });
             Value::Bool(if *negated { !found } else { found })
+        }
+        Expr::InSubquery { .. } => {
+            // Should have been materialized into InList before eval_expr.
+            Value::Empty
         }
         Expr::UnaryOp(op, inner) => {
             let v = eval_expr(inner, row, columns);
@@ -2786,6 +2939,9 @@ fn collect_field_indices(expr: &Expr, columns: &[String], out: &mut Vec<usize>) 
             for item in list {
                 collect_field_indices(item, columns, out);
             }
+        }
+        Expr::InSubquery { expr, .. } => {
+            collect_field_indices(expr, columns, out);
         }
         _ => {}
     }
@@ -4115,6 +4271,214 @@ mod tests {
                 for row in &rows {
                     assert_eq!(row[1], Value::Empty);
                 }
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    // ─── Mul/Div expression tests (E2f) ───────────────────────────────
+
+    #[test]
+    fn test_mul_in_projection() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql("User { .name, double_age: .age * 2 }").unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["name", "double_age"]);
+                // Alice age=30 → 60, Bob age=25 → 50, Charlie age=35 → 70
+                let ages: Vec<_> = rows.iter().map(|r| &r[1]).collect();
+                assert!(ages.contains(&&Value::Int(60)));
+                assert!(ages.contains(&&Value::Int(50)));
+                assert!(ages.contains(&&Value::Int(70)));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_div_in_filter() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql("User filter .age / 10 > 2").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                // 30/10=3>2 ✓, 25/10=2 ✗, 35/10=3>2 ✓
+                assert_eq!(rows.len(), 2);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    // ─── Multi-column ORDER BY tests (E2f) ────────────────────────────
+
+    #[test]
+    fn test_multi_order_by() {
+        let mut engine = test_engine();
+        // Insert another 30-year-old so we can test tiebreaker
+        engine.execute_powql(r#"insert User { name := "Dave", email := "dave@ex.com", age := 30 }"#).unwrap();
+        let result = engine.execute_powql("User order .age asc, .name asc { .name, .age }").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                // Expected: Bob(25), Alice(30), Dave(30), Charlie(35)
+                assert_eq!(rows[0][0], Value::Str("Bob".into()));
+                assert_eq!(rows[1][0], Value::Str("Alice".into()));
+                assert_eq!(rows[2][0], Value::Str("Dave".into()));
+                assert_eq!(rows[3][0], Value::Str("Charlie".into()));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_multi_order_mixed_direction() {
+        let mut engine = test_engine();
+        engine.execute_powql(r#"insert User { name := "Dave", email := "dave@ex.com", age := 30 }"#).unwrap();
+        let result = engine.execute_powql("User order .age asc, .name desc { .name, .age }").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                // Expected: Bob(25), Dave(30), Alice(30), Charlie(35)
+                assert_eq!(rows[0][0], Value::Str("Bob".into()));
+                assert_eq!(rows[1][0], Value::Str("Dave".into()));
+                assert_eq!(rows[2][0], Value::Str("Alice".into()));
+                assert_eq!(rows[3][0], Value::Str("Charlie".into()));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    // ─── ALTER TABLE / DROP TABLE tests (E2g) ─────────────────────────
+
+    #[test]
+    fn test_alter_add_column() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql("alter User add column status: str").unwrap();
+        match result {
+            QueryResult::Executed { message } => {
+                assert!(message.contains("status"));
+                assert!(message.contains("User"));
+            }
+            other => panic!("expected Executed, got {other:?}"),
+        }
+        // Verify schema was updated — new inserts can use the new column
+        engine.execute_powql(r#"insert User { name := "Eve", email := "eve@ex.com", age := 22, status := "active" }"#).unwrap();
+        let result = engine.execute_powql(r#"User filter .name = "Eve" { .name, .status }"#).unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["name", "status"]);
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][1], Value::Str("active".into()));
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_alter_drop_column() {
+        let mut engine = test_engine();
+        engine.execute_powql("alter User drop column email").unwrap();
+        let result = engine.execute_powql("User { .name, .age }").unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["name", "age"]);
+                assert_eq!(rows.len(), 3);
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_drop_table() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql("drop User").unwrap();
+        match result {
+            QueryResult::Executed { message } => {
+                assert!(message.contains("User"));
+                assert!(message.contains("dropped"));
+            }
+            other => panic!("expected Executed, got {other:?}"),
+        }
+        // Querying the dropped table should fail
+        assert!(engine.execute_powql("User").is_err());
+    }
+
+    #[test]
+    fn test_drop_nonexistent_table_errors() {
+        let mut engine = test_engine();
+        assert!(engine.execute_powql("drop NonExistent").is_err());
+    }
+
+    #[test]
+    fn test_alter_add_duplicate_column_errors() {
+        let mut engine = test_engine();
+        assert!(engine.execute_powql("alter User add name: str").is_err());
+    }
+
+    #[test]
+    fn test_alter_drop_nonexistent_column_errors() {
+        let mut engine = test_engine();
+        assert!(engine.execute_powql("alter User drop column nonexistent").is_err());
+    }
+
+    // ─── IN subquery tests (E2h) ─────────────────────────────────────
+
+    #[test]
+    fn test_in_subquery_basic() {
+        let mut engine = test_engine();
+        // Create a second table with a subset of user names
+        engine.execute_powql("type VIP { required name: str }").unwrap();
+        engine.execute_powql(r#"insert VIP { name := "Alice" }"#).unwrap();
+        engine.execute_powql(r#"insert VIP { name := "Charlie" }"#).unwrap();
+
+        let result = engine.execute_powql(
+            "User filter .name in (VIP { .name }) { .name, .age }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2);
+                let names: Vec<_> = rows.iter().map(|r| &r[0]).collect();
+                assert!(names.contains(&&Value::Str("Alice".into())));
+                assert!(names.contains(&&Value::Str("Charlie".into())));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_not_in_subquery() {
+        let mut engine = test_engine();
+        engine.execute_powql("type VIP { required name: str }").unwrap();
+        engine.execute_powql(r#"insert VIP { name := "Alice" }"#).unwrap();
+        engine.execute_powql(r#"insert VIP { name := "Charlie" }"#).unwrap();
+
+        let result = engine.execute_powql(
+            "User filter .name not in (VIP { .name }) { .name }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Str("Bob".into()));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_in_subquery_with_filter() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Score { required name: str, required points: int }").unwrap();
+        engine.execute_powql(r#"insert Score { name := "Alice", points := 100 }"#).unwrap();
+        engine.execute_powql(r#"insert Score { name := "Bob", points := 50 }"#).unwrap();
+        engine.execute_powql(r#"insert Score { name := "Charlie", points := 80 }"#).unwrap();
+
+        // Find users whose names are in the high-scorers list (points > 70)
+        let result = engine.execute_powql(
+            "User filter .name in (Score filter .points > 70 { .name }) { .name }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2);
+                let names: Vec<_> = rows.iter().map(|r| &r[0]).collect();
+                assert!(names.contains(&&Value::Str("Alice".into())));
+                assert!(names.contains(&&Value::Str("Charlie".into())));
             }
             _ => panic!("expected rows"),
         }

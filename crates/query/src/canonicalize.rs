@@ -168,6 +168,10 @@ fn hash_token(h: u64, tok: &Token, literals: &mut Vec<Literal>) -> u64 {
         Token::Then         => hash_byte(h, 0x58),
         Token::Else         => hash_byte(h, 0x59),
         Token::End          => hash_byte(h, 0x5A),
+        Token::Alter        => hash_byte(h, 0x5B),
+        Token::Drop         => hash_byte(h, 0x5C),
+        Token::Add          => hash_byte(h, 0x5D),
+        Token::Column       => hash_byte(h, 0x5E),
 
         // Operators.
         Token::Eq       => hash_byte(h, 0x40),

@@ -25,6 +25,8 @@ pub fn plan_statement(stmt: Statement) -> Result<PlanNode, PlanError> {
         Statement::UpdateQuery(upd) => plan_update(upd),
         Statement::DeleteQuery(del) => plan_delete(del),
         Statement::CreateType(ct) => plan_create_type(ct),
+        Statement::AlterTable(at) => Ok(PlanNode::AlterTable { table: at.table, action: at.action }),
+        Statement::DropTable(dt) => Ok(PlanNode::DropTable { name: dt.table }),
     }
 }
 
@@ -79,7 +81,7 @@ fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
         }
 
         if let Some(order) = q.order {
-            node = PlanNode::Sort { input: Box::new(node), field: order.field, descending: order.descending };
+            node = PlanNode::Sort { input: Box::new(node), keys: order.keys.into_iter().map(|k| SortKey { field: k.field, descending: k.descending }).collect() };
         }
         if let Some(lim) = q.limit {
             node = PlanNode::Limit { input: Box::new(node), count: lim };
@@ -96,8 +98,7 @@ fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
     if let Some(order) = q.order {
         node = PlanNode::Sort {
             input: Box::new(node),
-            field: order.field,
-            descending: order.descending,
+            keys: order.keys.into_iter().map(|k| SortKey { field: k.field, descending: k.descending }).collect(),
         };
     }
 
@@ -197,8 +198,7 @@ fn plan_joined_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
     if let Some(order) = q.order {
         node = PlanNode::Sort {
             input: Box::new(node),
-            field: order.field,
-            descending: order.descending,
+            keys: order.keys.into_iter().map(|k| SortKey { field: k.field, descending: k.descending }).collect(),
         };
     }
 
@@ -379,6 +379,9 @@ fn rewrite_agg_expr(expr: &mut Expr, aggs: &mut Vec<GroupAgg>, counter: &mut usi
             for item in list {
                 rewrite_agg_expr(item, aggs, counter);
             }
+        }
+        Expr::InSubquery { expr: e, .. } => {
+            rewrite_agg_expr(e, aggs, counter);
         }
         _ => {}
     }

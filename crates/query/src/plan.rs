@@ -1,4 +1,4 @@
-use crate::ast::{AggFunc, Expr, Assignment, JoinKind};
+use crate::ast::{AggFunc, AlterAction, Expr, Assignment, JoinKind};
 
 /// Physical plan nodes — what the executor actually runs.
 #[derive(Debug, Clone)]
@@ -14,7 +14,7 @@ pub enum PlanNode {
     IndexScan { table: String, column: String, key: Expr },
     Filter { input: Box<PlanNode>, predicate: Expr },
     Project { input: Box<PlanNode>, fields: Vec<ProjectField> },
-    Sort { input: Box<PlanNode>, field: String, descending: bool },
+    Sort { input: Box<PlanNode>, keys: Vec<SortKey> },
     Limit { input: Box<PlanNode>, count: Expr },
     Offset { input: Box<PlanNode>, count: Expr },
     Aggregate { input: Box<PlanNode>, function: AggFunc, field: Option<String> },
@@ -43,6 +43,8 @@ pub enum PlanNode {
         aggregates: Vec<GroupAgg>,
         having: Option<Expr>,
     },
+    AlterTable { table: String, action: AlterAction },
+    DropTable { name: String },
     Insert { table: String, assignments: Vec<Assignment> },
     Update { input: Box<PlanNode>, table: String, assignments: Vec<Assignment> },
     Delete { input: Box<PlanNode>, table: String },
@@ -53,6 +55,12 @@ pub enum PlanNode {
 pub struct ProjectField {
     pub alias: Option<String>,
     pub expr: Expr,
+}
+
+#[derive(Debug, Clone)]
+pub struct SortKey {
+    pub field: String,
+    pub descending: bool,
 }
 
 /// One aggregate computation inside a `PlanNode::GroupBy`.

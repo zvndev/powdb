@@ -72,6 +72,12 @@ pub enum Token {
     Else,       // else
     End,        // end
 
+    // DDL
+    Alter,      // alter
+    Drop,       // drop
+    Add,        // add
+    Column,     // column
+
     // Operators
     Eq,         // =
     Neq,        // !=

@@ -273,6 +273,70 @@ impl Catalog {
         let slot = *self.name_to_slot.get(table)?;
         Some(&self.tables[slot].schema)
     }
+
+    /// Drop a table: remove from the catalog and delete its data files.
+    /// Returns `Err` if the table doesn't exist.
+    pub fn drop_table(&mut self, name: &str) -> io::Result<()> {
+        let slot = *self.name_to_slot.get(name)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{name}' not found")))?;
+        // Remove the data file.
+        let table = &self.tables[slot];
+        let heap_path = self.data_dir.join(format!("{}.dat", table.schema.table_name));
+        if heap_path.exists() {
+            fs::remove_file(&heap_path)?;
+        }
+        // Remove index files.
+        for col in &table.schema.columns {
+            let idx_path = self.data_dir.join(format!("{}_{}.idx", name, col.name));
+            if idx_path.exists() {
+                let _ = fs::remove_file(&idx_path);
+            }
+        }
+        // Swap-remove from the Vec and fix up name_to_slot.
+        self.name_to_slot.remove(name);
+        let last = self.tables.len() - 1;
+        if slot != last {
+            let moved_name = self.tables[last].schema.table_name.clone();
+            self.tables.swap(slot, last);
+            self.name_to_slot.insert(moved_name, slot);
+        }
+        self.tables.pop();
+        self.persist()?;
+        Ok(())
+    }
+
+    /// Add a column to an existing table's schema. Existing rows get
+    /// `Value::Empty` for the new column on next read (no backfill needed
+    /// since the heap format already handles short rows gracefully).
+    pub fn alter_table_add_column(&mut self, table: &str, col: ColumnDef) -> io::Result<()> {
+        let tbl = self.by_name_mut(table)?;
+        // Check for duplicate column name.
+        if tbl.schema.columns.iter().any(|c| c.name == col.name) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists,
+                format!("column '{}' already exists in table '{table}'", col.name)));
+        }
+        tbl.schema.columns.push(col);
+        tbl.refresh_layout();
+        self.persist()?;
+        Ok(())
+    }
+
+    /// Remove a column from an existing table's schema. Does NOT rewrite
+    /// existing heap rows — reads simply won't decode the dropped column.
+    pub fn alter_table_drop_column(&mut self, table: &str, col_name: &str) -> io::Result<()> {
+        let tbl = self.by_name_mut(table)?;
+        let idx = tbl.schema.columns.iter().position(|c| c.name == col_name)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound,
+                format!("column '{col_name}' not found in table '{table}'")))?;
+        tbl.schema.columns.remove(idx);
+        // Recompute positions.
+        for (i, col) in tbl.schema.columns.iter_mut().enumerate() {
+            col.position = i as u16;
+        }
+        tbl.refresh_layout();
+        self.persist()?;
+        Ok(())
+    }
 }
 
 // ─── Catalog file format ────────────────────────────────────────────────────

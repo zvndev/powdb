@@ -10,6 +10,7 @@ pub enum QueryResult {
     Scalar(Value),     // count, avg, etc.
     Modified(u64),     // insert/update/delete — number of rows affected
     Created(String),   // DDL — type name created
+    Executed { message: String }, // DDL — alter/drop feedback
 }
 
 impl QueryResult {
@@ -19,6 +20,7 @@ impl QueryResult {
             QueryResult::Scalar(_) => 1,
             QueryResult::Modified(n) => *n as usize,
             QueryResult::Created(_) => 0,
+            QueryResult::Executed { .. } => 0,
         }
     }
 }
