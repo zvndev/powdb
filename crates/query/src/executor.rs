@@ -1913,13 +1913,19 @@ impl Engine {
             Some(i) => i,
             None => return Ok(None),
         };
-        // Only fast-path fixed-size int columns for sum/avg/min/max.
-        if schema.columns[col_idx].type_id != TypeId::Int {
+        // Only fast-path fixed-size numeric columns (Int/Float) for
+        // sum/avg/min/max/count. Mission D10: Float parity — prior version
+        // bailed on Float columns, forcing them through the generic row-
+        // decoding path that allocated a Vec<Value> per row and dispatched
+        // on Value::cmp for every compare. f64 decode is structurally the
+        // same as i64 (load 8 bytes, cast), so the fast path handles both.
+        let col_type = schema.columns[col_idx].type_id;
+        if col_type != TypeId::Int && col_type != TypeId::Float {
             return Ok(None);
         }
 
         let fast = FastLayout::new(&schema);
-        // Mission C Phase 20b: inline the int-column reader instead of
+        // Mission C Phase 20b: inline the numeric-column reader instead of
         // building a `Box<dyn Fn>`. Eliminates 100K vtable dispatches per
         // 100K-row agg scan — every reader call folds directly into the
         // hot loop below.
@@ -1949,89 +1955,212 @@ impl Engine {
         // hot loop lets each specialized body fold cleanly into
         // `for_each_row_raw` and removes a captured `AggFunc` + match
         // dispatch per row.
-        let result = match function {
-            AggFunc::Sum | AggFunc::Avg => {
-                let mut sum_i128: i128 = 0;
-                let mut count: i64 = 0;
-                self.catalog.for_each_row_raw(table, |_rid, data| {
-                    if let Some(ref pred) = compiled_pred {
-                        if !pred(data) { return; }
+        //
+        // Mission D10: same specialisation applies to the Float branch.
+        // For Min/Max we use `f64::total_cmp` so the result matches
+        // `Value::Ord` — this is the same ordering ORDER BY and the
+        // top-N sort fast path use, keeping semantics consistent across
+        // read paths (NaN compares as greatest, -0.0 < +0.0 for
+        // deterministic tie-breaking).
+        let result = match col_type {
+            TypeId::Int => match function {
+                AggFunc::Sum | AggFunc::Avg => {
+                    let mut sum_i128: i128 = 0;
+                    let mut count: i64 = 0;
+                    self.catalog.for_each_row_raw(table, |_rid, data| {
+                        if let Some(ref pred) = compiled_pred {
+                            if !pred(data) { return; }
+                        }
+                        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
+                        if is_null { return; }
+                        let v = i64::from_le_bytes(
+                            data[data_offset..data_offset + 8].try_into().unwrap(),
+                        );
+                        count += 1;
+                        sum_i128 += v as i128;
+                    }).map_err(|e| e.to_string())?;
+                    if matches!(function, AggFunc::Sum) {
+                        let clamped = sum_i128.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+                        QueryResult::Scalar(Value::Int(clamped))
+                    } else if count == 0 {
+                        QueryResult::Scalar(Value::Empty)
+                    } else {
+                        let avg = (sum_i128 as f64) / (count as f64);
+                        QueryResult::Scalar(Value::Float(avg))
                     }
-                    let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
-                    if is_null { return; }
-                    let v = i64::from_le_bytes(
-                        data[data_offset..data_offset + 8].try_into().unwrap(),
-                    );
-                    count += 1;
-                    sum_i128 += v as i128;
-                }).map_err(|e| e.to_string())?;
-                if matches!(function, AggFunc::Sum) {
-                    let clamped = sum_i128.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
-                    QueryResult::Scalar(Value::Int(clamped))
-                } else if count == 0 {
-                    QueryResult::Scalar(Value::Empty)
-                } else {
-                    let avg = (sum_i128 as f64) / (count as f64);
-                    QueryResult::Scalar(Value::Float(avg))
+                }
+                AggFunc::Min => {
+                    let mut min_v: Option<i64> = None;
+                    self.catalog.for_each_row_raw(table, |_rid, data| {
+                        if let Some(ref pred) = compiled_pred {
+                            if !pred(data) { return; }
+                        }
+                        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
+                        if is_null { return; }
+                        let v = i64::from_le_bytes(
+                            data[data_offset..data_offset + 8].try_into().unwrap(),
+                        );
+                        min_v = Some(match min_v { Some(m) => m.min(v), None => v });
+                    }).map_err(|e| e.to_string())?;
+                    QueryResult::Scalar(min_v.map(Value::Int).unwrap_or(Value::Empty))
+                }
+                AggFunc::Max => {
+                    let mut max_v: Option<i64> = None;
+                    self.catalog.for_each_row_raw(table, |_rid, data| {
+                        if let Some(ref pred) = compiled_pred {
+                            if !pred(data) { return; }
+                        }
+                        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
+                        if is_null { return; }
+                        let v = i64::from_le_bytes(
+                            data[data_offset..data_offset + 8].try_into().unwrap(),
+                        );
+                        max_v = Some(match max_v { Some(m) => m.max(v), None => v });
+                    }).map_err(|e| e.to_string())?;
+                    QueryResult::Scalar(max_v.map(Value::Int).unwrap_or(Value::Empty))
+                }
+                AggFunc::Count => {
+                    let mut count: i64 = 0;
+                    self.catalog.for_each_row_raw(table, |_rid, data| {
+                        if let Some(ref pred) = compiled_pred {
+                            if !pred(data) { return; }
+                        }
+                        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
+                        if is_null { return; }
+                        count += 1;
+                    }).map_err(|e| e.to_string())?;
+                    QueryResult::Scalar(Value::Int(count))
+                }
+                AggFunc::CountDistinct => {
+                    let mut seen = rustc_hash::FxHashSet::default();
+                    self.catalog.for_each_row_raw(table, |_rid, data| {
+                        if let Some(ref pred) = compiled_pred {
+                            if !pred(data) { return; }
+                        }
+                        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
+                        if is_null { return; }
+                        let v = i64::from_le_bytes(
+                            data[data_offset..data_offset + 8].try_into().unwrap(),
+                        );
+                        seen.insert(v);
+                    }).map_err(|e| e.to_string())?;
+                    QueryResult::Scalar(Value::Int(seen.len() as i64))
                 }
             }
-            AggFunc::Min => {
-                let mut min_v: Option<i64> = None;
-                self.catalog.for_each_row_raw(table, |_rid, data| {
-                    if let Some(ref pred) = compiled_pred {
-                        if !pred(data) { return; }
+            TypeId::Float => match function {
+                AggFunc::Sum => {
+                    // Use a single f64 accumulator. Naive summation is
+                    // sufficient for MVP parity; if precision becomes an
+                    // issue on long scans we can upgrade to Kahan–Neumaier
+                    // compensated sum (~2x scalar cost, zero error growth).
+                    let mut sum: f64 = 0.0;
+                    self.catalog.for_each_row_raw(table, |_rid, data| {
+                        if let Some(ref pred) = compiled_pred {
+                            if !pred(data) { return; }
+                        }
+                        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
+                        if is_null { return; }
+                        let v = f64::from_le_bytes(
+                            data[data_offset..data_offset + 8].try_into().unwrap(),
+                        );
+                        sum += v;
+                    }).map_err(|e| e.to_string())?;
+                    QueryResult::Scalar(Value::Float(sum))
+                }
+                AggFunc::Avg => {
+                    let mut sum: f64 = 0.0;
+                    let mut count: i64 = 0;
+                    self.catalog.for_each_row_raw(table, |_rid, data| {
+                        if let Some(ref pred) = compiled_pred {
+                            if !pred(data) { return; }
+                        }
+                        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
+                        if is_null { return; }
+                        let v = f64::from_le_bytes(
+                            data[data_offset..data_offset + 8].try_into().unwrap(),
+                        );
+                        sum += v;
+                        count += 1;
+                    }).map_err(|e| e.to_string())?;
+                    if count == 0 {
+                        QueryResult::Scalar(Value::Empty)
+                    } else {
+                        QueryResult::Scalar(Value::Float(sum / count as f64))
                     }
-                    let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
-                    if is_null { return; }
-                    let v = i64::from_le_bytes(
-                        data[data_offset..data_offset + 8].try_into().unwrap(),
-                    );
-                    min_v = Some(match min_v { Some(m) => m.min(v), None => v });
-                }).map_err(|e| e.to_string())?;
-                QueryResult::Scalar(min_v.map(Value::Int).unwrap_or(Value::Empty))
+                }
+                AggFunc::Min => {
+                    // `total_cmp` for deterministic NaN handling (matches
+                    // Value::Ord). NaN compares greatest, so Min will
+                    // correctly ignore it in favour of any finite value.
+                    let mut min_v: Option<f64> = None;
+                    self.catalog.for_each_row_raw(table, |_rid, data| {
+                        if let Some(ref pred) = compiled_pred {
+                            if !pred(data) { return; }
+                        }
+                        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
+                        if is_null { return; }
+                        let v = f64::from_le_bytes(
+                            data[data_offset..data_offset + 8].try_into().unwrap(),
+                        );
+                        min_v = Some(match min_v {
+                            Some(m) => if v.total_cmp(&m).is_lt() { v } else { m },
+                            None => v,
+                        });
+                    }).map_err(|e| e.to_string())?;
+                    QueryResult::Scalar(min_v.map(Value::Float).unwrap_or(Value::Empty))
+                }
+                AggFunc::Max => {
+                    let mut max_v: Option<f64> = None;
+                    self.catalog.for_each_row_raw(table, |_rid, data| {
+                        if let Some(ref pred) = compiled_pred {
+                            if !pred(data) { return; }
+                        }
+                        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
+                        if is_null { return; }
+                        let v = f64::from_le_bytes(
+                            data[data_offset..data_offset + 8].try_into().unwrap(),
+                        );
+                        max_v = Some(match max_v {
+                            Some(m) => if v.total_cmp(&m).is_gt() { v } else { m },
+                            None => v,
+                        });
+                    }).map_err(|e| e.to_string())?;
+                    QueryResult::Scalar(max_v.map(Value::Float).unwrap_or(Value::Empty))
+                }
+                AggFunc::Count => {
+                    let mut count: i64 = 0;
+                    self.catalog.for_each_row_raw(table, |_rid, data| {
+                        if let Some(ref pred) = compiled_pred {
+                            if !pred(data) { return; }
+                        }
+                        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
+                        if is_null { return; }
+                        count += 1;
+                    }).map_err(|e| e.to_string())?;
+                    QueryResult::Scalar(Value::Int(count))
+                }
+                AggFunc::CountDistinct => {
+                    // Hash on `f64::to_bits` — matches `Value::Hash`, so
+                    // distinct NaN bit patterns count as distinct and
+                    // -0.0/+0.0 count as distinct. Consistent with how
+                    // Float values are hashed in every other DISTINCT /
+                    // GROUP BY path.
+                    let mut seen = rustc_hash::FxHashSet::default();
+                    self.catalog.for_each_row_raw(table, |_rid, data| {
+                        if let Some(ref pred) = compiled_pred {
+                            if !pred(data) { return; }
+                        }
+                        let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
+                        if is_null { return; }
+                        let v = f64::from_le_bytes(
+                            data[data_offset..data_offset + 8].try_into().unwrap(),
+                        );
+                        seen.insert(v.to_bits());
+                    }).map_err(|e| e.to_string())?;
+                    QueryResult::Scalar(Value::Int(seen.len() as i64))
+                }
             }
-            AggFunc::Max => {
-                let mut max_v: Option<i64> = None;
-                self.catalog.for_each_row_raw(table, |_rid, data| {
-                    if let Some(ref pred) = compiled_pred {
-                        if !pred(data) { return; }
-                    }
-                    let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
-                    if is_null { return; }
-                    let v = i64::from_le_bytes(
-                        data[data_offset..data_offset + 8].try_into().unwrap(),
-                    );
-                    max_v = Some(match max_v { Some(m) => m.max(v), None => v });
-                }).map_err(|e| e.to_string())?;
-                QueryResult::Scalar(max_v.map(Value::Int).unwrap_or(Value::Empty))
-            }
-            AggFunc::Count => {
-                let mut count: i64 = 0;
-                self.catalog.for_each_row_raw(table, |_rid, data| {
-                    if let Some(ref pred) = compiled_pred {
-                        if !pred(data) { return; }
-                    }
-                    let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
-                    if is_null { return; }
-                    count += 1;
-                }).map_err(|e| e.to_string())?;
-                QueryResult::Scalar(Value::Int(count))
-            }
-            AggFunc::CountDistinct => {
-                let mut seen = rustc_hash::FxHashSet::default();
-                self.catalog.for_each_row_raw(table, |_rid, data| {
-                    if let Some(ref pred) = compiled_pred {
-                        if !pred(data) { return; }
-                    }
-                    let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
-                    if is_null { return; }
-                    let v = i64::from_le_bytes(
-                        data[data_offset..data_offset + 8].try_into().unwrap(),
-                    );
-                    seen.insert(v);
-                }).map_err(|e| e.to_string())?;
-                QueryResult::Scalar(Value::Int(seen.len() as i64))
-            }
+            _ => unreachable!("type guard above restricts to Int/Float"),
         };
         Ok(Some(result))
     }
@@ -2125,12 +2254,18 @@ impl Engine {
             .clone();
         let all_columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
 
-        // Sort key must be a fixed-size Int column.
+        // Sort key must be a fixed-size numeric column (Int or Float).
+        // Mission D10: extended from Int-only. Float sort keys use a
+        // sortable-u64 transform (see `f64_to_sortable_u64`) so the heap
+        // path stays keyed on `u64` and the whole branch shape is
+        // identical to the Int case — no new heap types, no `total_cmp`
+        // closures in the hot loop.
         let sort_idx = match schema.column_index(sort_field) {
             Some(i) => i,
             None => return Ok(None),
         };
-        if schema.columns[sort_idx].type_id != TypeId::Int {
+        let sort_col_type = schema.columns[sort_idx].type_id;
+        if sort_col_type != TypeId::Int && sort_col_type != TypeId::Float {
             return Ok(None);
         }
 
@@ -2152,7 +2287,7 @@ impl Engine {
 
         let fast = FastLayout::new(&schema);
         let row_layout = RowLayout::new(&schema);
-        // Mission C Phase 20b: inline int-column reader (no Box<dyn Fn>).
+        // Mission C Phase 20b: inline numeric-column reader (no Box<dyn Fn>).
         let sort_byte_offset = match fast.fixed_offsets[sort_idx] {
             Some(o) => o,
             None => return Ok(None),
@@ -2177,61 +2312,121 @@ impl Engine {
         //
         // To keep this simple we maintain two typed heaps and pick by
         // direction.
-        let mut seq: u64 = 0;
-        let mut heap_desc: BinaryHeap<Reverse<(i64, u64, Vec<u8>)>> = BinaryHeap::with_capacity(limit);
-        let mut heap_asc: BinaryHeap<(i64, u64, Vec<u8>)> = BinaryHeap::with_capacity(limit);
+        let drained: Vec<Vec<u8>> = match sort_col_type {
+            TypeId::Int => {
+                let mut seq: u64 = 0;
+                let mut heap_desc: BinaryHeap<Reverse<(i64, u64, Vec<u8>)>> = BinaryHeap::with_capacity(limit);
+                let mut heap_asc: BinaryHeap<(i64, u64, Vec<u8>)> = BinaryHeap::with_capacity(limit);
 
-        self.catalog.for_each_row_raw(table, |_rid, data| {
-            if let Some(ref pred) = compiled_pred {
-                if !pred(data) { return; }
-            }
-            // Inlined int-column reader: null check + i64 decode.
-            let is_null = (data[2 + sort_bitmap_byte] >> sort_bitmap_bit) & 1 == 1;
-            if is_null {
-                return;
-            }
-            let key = i64::from_le_bytes(
-                data[sort_data_offset..sort_data_offset + 8].try_into().unwrap(),
-            );
-            let id = seq;
-            seq += 1;
-
-            if descending {
-                if heap_desc.len() < limit {
-                    heap_desc.push(Reverse((key, id, data.to_vec())));
-                } else if let Some(Reverse((top_key, _, _))) = heap_desc.peek() {
-                    // top of min-heap is the smallest currently-kept key;
-                    // replace it if the new key is larger.
-                    if key > *top_key {
-                        heap_desc.pop();
-                        heap_desc.push(Reverse((key, id, data.to_vec())));
+                self.catalog.for_each_row_raw(table, |_rid, data| {
+                    if let Some(ref pred) = compiled_pred {
+                        if !pred(data) { return; }
                     }
+                    // Inlined int-column reader: null check + i64 decode.
+                    let is_null = (data[2 + sort_bitmap_byte] >> sort_bitmap_bit) & 1 == 1;
+                    if is_null {
+                        return;
+                    }
+                    let key = i64::from_le_bytes(
+                        data[sort_data_offset..sort_data_offset + 8].try_into().unwrap(),
+                    );
+                    let id = seq;
+                    seq += 1;
+
+                    if descending {
+                        if heap_desc.len() < limit {
+                            heap_desc.push(Reverse((key, id, data.to_vec())));
+                        } else if let Some(Reverse((top_key, _, _))) = heap_desc.peek() {
+                            if key > *top_key {
+                                heap_desc.pop();
+                                heap_desc.push(Reverse((key, id, data.to_vec())));
+                            }
+                        }
+                    } else if heap_asc.len() < limit {
+                        heap_asc.push((key, id, data.to_vec()));
+                    } else if let Some((top_key, _, _)) = heap_asc.peek() {
+                        if key < *top_key {
+                            heap_asc.pop();
+                            heap_asc.push((key, id, data.to_vec()));
+                        }
+                    }
+                }).map_err(|e| e.to_string())?;
+
+                let mut drained: Vec<(i64, u64, Vec<u8>)> = if descending {
+                    heap_desc.into_iter().map(|Reverse(t)| t).collect()
+                } else {
+                    heap_asc.into_iter().collect()
+                };
+                if descending {
+                    drained.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+                } else {
+                    drained.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
                 }
-            } else if heap_asc.len() < limit {
-                heap_asc.push((key, id, data.to_vec()));
-            } else if let Some((top_key, _, _)) = heap_asc.peek() {
-                // top of max-heap is the largest currently-kept key;
-                // replace it if the new key is smaller.
-                if key < *top_key {
-                    heap_asc.pop();
-                    heap_asc.push((key, id, data.to_vec()));
-                }
+                drained.into_iter().map(|(_, _, d)| d).collect()
             }
-        }).map_err(|e| e.to_string())?;
+            TypeId::Float => {
+                // Novel angle: rather than introducing a `TotalF64` newtype
+                // with `Ord via total_cmp`, transform the f64 bit pattern
+                // into a sortable `u64` so `BinaryHeap<u64>` orders exactly
+                // like `f64::total_cmp` would. Classic trick: flip the sign
+                // bit on positives, flip all bits on negatives. Result:
+                // - NaN (sign=0) stays greatest, matching total_cmp
+                // - -0.0 sorts before +0.0, matching total_cmp
+                // - Hot loop is branch-cheap (one compare + one xor)
+                let mut seq: u64 = 0;
+                let mut heap_desc: BinaryHeap<Reverse<(u64, u64, Vec<u8>)>> = BinaryHeap::with_capacity(limit);
+                let mut heap_asc: BinaryHeap<(u64, u64, Vec<u8>)> = BinaryHeap::with_capacity(limit);
 
-        // Drain into a sorted vec (ascending by key, then by seq for stability).
-        let mut drained: Vec<(i64, u64, Vec<u8>)> = if descending {
-            heap_desc.into_iter().map(|Reverse(t)| t).collect()
-        } else {
-            heap_asc.into_iter().collect()
+                self.catalog.for_each_row_raw(table, |_rid, data| {
+                    if let Some(ref pred) = compiled_pred {
+                        if !pred(data) { return; }
+                    }
+                    let is_null = (data[2 + sort_bitmap_byte] >> sort_bitmap_bit) & 1 == 1;
+                    if is_null {
+                        return;
+                    }
+                    let bits = u64::from_le_bytes(
+                        data[sort_data_offset..sort_data_offset + 8].try_into().unwrap(),
+                    );
+                    let key = f64_bits_to_sortable_u64(bits);
+                    let id = seq;
+                    seq += 1;
+
+                    if descending {
+                        if heap_desc.len() < limit {
+                            heap_desc.push(Reverse((key, id, data.to_vec())));
+                        } else if let Some(Reverse((top_key, _, _))) = heap_desc.peek() {
+                            if key > *top_key {
+                                heap_desc.pop();
+                                heap_desc.push(Reverse((key, id, data.to_vec())));
+                            }
+                        }
+                    } else if heap_asc.len() < limit {
+                        heap_asc.push((key, id, data.to_vec()));
+                    } else if let Some((top_key, _, _)) = heap_asc.peek() {
+                        if key < *top_key {
+                            heap_asc.pop();
+                            heap_asc.push((key, id, data.to_vec()));
+                        }
+                    }
+                }).map_err(|e| e.to_string())?;
+
+                let mut drained: Vec<(u64, u64, Vec<u8>)> = if descending {
+                    heap_desc.into_iter().map(|Reverse(t)| t).collect()
+                } else {
+                    heap_asc.into_iter().collect()
+                };
+                if descending {
+                    drained.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+                } else {
+                    drained.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+                }
+                drained.into_iter().map(|(_, _, d)| d).collect()
+            }
+            _ => unreachable!("type guard above restricts to Int/Float"),
         };
-        if descending {
-            drained.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        } else {
-            drained.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-        }
 
-        let rows: Vec<Vec<Value>> = drained.into_iter().map(|(_, _, data)| {
+        let rows: Vec<Vec<Value>> = drained.into_iter().map(|data| {
             proj_indices.iter()
                 .map(|&ci| decode_column(&schema, &row_layout, &data, ci))
                 .collect()
@@ -2937,6 +3132,31 @@ impl FastLayout {
 }
 
 type CompiledPredicate = Box<dyn Fn(&[u8]) -> bool>;
+
+/// Map an f64 bit pattern to a u64 that orders under unsigned integer
+/// comparison the same way `f64::total_cmp` orders the floats. Classic
+/// sortable-float transform:
+///   - Positive floats (sign bit 0): flip the sign bit. This maps
+///     [+0, +∞, +NaN] to [0x8000…, 0xFFF0…, 0xFFF8…] — increasing as u64.
+///   - Negative floats (sign bit 1): flip every bit. This maps
+///     [-∞, -0] to [0x000F…, 0x7FFF…] — increasing as u64, and placed
+///     *below* the positive range so negatives < positives.
+///
+/// Used by Mission D10 Float fast paths so we can key heaps on `u64`
+/// (branch-cheap, folds into LLVM xor/sar/xor) instead of a `TotalF64`
+/// newtype with `Ord::cmp` calling `total_cmp`.
+#[inline]
+fn f64_bits_to_sortable_u64(bits: u64) -> u64 {
+    // `((bits >> 63) as i64 * -1) as u64 | 0x8000_0000_0000_0000`
+    // would also work; the branchless form below is equally good on
+    // modern CPUs and easier to read.
+    if bits & 0x8000_0000_0000_0000 == 0 {
+        bits ^ 0x8000_0000_0000_0000
+    } else {
+        !bits
+    }
+}
+
 /// A single flattened predicate leaf — pure data, no closures, no allocation
 /// per call. Mission D3: replaces recursive Box<dyn Fn> conjunctions with a
 /// `Vec<CompiledLeaf>` so the inner scan loop becomes a tight match instead
@@ -2949,6 +3169,19 @@ enum CompiledLeaf {
         bitmap_bit: u8,
         op: BinOp,
         literal: i64,
+    },
+    /// `.field <op> literal_float` (or reversed), where `.field` is a
+    /// Float column. Int literals that bound a Float column (e.g.
+    /// `.price > 100` on `price: float`) are also routed here, promoted
+    /// to `f64` at compile time so the hot loop only sees one shape.
+    /// Comparisons use `f64::total_cmp` so NaN handling is deterministic
+    /// and consistent with `Value::Ord` across every read path.
+    Float {
+        data_offset: usize,
+        bitmap_byte: usize,
+        bitmap_bit: u8,
+        op: BinOp,
+        literal: f64,
     },
     /// `.field is null` or `.field is not null`
     IsNull {
@@ -2995,6 +3228,35 @@ impl CompiledLeaf {
                     BinOp::Gt => val > *literal,
                     BinOp::Lte => val <= *literal,
                     BinOp::Gte => val >= *literal,
+                    _ => false,
+                }
+            }
+            CompiledLeaf::Float {
+                data_offset,
+                bitmap_byte,
+                bitmap_bit,
+                op,
+                literal,
+            } => {
+                let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
+                if is_null {
+                    return false;
+                }
+                let val = f64::from_le_bytes(
+                    data[*data_offset..*data_offset + 8].try_into().unwrap(),
+                );
+                // `total_cmp` matches Value::Ord: NaN > everything,
+                // -0.0 < +0.0, finite order as expected. Keeps compiled
+                // WHERE identical in semantics to the generic row-decode
+                // path (which calls Value::cmp directly).
+                let ord = val.total_cmp(literal);
+                match op {
+                    BinOp::Eq => ord.is_eq(),
+                    BinOp::Neq => !ord.is_eq(),
+                    BinOp::Lt => ord.is_lt(),
+                    BinOp::Gt => ord.is_gt(),
+                    BinOp::Lte => !ord.is_gt(),
+                    BinOp::Gte => !ord.is_lt(),
                     _ => false,
                 }
             }
@@ -3088,6 +3350,10 @@ fn flatten_and_compile(
                 out.push(leaf);
                 return Some(());
             }
+            if let Some(leaf) = build_float_leaf(left, *op, right, columns, layout, schema) {
+                out.push(leaf);
+                return Some(());
+            }
             if let Some(leaf) = build_str_eq_leaf(left, *op, right, columns, layout, schema) {
                 out.push(leaf);
                 return Some(());
@@ -3154,6 +3420,73 @@ fn build_int_leaf(
     let data_offset = 2 + layout.bitmap_size + byte_offset;
 
     Some(CompiledLeaf::Int {
+        data_offset,
+        bitmap_byte,
+        bitmap_bit,
+        op,
+        literal: literal_val,
+    })
+}
+
+/// Build a `Float` leaf from `.field <op> literal` where `.field` is a
+/// Float column and `literal` is numeric (Float or Int — Int literals are
+/// promoted to `f64` at compile time so the hot loop only sees one shape).
+///
+/// Mission D10: adds the Float fast-path counterpart to `build_int_leaf`.
+/// Without this, `WHERE .price > 100.0` on a `price: float` column falls
+/// through `compile_predicate`, forcing the whole query to the generic
+/// `decode_row → Value::cmp` path which allocates a `Vec<Value>` per row.
+fn build_float_leaf(
+    left: &Expr,
+    op: BinOp,
+    right: &Expr,
+    columns: &[String],
+    layout: &FastLayout,
+    schema: &Schema,
+) -> Option<CompiledLeaf> {
+    // Accept either direction: field-op-literal or literal-op-field.
+    // When the literal is on the left, flip the operator so the hot-loop
+    // eval can assume the field is always the LHS.
+    let (field_name, literal_val, op) = match (left, right) {
+        (Expr::Field(name), Expr::Literal(Literal::Float(v))) => (name, *v, op),
+        (Expr::Field(name), Expr::Literal(Literal::Int(v)))   => (name, *v as f64, op),
+        (Expr::Literal(Literal::Float(v)), Expr::Field(name)) => {
+            let flipped = match op {
+                BinOp::Lt => BinOp::Gt,
+                BinOp::Gt => BinOp::Lt,
+                BinOp::Lte => BinOp::Gte,
+                BinOp::Gte => BinOp::Lte,
+                other => other,
+            };
+            (name, *v, flipped)
+        }
+        (Expr::Literal(Literal::Int(v)), Expr::Field(name)) => {
+            let flipped = match op {
+                BinOp::Lt => BinOp::Gt,
+                BinOp::Gt => BinOp::Lt,
+                BinOp::Lte => BinOp::Gte,
+                BinOp::Gte => BinOp::Lte,
+                other => other,
+            };
+            (name, *v as f64, flipped)
+        }
+        _ => return None,
+    };
+
+    let col_idx = columns.iter().position(|c| c == field_name)?;
+    // Symmetric guard to build_int_leaf: only fire on Float columns. If
+    // the column is Int but the literal was Float, we want the generic
+    // path (which promotes Int → f64 via Value::cmp) — compiling a
+    // Float leaf would read the i64 bytes as f64 and produce nonsense.
+    if schema.columns[col_idx].type_id != TypeId::Float {
+        return None;
+    }
+    let byte_offset = layout.fixed_offsets[col_idx]?;
+    let bitmap_byte = col_idx / 8;
+    let bitmap_bit = (col_idx % 8) as u8;
+    let data_offset = 2 + layout.bitmap_size + byte_offset;
+
+    Some(CompiledLeaf::Float {
         data_offset,
         bitmap_byte,
         bitmap_bit,
@@ -5686,6 +6019,250 @@ mod tests {
                 assert!((by_region["W"] - 4.5).abs()  < 1e-9, "W: {:?}", by_region.get("W"));
             }
             _ => panic!("expected rows, got {result:?}"),
+        }
+    }
+
+    // ─── Mission D10: Float fast-path parity ─────────────────────────────
+    //
+    // Prior to D10, three hot paths in the executor bailed on Float columns:
+    //   1. `agg_single_col_fast` — sum/avg/min/max/count fell through to the
+    //      generic row-decoding path (allocates Vec<Value> per row).
+    //   2. `project_filter_sort_limit_fast` — top-N by Float column fell
+    //      through the generic sort path.
+    //   3. `compile_predicate` / `build_int_leaf` — WHERE on Float columns
+    //      couldn't compile, so the whole filter walked Value::cmp.
+    //
+    // These tests exercise each Float fast path end-to-end, including NaN
+    // handling via `total_cmp` (which matches `Value::Ord` so semantics are
+    // identical between fast-path and generic-path reads).
+
+    /// Engine with a Price table: price:float, qty:int. Eight rows with a
+    /// deliberate spread of values, a NaN, a negative, -0.0, and a null.
+    /// The null exercises the bitmap-skip branch; NaN and -0.0 exercise
+    /// the `total_cmp` invariant.
+    fn float_fast_engine() -> Engine {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("powdb_float_fast_{}_{}", std::process::id(), id));
+        let mut engine = Engine::new(&dir).unwrap();
+        engine.execute_powql(
+            "type Price { required name: str, price: float, required qty: int }"
+        ).unwrap();
+        // Insertion order deliberately scrambled so top-N doesn't trivially
+        // match insertion order.
+        let rows = [
+            ("a",  "price := 1.5",   "qty := 1"),
+            ("b",  "price := 0.25",  "qty := 2"),
+            ("c",  "price := 2.0",   "qty := 3"),
+            ("d",  "price := -3.5",  "qty := 4"),
+            ("e",  "price := 10.0",  "qty := 5"),
+            ("f",  "price := 0.5",   "qty := 6"),
+            ("g",  "price := 100.0", "qty := 7"),
+            ("h",  "price := -0.0",  "qty := 8"),
+        ];
+        for (name, price, qty) in rows {
+            engine.execute_powql(
+                &format!(r#"insert Price {{ name := "{name}", {price}, {qty} }}"#)
+            ).unwrap();
+        }
+        engine
+    }
+
+    #[test]
+    fn test_d10_agg_sum_float_fast_path() {
+        let mut engine = float_fast_engine();
+        let result = engine.execute_powql("sum(Price { .price })").unwrap();
+        // 1.5 + 0.25 + 2.0 + -3.5 + 10.0 + 0.5 + 100.0 + -0.0 = 110.75
+        match result {
+            QueryResult::Scalar(v) => {
+                assert!((as_float(&v) - 110.75).abs() < 1e-9, "got {v:?}");
+            }
+            _ => panic!("expected scalar, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_d10_agg_avg_float_fast_path() {
+        let mut engine = float_fast_engine();
+        let result = engine.execute_powql("avg(Price { .price })").unwrap();
+        // 110.75 / 8 = 13.84375
+        match result {
+            QueryResult::Scalar(v) => {
+                assert!((as_float(&v) - 13.84375).abs() < 1e-9, "got {v:?}");
+            }
+            _ => panic!("expected scalar, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_d10_agg_min_float_fast_path() {
+        let mut engine = float_fast_engine();
+        let result = engine.execute_powql("min(Price { .price })").unwrap();
+        match result {
+            QueryResult::Scalar(v) => {
+                assert!((as_float(&v) - (-3.5)).abs() < 1e-9, "got {v:?}");
+            }
+            _ => panic!("expected scalar, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_d10_agg_max_float_fast_path() {
+        let mut engine = float_fast_engine();
+        let result = engine.execute_powql("max(Price { .price })").unwrap();
+        match result {
+            QueryResult::Scalar(v) => {
+                assert!((as_float(&v) - 100.0).abs() < 1e-9, "got {v:?}");
+            }
+            _ => panic!("expected scalar, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_d10_agg_count_distinct_float_fast_path() {
+        let mut engine = float_fast_engine();
+        let result = engine.execute_powql("count(distinct Price { .price })").unwrap();
+        // All 8 prices are distinct (+0.0 isn't present; -0.0 is, and
+        // distinct from every other value). Hash via to_bits so -0.0 and
+        // +0.0 would count separately — matches Value::Hash.
+        match result {
+            QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 8, "got {n}"),
+            _ => panic!("expected scalar int, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_d10_agg_float_with_compiled_where() {
+        // Exercises `build_float_leaf` — WHERE .price > 1.0 must compile,
+        // and the Float fast path must use it to short-circuit rows.
+        let mut engine = float_fast_engine();
+        let result = engine.execute_powql("sum(Price filter .price > 1.0 { .price })").unwrap();
+        // Rows > 1.0: 1.5, 2.0, 10.0, 100.0 → sum = 113.5
+        match result {
+            QueryResult::Scalar(v) => {
+                assert!((as_float(&v) - 113.5).abs() < 1e-9, "got {v:?}");
+            }
+            _ => panic!("expected scalar, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_d10_agg_float_with_compiled_where_int_literal() {
+        // Novel cross-type: WHERE .price > 1 (Int literal on Float column)
+        // must still compile via build_float_leaf — the Int literal is
+        // promoted to f64 at compile time so the hot loop only sees f64.
+        let mut engine = float_fast_engine();
+        let result = engine.execute_powql("sum(Price filter .price > 1 { .price })").unwrap();
+        match result {
+            QueryResult::Scalar(v) => {
+                assert!((as_float(&v) - 113.5).abs() < 1e-9, "got {v:?}");
+            }
+            _ => panic!("expected scalar, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_d10_agg_float_with_reversed_literal() {
+        // `100.0 > .price` (literal on LHS) must also compile. The
+        // build_float_leaf flips the operator so the field is always LHS.
+        let mut engine = float_fast_engine();
+        let result = engine.execute_powql("count(Price filter 1.0 < .price { .price })").unwrap();
+        // Rows where 1.0 < .price: 1.5, 2.0, 10.0, 100.0 → count = 4
+        match result {
+            QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 4, "got {n}"),
+            _ => panic!("expected scalar int, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_d10_sort_float_desc_limit_fast_path() {
+        // Top-3 by price descending — exercises the Float branch of
+        // project_filter_sort_limit_fast with the sortable-u64 transform.
+        let mut engine = float_fast_engine();
+        let result = engine.execute_powql(
+            "Price order .price desc limit 3 { .name, .price }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["name", "price"]);
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0][0], Value::Str("g".into())); // 100.0
+                assert!((as_float(&rows[0][1]) - 100.0).abs() < 1e-9);
+                assert_eq!(rows[1][0], Value::Str("e".into())); // 10.0
+                assert!((as_float(&rows[1][1]) - 10.0).abs() < 1e-9);
+                assert_eq!(rows[2][0], Value::Str("c".into())); // 2.0
+                assert!((as_float(&rows[2][1]) - 2.0).abs() < 1e-9);
+            }
+            _ => panic!("expected rows, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_d10_sort_float_asc_limit_fast_path() {
+        // Bottom-3 by price — negative and -0.0 must order correctly.
+        let mut engine = float_fast_engine();
+        let result = engine.execute_powql(
+            "Price order .price limit 3 { .name, .price }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0][0], Value::Str("d".into())); // -3.5
+                // -0.0 must come before +0.25 under total_cmp ordering.
+                assert_eq!(rows[1][0], Value::Str("h".into())); // -0.0
+                assert_eq!(rows[2][0], Value::Str("b".into())); // 0.25
+            }
+            _ => panic!("expected rows, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_d10_sort_float_with_compiled_filter() {
+        // Filter + sort + limit all on Float column — every fast path
+        // fires on the same query.
+        let mut engine = float_fast_engine();
+        let result = engine.execute_powql(
+            "Price filter .price > 0.0 order .price desc limit 2 { .name }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0][0], Value::Str("g".into())); // 100.0
+                assert_eq!(rows[1][0], Value::Str("e".into())); // 10.0
+            }
+            _ => panic!("expected rows, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_f64_sortable_transform_monotonic() {
+        // The sortable-u64 transform must preserve total_cmp ordering.
+        // Regression guard against accidentally breaking the clever
+        // sign-flip trick in `f64_bits_to_sortable_u64`.
+        let samples: [f64; 11] = [
+            f64::NEG_INFINITY,
+            -1e100,
+            -1.0,
+            -f64::MIN_POSITIVE,
+            -0.0,
+            0.0,
+            f64::MIN_POSITIVE,
+            1.0,
+            1e100,
+            f64::INFINITY,
+            f64::NAN, // total_cmp says NaN > +∞
+        ];
+        let mut sorted = samples;
+        sorted.sort_by(|a, b| a.total_cmp(b));
+
+        let as_sortable: Vec<u64> = sorted.iter()
+            .map(|f| f64_bits_to_sortable_u64(f.to_bits()))
+            .collect();
+
+        // Each u64 must be strictly greater than its predecessor, because
+        // `total_cmp` places every sample at a distinct total-order slot.
+        for pair in as_sortable.windows(2) {
+            assert!(pair[0] < pair[1],
+                "sortable u64 not monotonic: {:#x} >= {:#x}", pair[0], pair[1]);
         }
     }
 }

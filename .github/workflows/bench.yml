@@ -28,6 +28,17 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
+      # Override `.cargo/config.toml`'s `-C target-cpu=native` with a
+      # portable x86-64-v2 baseline (SSE3/SSSE3/SSE4.1/SSE4.2/POPCNT).
+      # GitHub Actions `ubuntu-24.04` runners are a heterogeneous pool of
+      # Azure VMs with different host CPUs. `target-cpu=native` bakes
+      # host-specific instructions (up to AVX-512 on Sapphire Rapids) into
+      # the binary, which then SIGILLs when cargo's cache serves that
+      # binary to a subsequent job running on an older CPU. `x86-64-v2`
+      # is the widest baseline that still lets crc32fast use its SSE4.2
+      # SIMD path (runtime-detected), so there's no perf floor lost on
+      # the WAL path.
+      RUSTFLAGS: "-C target-cpu=x86-64-v2"
 
     steps:
       - name: Checkout
@@ -43,9 +54,13 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: bench-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          # Cache key is suffixed `-v2` to bust any stale `target/` built
+          # under `target-cpu=native` on a previous runner — the old cache
+          # contained a binary with AVX-512 instructions that crashed on
+          # Skylake-era runners (see SIGILL on run 24210833296).
+          key: bench-${{ runner.os }}-v2-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            bench-${{ runner.os }}-
+            bench-${{ runner.os }}-v2-
 
       - name: Print rustc version
         run: rustc --version
