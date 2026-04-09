@@ -11,6 +11,7 @@ pub enum Statement {
     CreateView(CreateViewExpr),
     RefreshView(RefreshViewExpr),
     DropView(DropViewExpr),
+    Union(UnionExpr),
 }
 
 /// `alter User add column status: str` / `alter User drop column status`
@@ -52,6 +53,15 @@ pub struct RefreshViewExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropViewExpr {
     pub name: String,
+}
+
+/// `User filter .age > 30 union User filter .status = "vip"`
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnionExpr {
+    pub left: Box<Statement>,
+    pub right: Box<Statement>,
+    /// `true` for `union all` (keep duplicates), `false` for `union` (deduplicate).
+    pub all: bool,
 }
 
 /// A query expression: Type [join ...]* [filter ...] [order ...] [limit ...] [{ projection }]

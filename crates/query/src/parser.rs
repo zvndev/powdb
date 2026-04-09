@@ -39,7 +39,7 @@ impl Parser {
     }
 
     fn parse_statement(&mut self) -> Result<Statement, ParseError> {
-        match self.peek() {
+        let stmt = match self.peek() {
             Token::Insert => self.parse_insert(),
             Token::Type => self.parse_create_type(),
             Token::Alter => self.parse_alter_table(),
@@ -51,7 +51,9 @@ impl Parser {
             }
             Token::Ident(_) => self.parse_query_or_mutation(),
             _ => Err(ParseError { message: format!("unexpected token: {:?}", self.peek()) }),
-        }
+        }?;
+        // Check for UNION chaining after any query-producing statement.
+        self.maybe_parse_union(stmt)
     }
 
     fn parse_query_or_mutation(&mut self) -> Result<Statement, ParseError> {
@@ -916,6 +918,48 @@ impl Parser {
         Ok(Statement::CreateView(CreateViewExpr { name, query, query_text }))
     }
 
+    /// Check for `union [all]` after a query and build a left-associative
+    /// chain if present.
+    fn maybe_parse_union(&mut self, left: Statement) -> Result<Statement, ParseError> {
+        if *self.peek() != Token::Union {
+            return Ok(left);
+        }
+        if !matches!(left, Statement::Query(_) | Statement::Union(_)) {
+            return Err(ParseError { message: "UNION requires a query on the left side".into() });
+        }
+        self.advance(); // consume `union`
+        let all = if let Token::Ident(s) = self.peek() {
+            if s == "all" {
+                self.advance();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        // Parse the RHS as a single query (not chained — we'll chain ourselves).
+        let right = self.parse_single_query()?;
+        let union = Statement::Union(UnionExpr {
+            left: Box::new(left),
+            right: Box::new(right),
+            all,
+        });
+        // Recursively check for further chaining: `A union B union C`
+        self.maybe_parse_union(union)
+    }
+
+    /// Parse a single query statement (no UNION chaining). Used for UNION RHS.
+    fn parse_single_query(&mut self) -> Result<Statement, ParseError> {
+        match self.peek() {
+            Token::Count | Token::Avg | Token::Sum | Token::Min | Token::Max => {
+                self.parse_aggregate_query()
+            }
+            Token::Ident(_) => self.parse_query_or_mutation(),
+            _ => Err(ParseError { message: format!("expected query after UNION, got {:?}", self.peek()) }),
+        }
+    }
+
     /// `refresh <ViewName>`
     fn parse_refresh_view(&mut self) -> Result<Statement, ParseError> {
         self.expect(&Token::Refresh)?;
@@ -1012,6 +1056,7 @@ fn tokens_to_text(tokens: &[Token]) -> String {
             Token::View => out.push_str("view"),
             Token::Materialized => out.push_str("materialized"),
             Token::Refresh => out.push_str("refresh"),
+            Token::Union => out.push_str("union"),
             Token::Having => out.push_str("having"),
             Token::Distinct => out.push_str("distinct"),
             Token::In => out.push_str("in"),
@@ -2076,6 +2121,102 @@ mod tests {
                 assert_eq!(dt.table, "Users");
             }
             _ => panic!("expected DropTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_union() {
+        let stmt = parse("User union Order").unwrap();
+        match stmt {
+            Statement::Union(u) => {
+                assert!(!u.all);
+                match *u.left {
+                    Statement::Query(_) => {}
+                    _ => panic!("expected Query on left"),
+                }
+                match *u.right {
+                    Statement::Query(_) => {}
+                    _ => panic!("expected Query on right"),
+                }
+            }
+            _ => panic!("expected Union"),
+        }
+    }
+
+    #[test]
+    fn test_parse_union_all() {
+        let stmt = parse("User union all Order").unwrap();
+        match stmt {
+            Statement::Union(u) => {
+                assert!(u.all, "expected UNION ALL");
+                match *u.left {
+                    Statement::Query(_) => {}
+                    _ => panic!("expected Query on left"),
+                }
+                match *u.right {
+                    Statement::Query(_) => {}
+                    _ => panic!("expected Query on right"),
+                }
+            }
+            _ => panic!("expected Union"),
+        }
+    }
+
+    #[test]
+    fn test_parse_union_chain() {
+        // Left-associative: A union B union C => Union(Union(A, B), C)
+        let stmt = parse("User union Order union Product").unwrap();
+        match stmt {
+            Statement::Union(outer) => {
+                assert!(!outer.all);
+                // Right side is Product
+                match *outer.right {
+                    Statement::Query(q) => assert_eq!(q.source, "Product"),
+                    _ => panic!("expected Query(Product) on right"),
+                }
+                // Left side is Union(User, Order)
+                match *outer.left {
+                    Statement::Union(inner) => {
+                        assert!(!inner.all);
+                        match *inner.left {
+                            Statement::Query(q) => assert_eq!(q.source, "User"),
+                            _ => panic!("expected Query(User)"),
+                        }
+                        match *inner.right {
+                            Statement::Query(q) => assert_eq!(q.source, "Order"),
+                            _ => panic!("expected Query(Order)"),
+                        }
+                    }
+                    _ => panic!("expected inner Union"),
+                }
+            }
+            _ => panic!("expected Union"),
+        }
+    }
+
+    #[test]
+    fn test_parse_union_with_filter() {
+        let stmt = parse("User filter .age > 10 union Order filter .total > 50").unwrap();
+        match stmt {
+            Statement::Union(u) => {
+                assert!(!u.all);
+                // Both sides should be queries (the filter is part of each query)
+                match *u.left {
+                    Statement::Query(q) => {
+                        assert_eq!(q.source, "User");
+                        assert!(q.filter.is_some());
+                    }
+                    _ => panic!("expected Query on left"),
+                }
+                match *u.right {
+                    Statement::Query(q) => {
+                        assert_eq!(q.source, "Order");
+                        assert!(q.filter.is_some());
+                    }
+                    _ => panic!("expected Query on right"),
+                }
+            }
+            _ => panic!("expected Union"),
         }
     }
 }

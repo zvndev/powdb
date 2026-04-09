@@ -192,6 +192,10 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
         PlanNode::CreateView { .. } => {}
         PlanNode::RefreshView { .. } => {}
         PlanNode::DropView { .. } => {}
+        PlanNode::Union { left, right, .. } => {
+            substitute_plan(left, literals, idx);
+            substitute_plan(right, literals, idx);
+        }
     }
 }
 
@@ -273,6 +277,10 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
         PlanNode::CreateView { .. } => {}
         PlanNode::RefreshView { .. } => {}
         PlanNode::DropView { .. } => {}
+        PlanNode::Union { left, right, .. } => {
+            count_plan(left, n);
+            count_plan(right, n);
+        }
     }
 }
 
@@ -552,6 +560,10 @@ mod tests {
             PlanNode::CreateView { .. } => {}
             PlanNode::RefreshView { .. } => {}
             PlanNode::DropView { .. } => {}
+            PlanNode::Union { left, right, .. } => {
+                collect_literals_for_test(left, out);
+                collect_literals_for_test(right, out);
+            }
         }
     }
 

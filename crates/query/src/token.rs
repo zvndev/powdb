@@ -45,6 +45,7 @@ pub enum Token {
     View,       // view
     Materialized,// materialized
     Refresh,    // refresh
+    Union,      // union
     Having,     // having
     Distinct,   // distinct
     In,         // in

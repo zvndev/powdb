@@ -1617,6 +1617,37 @@ impl Engine {
                 })
             }
 
+            PlanNode::Union { left, right, all } => {
+                let left_result = self.execute_plan(left)?;
+                let right_result = self.execute_plan(right)?;
+                let (left_cols, left_rows) = match left_result {
+                    QueryResult::Rows { columns, rows } => (columns, rows),
+                    _ => return Err("UNION requires query results on left side".into()),
+                };
+                let (_, right_rows) = match right_result {
+                    QueryResult::Rows { columns, rows } => (columns, rows),
+                    _ => return Err("UNION requires query results on right side".into()),
+                };
+                let mut combined = left_rows;
+                if *all {
+                    // UNION ALL — just concatenate.
+                    combined.extend(right_rows);
+                } else {
+                    // UNION — deduplicate using the same HashSet approach
+                    // as DISTINCT. Value already implements Hash + Eq.
+                    let mut seen = std::collections::HashSet::new();
+                    for row in &combined {
+                        seen.insert(row.clone());
+                    }
+                    for row in right_rows {
+                        if seen.insert(row.clone()) {
+                            combined.push(row);
+                        }
+                    }
+                }
+                Ok(QueryResult::Rows { columns: left_cols, rows: combined })
+            }
+
             PlanNode::IndexScan { table, column, key } => {
                 let schema = self.catalog.schema(table)
                     .ok_or_else(|| format!("table '{table}' not found"))?
@@ -4799,5 +4830,82 @@ mod tests {
         let mut engine = test_engine();
         let err = engine.execute_powql("drop view NoSuchView").unwrap_err();
         assert!(err.contains("not found"));
+    }
+
+    // ── UNION / UNION ALL tests ────────────────────────────────
+
+    #[test]
+    fn test_union_deduplicates() {
+        let mut engine = test_engine();
+        engine.execute_powql("type A { name: str }").unwrap();
+        engine.execute_powql("type B { name: str }").unwrap();
+        engine.execute_powql(r#"insert A { name := "alice" }"#).unwrap();
+        engine.execute_powql(r#"insert A { name := "bob" }"#).unwrap();
+        engine.execute_powql(r#"insert B { name := "bob" }"#).unwrap();
+        engine.execute_powql(r#"insert B { name := "carol" }"#).unwrap();
+        let result = engine.execute_powql("A union B").unwrap();
+        let rows = match result { QueryResult::Rows { rows, .. } => rows, _ => panic!() };
+        // alice, bob, carol — bob deduped
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn test_union_all_keeps_duplicates() {
+        let mut engine = test_engine();
+        engine.execute_powql("type X { val: int }").unwrap();
+        engine.execute_powql("type Y { val: int }").unwrap();
+        engine.execute_powql("insert X { val := 1 }").unwrap();
+        engine.execute_powql("insert X { val := 2 }").unwrap();
+        engine.execute_powql("insert Y { val := 2 }").unwrap();
+        engine.execute_powql("insert Y { val := 3 }").unwrap();
+        let result = engine.execute_powql("X union all Y").unwrap();
+        let rows = match result { QueryResult::Rows { rows, .. } => rows, _ => panic!() };
+        // 1, 2, 2, 3 — no dedup
+        assert_eq!(rows.len(), 4);
+    }
+
+    #[test]
+    fn test_union_with_filters() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Emp { name: str, dept: str }").unwrap();
+        engine.execute_powql(r#"insert Emp { name := "alice", dept := "eng" }"#).unwrap();
+        engine.execute_powql(r#"insert Emp { name := "bob", dept := "sales" }"#).unwrap();
+        engine.execute_powql(r#"insert Emp { name := "carol", dept := "eng" }"#).unwrap();
+        let result = engine.execute_powql(
+            r#"Emp filter .dept = "eng" union Emp filter .dept = "sales""#
+        ).unwrap();
+        let rows = match result { QueryResult::Rows { rows, .. } => rows, _ => panic!() };
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn test_union_chain_three_tables() {
+        let mut engine = test_engine();
+        engine.execute_powql("type T1 { v: int }").unwrap();
+        engine.execute_powql("type T2 { v: int }").unwrap();
+        engine.execute_powql("type T3 { v: int }").unwrap();
+        engine.execute_powql("insert T1 { v := 1 }").unwrap();
+        engine.execute_powql("insert T2 { v := 2 }").unwrap();
+        engine.execute_powql("insert T3 { v := 3 }").unwrap();
+        let result = engine.execute_powql("T1 union T2 union T3").unwrap();
+        let rows = match result { QueryResult::Rows { rows, .. } => rows, _ => panic!() };
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn test_union_uses_left_side_columns() {
+        let mut engine = test_engine();
+        engine.execute_powql("type L { name: str }").unwrap();
+        engine.execute_powql("type R { name: str }").unwrap();
+        engine.execute_powql(r#"insert L { name := "a" }"#).unwrap();
+        engine.execute_powql(r#"insert R { name := "b" }"#).unwrap();
+        let result = engine.execute_powql("L union R").unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["name".to_string()]);
+                assert_eq!(rows.len(), 2);
+            }
+            _ => panic!("expected rows"),
+        }
     }
 }

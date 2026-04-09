@@ -55,6 +55,8 @@ pub enum PlanNode {
     RefreshView { name: String },
     /// Drop a materialized view (backing table + registry entry).
     DropView { name: String },
+    /// UNION [ALL]: execute both sides, concatenate (ALL) or deduplicate.
+    Union { left: Box<PlanNode>, right: Box<PlanNode>, all: bool },
 }
 
 #[derive(Debug, Clone)]

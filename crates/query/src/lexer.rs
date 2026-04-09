@@ -137,6 +137,7 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                 "materialized" => Token::Materialized,
                 "materialize"  => Token::Materialized,
                 "refresh"      => Token::Refresh,
+                "union"        => Token::Union,
                 "having"       => Token::Having,
                 "distinct"     => Token::Distinct,
                 "in"           => Token::In,

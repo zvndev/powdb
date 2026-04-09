@@ -33,6 +33,15 @@ pub fn plan_statement(stmt: Statement) -> Result<PlanNode, PlanError> {
         }),
         Statement::RefreshView(rv) => Ok(PlanNode::RefreshView { name: rv.name }),
         Statement::DropView(dv) => Ok(PlanNode::DropView { name: dv.name }),
+        Statement::Union(u) => {
+            let left = plan_statement(*u.left)?;
+            let right = plan_statement(*u.right)?;
+            Ok(PlanNode::Union {
+                left: Box::new(left),
+                right: Box::new(right),
+                all: u.all,
+            })
+        }
     }
 }
 
