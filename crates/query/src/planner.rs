@@ -98,11 +98,14 @@ fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
         if let Some(order) = q.order {
             node = PlanNode::Sort { input: Box::new(node), keys: order.keys.into_iter().map(|k| SortKey { field: k.field, descending: k.descending }).collect() };
         }
-        if let Some(lim) = q.limit {
-            node = PlanNode::Limit { input: Box::new(node), count: lim };
-        }
+        // Offset must be applied *before* Limit: skip M rows, then take N.
+        // Plan shape is Limit(Offset(...)), so Offset is built first (inner)
+        // and Limit wraps it (outer).
         if let Some(off) = q.offset {
             node = PlanNode::Offset { input: Box::new(node), count: off };
+        }
+        if let Some(lim) = q.limit {
+            node = PlanNode::Limit { input: Box::new(node), count: lim };
         }
         if q.distinct {
             node = PlanNode::Distinct { input: Box::new(node) };
@@ -117,12 +120,15 @@ fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
         };
     }
 
-    if let Some(lim) = q.limit {
-        node = PlanNode::Limit { input: Box::new(node), count: lim };
-    }
-
+    // Offset must be applied *before* Limit: skip M rows, then take N.
+    // Plan shape is Limit(Offset(...)), so Offset is built first (inner)
+    // and Limit wraps it (outer).
     if let Some(off) = q.offset {
         node = PlanNode::Offset { input: Box::new(node), count: off };
+    }
+
+    if let Some(lim) = q.limit {
+        node = PlanNode::Limit { input: Box::new(node), count: lim };
     }
 
     if let Some(proj) = q.projection {
@@ -217,12 +223,15 @@ fn plan_joined_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
         };
     }
 
-    if let Some(lim) = q.limit {
-        node = PlanNode::Limit { input: Box::new(node), count: lim };
-    }
-
+    // Offset must be applied *before* Limit: skip M rows, then take N.
+    // Plan shape is Limit(Offset(...)), so Offset is built first (inner)
+    // and Limit wraps it (outer).
     if let Some(off) = q.offset {
         node = PlanNode::Offset { input: Box::new(node), count: off };
+    }
+
+    if let Some(lim) = q.limit {
+        node = PlanNode::Limit { input: Box::new(node), count: lim };
     }
 
     // Mission E2b: GROUP BY path for joined queries.
