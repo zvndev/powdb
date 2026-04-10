@@ -179,6 +179,60 @@ fn test_index_rehydrates_via_rebuild_when_idx_file_missing() {
 }
 
 #[test]
+fn test_index_crash_before_save_rebuilds_from_heap() {
+    // Blocker B3: under the deferred-save model, `Table::insert` no
+    // longer fsyncs `.idx` files per row — it marks the tree dirty in
+    // memory and defers the save to `Catalog::checkpoint` / `Drop`.
+    //
+    // That change is only correct if WAL replay + post-replay
+    // rebuild put the index back in sync with the heap after a
+    // crash. Simulate the crash by `mem::forget`ing the catalog so
+    // its `Drop` (which normally calls `checkpoint`) never runs, then
+    // reopen and confirm every inserted key is still findable via
+    // the index fast path.
+    let dir = fresh_dir("crash_before_save");
+
+    {
+        let mut cat = Catalog::create(&dir).expect("create catalog");
+        cat.create_table(user_schema()).expect("create table");
+        cat.create_index("users", "id").expect("create index");
+        // Force one clean checkpoint here so the catalog.bin and the
+        // `.idx` file land on disk — otherwise `Catalog::open` has
+        // nothing to rehydrate from besides the WAL.
+        cat.checkpoint().expect("initial checkpoint");
+
+        for i in 0..100i64 {
+            cat.insert("users", &row(i, &format!("user_{i}"))).unwrap();
+        }
+        // Intentionally skip `cat.checkpoint()`. The indexes are now
+        // dirty in memory — if we drop cleanly they would be saved,
+        // so bypass Drop with `mem::forget` to emulate a crash
+        // between the last insert and the next checkpoint.
+        std::mem::forget(cat);
+    }
+
+    {
+        let cat = Catalog::open(&dir).expect("reopen after crash");
+        for i in 0..100i64 {
+            let result = cat
+                .index_lookup("users", "id", &Value::Int(i))
+                .unwrap()
+                .unwrap_or_else(|| panic!("key {i} missing post-crash: index not rebuilt"));
+            assert_eq!(result[0], Value::Int(i));
+            assert_eq!(result[1], Value::Str(format!("user_{i}")));
+        }
+        // Missing keys should still miss — confirms we're hitting a
+        // real (rebuilt) btree, not falling through to a heap scan.
+        assert!(cat
+            .index_lookup("users", "id", &Value::Int(9999))
+            .unwrap()
+            .is_none());
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_index_persists_deletes_across_reopen() {
     // Confirms the delete path saves the mutated btree, so a deleted key
     // stays deleted after restart (rather than being silently
