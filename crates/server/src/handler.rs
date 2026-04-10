@@ -1,13 +1,55 @@
 use crate::protocol::Message;
-use powdb_query::executor::Engine;
+use powdb_query::executor::{Engine, is_read_only_statement, READONLY_NEEDS_WRITE};
+use powdb_query::parser;
 use powdb_query::result::QueryResult;
 use powdb_storage::types::Value;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use tokio::net::TcpStream;
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tracing::{info, debug, warn, error};
 
-pub async fn handle_connection(stream: TcpStream, engine: Arc<Mutex<Engine>>, expected_password: Option<String>) {
+/// Execute a query against the engine under the RwLock. Read-only
+/// statements acquire `.read()` so concurrent SELECTs can scan in
+/// parallel; mutations acquire `.write()`. Parse failures, subquery
+/// planning errors, and anything that needs the write lock due to dirty
+/// materialized views all fall through to the write path for a uniform
+/// error shape.
+///
+/// Mission infra-1: this is the entry point that replaces the old
+/// "every query locks the whole engine" behaviour.
+fn dispatch_query(engine: &Arc<RwLock<Engine>>, query: &str) -> Result<QueryResult, String> {
+    // Parse once at the handler level so we can classify the statement
+    // without touching the engine. This is the same lex+parse cost the
+    // engine would pay anyway; we just hoist it out of the lock critical
+    // section so concurrent readers don't serialise on lexing either.
+    let stmt_result = parser::parse(query).map_err(|e| e.message);
+
+    let can_try_read = matches!(&stmt_result, Ok(s) if is_read_only_statement(s));
+    if can_try_read {
+        // Read lock is released before we drop into the write path on
+        // fallback — critical to avoid deadlock if the read fails with
+        // READONLY_NEEDS_WRITE (dirty view or parser-vs-plan discrepancy).
+        let res = {
+            let eng = engine.read().unwrap();
+            eng.execute_powql_readonly(query)
+        };
+        match res {
+            Ok(r) => return Ok(r),
+            Err(e) if e == READONLY_NEEDS_WRITE => {
+                // Escalate: fall through to the write path below.
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Write path: either the statement is a mutation, it failed to parse
+    // (let the authoritative planner report the error), or the read path
+    // asked for escalation.
+    let mut eng = engine.write().unwrap();
+    eng.execute_powql(query)
+}
+
+pub async fn handle_connection(stream: TcpStream, engine: Arc<RwLock<Engine>>, expected_password: Option<String>) {
     let peer = stream.peer_addr().ok().map(|a| a.to_string()).unwrap_or_else(|| "unknown".into());
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -62,8 +104,7 @@ pub async fn handle_connection(stream: TcpStream, engine: Arc<Mutex<Engine>>, ex
         let response = match msg {
             Message::Query { query } => {
                 debug!(peer = %peer, query = %query, "received query");
-                let mut eng = engine.lock().unwrap();
-                match eng.execute_powql(&query) {
+                match dispatch_query(&engine, &query) {
                     Ok(result) => query_result_to_message(result),
                     Err(e) => Message::Error { message: e },
                 }
