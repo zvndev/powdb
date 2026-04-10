@@ -79,19 +79,86 @@ impl Table {
     }
 
     /// Reopen an existing table from disk. Caller supplies the schema (loaded
-    /// from the catalog file). Indexes are not rebuilt — they live in memory
-    /// until `create_index` is called again.
+    /// from the catalog file). Indexes are NOT rebuilt — they live in memory
+    /// until `create_index` is called again. Prefer `open_with_indexes` when
+    /// the catalog knows which columns are indexed.
     pub fn open(schema: Schema, data_dir: &Path) -> io::Result<Self> {
+        Self::open_with_indexes(schema, data_dir, &[])
+    }
+
+    /// Mission 3: reopen an existing table from disk, also rehydrating any
+    /// persisted b-tree indexes.
+    ///
+    /// For each name in `indexed_col_names`:
+    ///   - If the `{table}_{col}.idx` file exists, load it via
+    ///     `BTree::load` — O(file size) memcpy+decode, no heap scan.
+    ///   - If the file is missing (e.g. first open after upgrading from
+    ///     pre-Mission-3 catalogs), fall back to the create-time rebuild
+    ///     path: scan the heap and insert every non-empty value. After the
+    ///     rebuild, `save` the freshly built tree so subsequent opens hit
+    ///     the fast path.
+    pub fn open_with_indexes(
+        schema: Schema,
+        data_dir: &Path,
+        indexed_col_names: &[String],
+    ) -> io::Result<Self> {
         let heap_path = data_dir.join(format!("{}.heap", schema.table_name));
         let heap = HeapFile::open(&heap_path)?;
         let row_layout = RowLayout::new(&schema);
-        Ok(Table {
+        let mut table = Table {
             schema,
             heap,
             encode_scratch: Vec::new(),
             indexed_cols: Vec::new(),
             row_layout,
-        })
+        };
+
+        for col_name in indexed_col_names {
+            let col_idx = match table.schema.column_index(col_name) {
+                Some(i) => i,
+                // Schema drift: the catalog lists an index on a column that
+                // no longer exists. Silently drop the index rather than
+                // failing the whole open — matches the `drop column`
+                // rewrite path, which already blows away indexes.
+                None => continue,
+            };
+            let is_int = table.schema.columns[col_idx].type_id == TypeId::Int;
+            let idx_path = data_dir.join(format!(
+                "{}_{}.idx",
+                table.schema.table_name, col_name
+            ));
+
+            let btree = if idx_path.exists() {
+                BTree::load(&idx_path)?
+            } else {
+                // Missing file: rebuild from the heap and save so we
+                // take the fast path next time.
+                let mut bt = BTree::create(&idx_path)?;
+                for (rid, row) in table.heap.scan() {
+                    let row = crate::row::decode_row(&table.schema, &row);
+                    if !row[col_idx].is_empty() {
+                        bt.insert(row[col_idx].clone(), rid);
+                    }
+                }
+                bt.save()?;
+                bt
+            };
+
+            table.indexed_cols.push(IndexedCol {
+                col_idx,
+                col_name: col_name.clone(),
+                is_int,
+                btree,
+            });
+        }
+
+        Ok(table)
+    }
+
+    /// Mission 3: catalog uses this to snapshot the list of columns that
+    /// currently have an index, so it can be persisted in `catalog.bin`.
+    pub(crate) fn indexed_column_names(&self) -> Vec<String> {
+        self.indexed_cols.iter().map(|c| c.col_name.clone()).collect()
     }
 
     /// Recalculate the cached row layout from the current schema. Must be
@@ -129,6 +196,7 @@ impl Table {
         &mut self,
         old_schema: &Schema,
         fill_values: &[Value],
+        data_dir: &Path,
     ) -> io::Result<()> {
         debug_assert_eq!(fill_values.len(), self.schema.columns.len());
 
@@ -192,10 +260,15 @@ impl Table {
             self.indexed_cols.clear();
 
             for (col_idx, col_name, is_int) in existing {
-                // Reuse the existing index file path. `BTree::create`
-                // is in-memory only (the path is purely informational
-                // today), so this does not touch the filesystem.
-                let idx_path = std::path::PathBuf::new();
+                // Mission 3: write the freshly rebuilt index back to its
+                // canonical `{table}_{col}.idx` file so a subsequent
+                // restart loads the up-to-date tree instead of the stale
+                // pre-rewrite version (whose RowIds may now point at
+                // moved rows).
+                let idx_path = data_dir.join(format!(
+                    "{}_{}.idx",
+                    self.schema.table_name, col_name
+                ));
                 let mut btree = crate::btree::BTree::create(&idx_path)?;
                 for (rid, row) in self.heap.scan() {
                     let row = decode_row(&self.schema, &row);
@@ -211,6 +284,7 @@ impl Table {
                     }
                     btree.insert(v.clone(), rid);
                 }
+                btree.save()?;
                 self.indexed_cols.push(IndexedCol {
                     col_idx,
                     col_name,
@@ -290,6 +364,13 @@ impl Table {
         // (bench's `User.id` case) the body compiles down to one
         // bounds-checked vec access + one `insert_int` call, no
         // FxHash(col_name) / HashMap probe at all.
+        //
+        // Blocker B3: each `insert` / `insert_int` flips the btree's
+        // dirty flag in memory; the actual `save` (serialize + fsync
+        // + rename) is deferred to the next `Catalog::checkpoint` /
+        // `Catalog::drop`. Mission 3 used to do one fsync per row
+        // here, which cost `insert_batch_1k` ~1000 fsyncs per
+        // iteration and wiped out the D10/D11 wins.
         for entry in &mut self.indexed_cols {
             let val = &values[entry.col_idx];
             if val.is_empty() {
@@ -304,6 +385,61 @@ impl Table {
             entry.btree.insert(val.clone(), rid);
         }
         Ok(rid)
+    }
+
+    /// Blocker B3: flush every dirty btree index to disk. Wired into
+    /// [`crate::catalog::Catalog::checkpoint`] and its `Drop` impl so
+    /// we get one fsync + rename per dirty index per checkpoint, not
+    /// one per inserted row. Clean trees (no mutations since last
+    /// save) are free — `BTree::save_if_dirty` early-returns.
+    pub(crate) fn save_dirty_indexes(&mut self) -> io::Result<()> {
+        for entry in self.indexed_cols.iter_mut() {
+            entry.btree.save_if_dirty()?;
+        }
+        Ok(())
+    }
+
+    /// Blocker B3: rebuild every secondary index from the heap.
+    ///
+    /// Used by the crash-recovery path in `Catalog::open`: after WAL
+    /// replay lands rows back in the heap, the on-disk `.idx` files
+    /// may lag (or lead) the heap because the prior session deferred
+    /// btree saves until checkpoint. Replaying is cheap — we walk the
+    /// heap once per index — and produces a tree that exactly matches
+    /// the current heap state, which is the invariant subsequent
+    /// inserts assume.
+    ///
+    /// After this call, every indexed tree is marked dirty so the
+    /// next `Catalog::checkpoint` persists the recovered state.
+    pub(crate) fn rebuild_indexes_from_heap(&mut self) -> io::Result<()> {
+        if self.indexed_cols.is_empty() {
+            return Ok(());
+        }
+
+        let schema = &self.schema;
+        for entry in self.indexed_cols.iter_mut() {
+            let mut fresh = BTree::create(entry.btree.file_path())?;
+            for (rid, row) in self.heap.scan() {
+                let row = crate::row::decode_row(schema, &row);
+                let v = &row[entry.col_idx];
+                if v.is_empty() {
+                    continue;
+                }
+                if entry.is_int {
+                    if let Value::Int(i) = v {
+                        fresh.insert_int(*i, rid);
+                        continue;
+                    }
+                }
+                fresh.insert(v.clone(), rid);
+            }
+            // Force-mark dirty so the next checkpoint flushes the
+            // freshly rebuilt tree, even if no further mutations
+            // happen before shutdown.
+            fresh.mark_dirty();
+            entry.btree = fresh;
+        }
+        Ok(())
     }
 
     pub fn get(&self, rid: RowId) -> Option<Row> {
@@ -360,7 +496,11 @@ impl Table {
             }
         })?;
 
-        self.heap.delete(rid)
+        self.heap.delete(rid)?;
+        // Blocker B3: btree mutations above marked the indexes dirty.
+        // The actual persist happens at the next `Catalog::checkpoint`
+        // (or `Drop`), batching many deletes into one fsync per index.
+        Ok(())
     }
 
     /// Mission C Phase 12: bulk delete a list of rids, batching the
@@ -448,6 +588,10 @@ impl Table {
             entry.btree.delete_many_int(keys);
         }
 
+        // Blocker B3: indexes are now dirty in memory; `delete_many_int`
+        // already flipped the dirty flag on each mutated btree above.
+        // Checkpoint batches the persist.
+
         Ok(count)
     }
 
@@ -467,8 +611,32 @@ impl Table {
     where
         P: FnMut(&[u8]) -> bool,
     {
+        self.scan_delete_matching_with_hook(pred, |_, _| {})
+    }
+
+    /// Variant of [`Self::scan_delete_matching`] that lets the caller
+    /// observe every matched row just before it's marked deleted. Used
+    /// by [`crate::catalog::Catalog::scan_delete_matching_logged`] to
+    /// emit one WAL `Delete` record per victim in the same single-pass
+    /// scan — no second walk over the heap, no per-row `ensure_hot`
+    /// round-trip.
+    ///
+    /// The user hook runs inside the heap's pinned hot-page borrow, so
+    /// it must not call back into the catalog / table / heap. The WAL
+    /// append path only writes into an in-memory buffer and is safe.
+    pub fn scan_delete_matching_with_hook<P, H>(
+        &mut self,
+        pred: P,
+        mut user_hook: H,
+    ) -> io::Result<u64>
+    where
+        P: FnMut(&[u8]) -> bool,
+        H: FnMut(RowId, &[u8]),
+    {
         if self.indexed_cols.is_empty() {
-            return self.heap.scan_delete_matching(pred, |_| {});
+            return self.heap.scan_delete_matching(pred, |rid, bytes| {
+                user_hook(rid, bytes);
+            });
         }
 
         // Split the borrow so the hook closure can capture schema /
@@ -492,12 +660,13 @@ impl Table {
             let mut keys_per_index: Vec<Vec<i64>> =
                 (0..n_indexed).map(|_| Vec::with_capacity(1024)).collect();
 
-            let count = heap.scan_delete_matching(pred, |data| {
+            let count = heap.scan_delete_matching(pred, |rid, data| {
                 for (slot_i, entry) in indexed_cols.iter().enumerate() {
                     if let Value::Int(i) = decode_column(schema, layout, data, entry.col_idx) {
                         keys_per_index[slot_i].push(i);
                     }
                 }
+                user_hook(rid, data);
             })?;
 
             // Mission C Phase 17: btrees live inline in indexed_cols,
@@ -507,6 +676,9 @@ impl Table {
                 keys.sort_unstable();
                 entry.btree.delete_many_int(keys);
             }
+            // Blocker B3: dirty flags are already set by the
+            // per-btree `delete_many_int` call above; checkpoint
+            // handles the persist.
             return Ok(count);
         }
 
@@ -515,13 +687,14 @@ impl Table {
         let mut values_per_index: Vec<Vec<Value>> =
             (0..n_indexed).map(|_| Vec::with_capacity(256)).collect();
 
-        let count = heap.scan_delete_matching(pred, |data| {
+        let count = heap.scan_delete_matching(pred, |rid, data| {
             for (slot_i, entry) in indexed_cols.iter().enumerate() {
                 let v = decode_column(schema, layout, data, entry.col_idx);
                 if !v.is_empty() {
                     values_per_index[slot_i].push(v);
                 }
             }
+            user_hook(rid, data);
         })?;
 
         for (slot_i, entry) in indexed_cols.iter_mut().enumerate() {
@@ -529,6 +702,8 @@ impl Table {
                 entry.btree.delete(v);
             }
         }
+        // Blocker B3: btree dirty flags are set by `delete`; checkpoint
+        // flushes later.
         Ok(count)
     }
 
@@ -608,6 +783,8 @@ impl Table {
                 }
             }
         }
+        // Blocker B3: any mutated btree is now dirty; checkpoint will
+        // persist it. No per-row fsync on this hot path.
         Ok(new_rid)
     }
 
@@ -718,6 +895,12 @@ impl Table {
                 btree.insert(row[col_idx].clone(), rid);
             }
         }
+
+        // Mission 3: persist the freshly-built index so it survives a
+        // restart. `BTree::create` stashed the path inside the tree, so
+        // `save()` writes to the right place. Subsequent inserts / updates
+        // / deletes will re-save after each mutation (see `save_if_touched`).
+        btree.save()?;
 
         // Mission C Phase 17: store the btree inline alongside the
         // cached col_idx / col_name / is_int metadata — single tight

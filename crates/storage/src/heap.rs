@@ -71,12 +71,31 @@ impl HeapFile {
     }
 
     pub fn open(path: &Path) -> io::Result<Self> {
-        let disk = DiskManager::open(path)?;
+        let mut disk = DiskManager::open(path)?;
         let num_pages = disk.num_pages();
         let mut pages_with_space = Vec::new();
         let mut in_free_list = vec![false; num_pages as usize];
         for i in 0..num_pages {
             if let Ok(buf) = disk.read_page(i) {
+                // Mission 2: a page whose `page_type` byte is 0 was
+                // allocated by [`DiskManager::allocate_page`] (which
+                // writes an all-zero 4KB block) but never populated with
+                // a real [`Page`] header. This happens when a crash
+                // occurs between `allocate_page` extending the file and
+                // the first `write_page` that lands actual row data —
+                // which is exactly the state a WAL-replay-driven recovery
+                // sees. Reinitialize these pages in place as fresh empty
+                // Data pages so the insert path can treat them as normal
+                // free-space candidates. Without this, `Page::insert`
+                // takes `free_start = 0` as the write offset and stomps
+                // on the page header with row bytes.
+                if buf[4] == 0 {
+                    let fresh = Page::new(i, PageType::Data);
+                    let _ = disk.write_page(i, fresh.as_bytes());
+                    pages_with_space.push(i);
+                    in_free_list[i as usize] = true;
+                    continue;
+                }
                 if let Some(page) = Page::from_bytes(&buf) {
                     if page.free_space() > 64 {
                         pages_with_space.push(i);
@@ -552,7 +571,7 @@ impl HeapFile {
     ) -> io::Result<u64>
     where
         P: FnMut(&[u8]) -> bool,
-        H: FnMut(&[u8]),
+        H: FnMut(RowId, &[u8]),
     {
         let num_pages = self.disk.num_pages();
         if num_pages == 0 {
@@ -573,7 +592,11 @@ impl HeapFile {
                     let should_delete = match hot.page.get(slot) {
                         Some(bytes) => {
                             if pred(bytes) {
-                                hook(bytes);
+                                // Mission B2: hook receives the rid so the
+                                // catalog's WAL-logged wrapper can emit one
+                                // Delete record per matched row in the same
+                                // single-pass scan.
+                                hook(RowId { page_id, slot_index: slot }, bytes);
                                 true
                             } else {
                                 false
@@ -979,6 +1002,25 @@ impl Drop for HeapFile {
 // while the map is active. The HeapFile is not Send/Sync anyway (it
 // contains DiskManager with File), so this is fine for single-threaded use.
 unsafe impl Send for HeapFile {}
+// SAFETY: Blocker B1 fix. `HeapFile` lives behind `Arc<RwLock<Engine>>`,
+// so the standard `&self`/`&mut self` discipline applies: many readers
+// or one writer, never both. The interesting question is whether the
+// `&self` read path is itself thread-safe across multiple reader threads.
+//
+// The disk fallback (`DiskManager::read_page` / `write_page`) now uses
+// `FileExt::read_exact_at` / `write_all_at`, which map to pread(2) /
+// pwrite(2). POSIX guarantees these are atomic with respect to the kernel
+// file offset, so concurrent `&self` callers sharing a single `&File`
+// cannot race on a seek cursor the way a `seek + read_exact` pair would.
+// Byte-level corruption under concurrent reads — the old bug — is gone.
+//
+// The `mmap_ptr` field is a `*const u8` into a read-only mmap. Read-only
+// `&[u8]` views derived via `std::slice::from_raw_parts` are fine to
+// alias across threads: no `&mut` can coexist with the readers because
+// the RwLock write guard excludes them. Writers still take the write
+// guard for higher-level consistency (catalog/header mutation); this
+// SAFETY note is strictly about the read path not corrupting bytes.
+unsafe impl Sync for HeapFile {}
 
 #[cfg(test)]
 mod tests {
@@ -1082,7 +1124,7 @@ mod tests {
                     _ => false,
                 }
             },
-            |data| {
+            |_rid, data| {
                 if let Value::Int(i) = crate::row::decode_column(&schema, &layout, data, 1) {
                     deleted_keys.push(i);
                 }
@@ -1116,12 +1158,12 @@ mod tests {
             heap.insert(&encode_row(&schema, &row)).unwrap();
         }
         // Predicate never matches — zero deletions, scan count unchanged.
-        let c = heap.scan_delete_matching(|_| false, |_| {}).unwrap();
+        let c = heap.scan_delete_matching(|_| false, |_rid, _| {}).unwrap();
         assert_eq!(c, 0);
         assert_eq!(heap.scan().count(), 50);
 
         // Predicate always matches — everything gone.
-        let c = heap.scan_delete_matching(|_| true, |_| {}).unwrap();
+        let c = heap.scan_delete_matching(|_| true, |_rid, _| {}).unwrap();
         assert_eq!(c, 50);
         assert_eq!(heap.scan().count(), 0);
         drop(heap);

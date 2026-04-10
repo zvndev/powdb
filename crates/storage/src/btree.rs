@@ -1,7 +1,43 @@
-use crate::types::{RowId, Value};
+use crate::types::{RowId, TypeId, Value};
+use std::fs;
+use std::io::{self, Read, Write};
 use std::path::Path;
 
 const ORDER: usize = 256;
+
+// ─── On-disk btree file format ────────────────────────────────────────────
+//
+// Mission 3: persist b-tree indexes to disk so `CREATE INDEX` survives a
+// restart. Format is a small hand-rolled little-endian blob — we explicitly
+// avoid pulling in a new serializer dep (no `serde`/`bincode`/`postcard` in
+// the workspace, and the tree's node shape is simple enough to encode by
+// hand).
+//
+// Layout:
+//   magic     [4]  = "BIDX"
+//   version   u16
+//   root      u32
+//   n_nodes   u32
+//   for each node:
+//     tag     u8   (0 = Internal, 1 = Leaf)
+//     n_keys  u32
+//     for each key: encoded Value (type tag + payload — see write_value/read_value)
+//     if Internal:
+//       n_children u32
+//       children:  u32 * n_children
+//     if Leaf:
+//       for each value slot: page_id u32 + slot_index u16
+//       next_leaf_present u8 (0/1)
+//       if present: next_leaf u32
+//
+// Value encoding:
+//   type_id u8 + payload. For Int/Float/DateTime: 8 bytes LE. For Bool: 1
+//   byte. For Str: u32 len + UTF-8 bytes. For Uuid: 16 bytes. For Bytes:
+//   u32 len + raw bytes. For Empty: no payload.
+const BTREE_MAGIC: &[u8; 4] = b"BIDX";
+const BTREE_VERSION: u16 = 1;
+const NODE_TAG_INTERNAL: u8 = 0;
+const NODE_TAG_LEAF: u8 = 1;
 
 #[derive(Debug, Clone)]
 enum Node {
@@ -23,8 +59,15 @@ enum Node {
 pub struct BTree {
     nodes: Vec<Node>,
     root: usize,
-    #[allow(dead_code)]
+    /// Backing file for on-disk persistence. Set at `create`/`load` time;
+    /// `save` writes to this path atomically (write-then-rename).
     path: std::path::PathBuf,
+    /// Blocker B3: has this tree been mutated in memory since the last
+    /// `save_if_dirty` / `save` call? Every mutating method flips this to
+    /// `true`; `save_if_dirty` skips the serialize+rename when the flag
+    /// is clear, so a checkpoint that touches an untouched tree is free.
+    /// Set to `false` on `create` / `load` / any successful `save_to`.
+    dirty: bool,
 }
 
 impl BTree {
@@ -38,10 +81,19 @@ impl BTree {
             nodes: vec![root_node],
             root: 0,
             path: path.to_path_buf(),
+            // Fresh trees have no on-disk content yet; the caller is
+            // expected to `save` once after bulk-loading before the
+            // dirty flag is meaningful.
+            dirty: false,
         })
     }
 
     pub fn insert(&mut self, key: Value, rid: RowId) {
+        // Blocker B3: any mutation flips the dirty flag. Callers
+        // (Table::insert, Table::update_hinted, ...) defer the actual
+        // disk write to the next `save_if_dirty` — typically at
+        // `Catalog::checkpoint` or on `Drop`.
+        self.dirty = true;
         let root = self.root;
         if let Some((mid_key, new_node_id)) = self.insert_recursive(root, key, rid) {
             // Root was split — create new root
@@ -68,6 +120,8 @@ impl BTree {
     /// compatible with the generic `insert` / `lookup` paths.
     #[inline]
     pub fn insert_int(&mut self, key: i64, rid: RowId) {
+        // Blocker B3: mark dirty; checkpoint flushes later.
+        self.dirty = true;
         let root = self.root;
         if let Some((mid_key, new_node_id)) = self.insert_recursive_int(root, key, rid) {
             let new_root = Node::Internal {
@@ -387,6 +441,10 @@ impl BTree {
     /// Returns `true` if the key was found and removed.
     #[inline]
     pub fn delete_int(&mut self, key: i64) -> bool {
+        // Blocker B3: we mark dirty optimistically even if the key
+        // turns out to be missing — the cost of re-checking is higher
+        // than the cost of one no-op save.
+        self.dirty = true;
         let mut node_id = self.root;
         loop {
             // Walk internal nodes via single-sided comparison.
@@ -439,6 +497,10 @@ impl BTree {
         if sorted_keys.is_empty() {
             return 0;
         }
+        // Blocker B3: mark dirty; non-empty input means we will try
+        // at least one leaf compaction, which may or may not remove
+        // anything — still cheaper than a counted "only on match" flip.
+        self.dirty = true;
 
         // Walk to the leftmost leaf. From there we can follow `next_leaf`
         // to visit every leaf in order — matching the sorted-key cursor.
@@ -518,6 +580,9 @@ impl BTree {
 
     /// Delete a key from the tree. Returns true if the key was found and removed.
     pub fn delete(&mut self, key: &Value) -> bool {
+        // Blocker B3: mark dirty; see `delete_int` for the optimistic
+        // marking rationale.
+        self.dirty = true;
         // Simple deletion: find leaf and remove (no rebalancing for now — acceptable
         // for initial implementation, tree stays valid just potentially underfull)
         let mut node_id = self.root;
@@ -619,6 +684,342 @@ impl BTree {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Mission 3: the on-disk file this tree is backed by. Callers (Table
+    /// lifecycle) use this to know where to write when they call
+    /// `save`/`save_to_path`.
+    pub fn file_path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Persist the tree to its backing file atomically. Writes to a
+    /// sibling `.tmp` path then renames over the target, matching the
+    /// catalog's persist strategy.
+    pub fn save(&mut self) -> io::Result<()> {
+        let path = self.path.clone();
+        self.save_to(&path)?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Blocker B3: persist the tree only if it has been mutated since
+    /// the last successful `save` / `save_if_dirty`. Wired into
+    /// [`crate::catalog::Catalog::checkpoint`] and its `Drop` impl so
+    /// the write cost is paid at most once per checkpoint instead of
+    /// once per insert/update/delete on the hot path.
+    pub fn save_if_dirty(&mut self) -> io::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        self.save()
+    }
+
+    /// Is there unflushed work in this tree? Exposed for tests + the
+    /// `Table::rebuild_dirty_indexes_from_heap` recovery path.
+    #[inline]
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Force the dirty flag. Used by crash-recovery paths that know
+    /// the in-memory tree may lag the heap (e.g. after WAL replay).
+    #[inline]
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Persist the tree to an arbitrary path. Primarily used by tests
+    /// and by the create-index rebuild path, which wants to write the
+    /// file at a location supplied by the caller. Does NOT update
+    /// `self.path` or the dirty flag.
+    pub fn save_to(&self, path: &Path) -> io::Result<()> {
+        let mut buf: Vec<u8> = Vec::with_capacity(64 + 32 * self.nodes.len());
+        buf.extend_from_slice(BTREE_MAGIC);
+        buf.extend_from_slice(&BTREE_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(self.root as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.nodes.len() as u32).to_le_bytes());
+        for node in &self.nodes {
+            match node {
+                Node::Internal { keys, children } => {
+                    buf.push(NODE_TAG_INTERNAL);
+                    buf.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+                    for k in keys {
+                        write_value(&mut buf, k);
+                    }
+                    buf.extend_from_slice(&(children.len() as u32).to_le_bytes());
+                    for &c in children {
+                        buf.extend_from_slice(&(c as u32).to_le_bytes());
+                    }
+                }
+                Node::Leaf { keys, values, next_leaf } => {
+                    buf.push(NODE_TAG_LEAF);
+                    buf.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+                    for k in keys {
+                        write_value(&mut buf, k);
+                    }
+                    // values align 1:1 with keys, so we don't repeat the
+                    // count — caller reads `n_keys` rids.
+                    for rid in values {
+                        buf.extend_from_slice(&rid.page_id.to_le_bytes());
+                        buf.extend_from_slice(&rid.slot_index.to_le_bytes());
+                    }
+                    match next_leaf {
+                        Some(nid) => {
+                            buf.push(1);
+                            buf.extend_from_slice(&(*nid as u32).to_le_bytes());
+                        }
+                        None => {
+                            buf.push(0);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Atomic write: sibling .tmp then rename. Mirrors the catalog's
+        // persist strategy so a crash between write and rename leaves
+        // the old file intact.
+        let mut tmp = path.to_path_buf();
+        let tmp_name = match path.file_name() {
+            Some(n) => {
+                let mut s = n.to_os_string();
+                s.push(".tmp");
+                s
+            }
+            None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "btree path has no file name")),
+        };
+        tmp.set_file_name(tmp_name);
+
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(&buf)?;
+        f.sync_data()?;
+        drop(f);
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Reload a tree from disk. The returned tree's `path` is set to the
+    /// supplied path so subsequent `save()` calls hit the same file.
+    pub fn load(path: &Path) -> io::Result<Self> {
+        let mut f = fs::File::open(path)?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+
+        let mut pos = 0usize;
+        if buf.len() < 14 || &buf[0..4] != BTREE_MAGIC {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad btree magic"));
+        }
+        pos += 4;
+        let version = read_u16(&buf, &mut pos)?;
+        if version != BTREE_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported btree version: {version}"),
+            ));
+        }
+        let root = read_u32(&buf, &mut pos)? as usize;
+        let n_nodes = read_u32(&buf, &mut pos)? as usize;
+
+        let mut nodes: Vec<Node> = Vec::with_capacity(n_nodes);
+        for _ in 0..n_nodes {
+            let tag = read_u8(&buf, &mut pos)?;
+            match tag {
+                NODE_TAG_INTERNAL => {
+                    let n_keys = read_u32(&buf, &mut pos)? as usize;
+                    let mut keys = Vec::with_capacity(n_keys);
+                    for _ in 0..n_keys {
+                        keys.push(read_value(&buf, &mut pos)?);
+                    }
+                    let n_children = read_u32(&buf, &mut pos)? as usize;
+                    let mut children = Vec::with_capacity(n_children);
+                    for _ in 0..n_children {
+                        children.push(read_u32(&buf, &mut pos)? as usize);
+                    }
+                    nodes.push(Node::Internal { keys, children });
+                }
+                NODE_TAG_LEAF => {
+                    let n_keys = read_u32(&buf, &mut pos)? as usize;
+                    let mut keys = Vec::with_capacity(n_keys);
+                    for _ in 0..n_keys {
+                        keys.push(read_value(&buf, &mut pos)?);
+                    }
+                    let mut values = Vec::with_capacity(n_keys);
+                    for _ in 0..n_keys {
+                        let page_id = read_u32(&buf, &mut pos)?;
+                        let slot_index = read_u16(&buf, &mut pos)?;
+                        values.push(RowId { page_id, slot_index });
+                    }
+                    let has_next = read_u8(&buf, &mut pos)? != 0;
+                    let next_leaf = if has_next {
+                        Some(read_u32(&buf, &mut pos)? as usize)
+                    } else {
+                        None
+                    };
+                    nodes.push(Node::Leaf { keys, values, next_leaf });
+                }
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unknown btree node tag: {other}"),
+                    ));
+                }
+            }
+        }
+
+        if root >= nodes.len() && !nodes.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "btree root index out of range",
+            ));
+        }
+
+        Ok(BTree {
+            nodes,
+            root,
+            path: path.to_path_buf(),
+            // Loaded tree matches its backing file exactly.
+            dirty: false,
+        })
+    }
+}
+
+// ─── on-disk value encoding ────────────────────────────────────────────────
+
+fn write_value(buf: &mut Vec<u8>, v: &Value) {
+    buf.push(v.type_id() as u8);
+    match v {
+        Value::Int(i) => buf.extend_from_slice(&i.to_le_bytes()),
+        Value::Float(f) => buf.extend_from_slice(&f.to_le_bytes()),
+        Value::Bool(b) => buf.push(if *b { 1 } else { 0 }),
+        Value::Str(s) => {
+            let bytes = s.as_bytes();
+            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(bytes);
+        }
+        Value::DateTime(t) => buf.extend_from_slice(&t.to_le_bytes()),
+        Value::Uuid(u) => buf.extend_from_slice(u),
+        Value::Bytes(b) => {
+            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(b);
+        }
+        Value::Empty => {}
+    }
+}
+
+fn read_value(buf: &[u8], pos: &mut usize) -> io::Result<Value> {
+    let tag = read_u8(buf, pos)?;
+    let type_id = type_id_from_u8(tag)?;
+    match type_id {
+        TypeId::Int => {
+            let v = read_i64(buf, pos)?;
+            Ok(Value::Int(v))
+        }
+        TypeId::Float => {
+            let raw = read_u64(buf, pos)?;
+            Ok(Value::Float(f64::from_bits(raw)))
+        }
+        TypeId::Bool => {
+            let b = read_u8(buf, pos)?;
+            Ok(Value::Bool(b != 0))
+        }
+        TypeId::Str => {
+            let n = read_u32(buf, pos)? as usize;
+            if *pos + n > buf.len() {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated btree str"));
+            }
+            let s = std::str::from_utf8(&buf[*pos..*pos + n])
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-utf8 in btree str"))?
+                .to_string();
+            *pos += n;
+            Ok(Value::Str(s))
+        }
+        TypeId::DateTime => {
+            let v = read_i64(buf, pos)?;
+            Ok(Value::DateTime(v))
+        }
+        TypeId::Uuid => {
+            if *pos + 16 > buf.len() {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated btree uuid"));
+            }
+            let mut u = [0u8; 16];
+            u.copy_from_slice(&buf[*pos..*pos + 16]);
+            *pos += 16;
+            Ok(Value::Uuid(u))
+        }
+        TypeId::Bytes => {
+            let n = read_u32(buf, pos)? as usize;
+            if *pos + n > buf.len() {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated btree bytes"));
+            }
+            let v = buf[*pos..*pos + n].to_vec();
+            *pos += n;
+            Ok(Value::Bytes(v))
+        }
+        TypeId::Empty => Ok(Value::Empty),
+    }
+}
+
+fn type_id_from_u8(v: u8) -> io::Result<TypeId> {
+    match v {
+        0 => Ok(TypeId::Empty),
+        1 => Ok(TypeId::Int),
+        2 => Ok(TypeId::Float),
+        3 => Ok(TypeId::Bool),
+        4 => Ok(TypeId::Str),
+        5 => Ok(TypeId::DateTime),
+        6 => Ok(TypeId::Uuid),
+        7 => Ok(TypeId::Bytes),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown btree value tag: {other}"),
+        )),
+    }
+}
+
+fn read_u8(buf: &[u8], pos: &mut usize) -> io::Result<u8> {
+    if *pos >= buf.len() {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated btree"));
+    }
+    let v = buf[*pos];
+    *pos += 1;
+    Ok(v)
+}
+fn read_u16(buf: &[u8], pos: &mut usize) -> io::Result<u16> {
+    if *pos + 2 > buf.len() {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated btree"));
+    }
+    let v = u16::from_le_bytes(buf[*pos..*pos + 2].try_into().unwrap());
+    *pos += 2;
+    Ok(v)
+}
+fn read_u32(buf: &[u8], pos: &mut usize) -> io::Result<u32> {
+    if *pos + 4 > buf.len() {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated btree"));
+    }
+    let v = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap());
+    *pos += 4;
+    Ok(v)
+}
+fn read_u64(buf: &[u8], pos: &mut usize) -> io::Result<u64> {
+    if *pos + 8 > buf.len() {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated btree"));
+    }
+    let v = u64::from_le_bytes(buf[*pos..*pos + 8].try_into().unwrap());
+    *pos += 8;
+    Ok(v)
+}
+fn read_i64(buf: &[u8], pos: &mut usize) -> io::Result<i64> {
+    Ok(read_u64(buf, pos)? as i64)
 }
 
 #[cfg(test)]
@@ -862,6 +1263,97 @@ mod tests {
         for i in &keys {
             assert_eq!(bt.lookup_int(*i), None);
         }
+    }
+
+    #[test]
+    fn test_save_load_roundtrip_int_keys() {
+        // Mission 3: save + load must reproduce an equivalent tree for
+        // both small (single-leaf) and large (multi-level) int-keyed
+        // trees. "Equivalent" means every key looks up to the same
+        // RowId, and the total length matches.
+        let tmp = std::env::temp_dir().join(format!(
+            "powdb_btree_save_int_{}.idx",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let mut bt = BTree::create(&tmp).unwrap();
+        for i in 0..2000i64 {
+            bt.insert_int(
+                i,
+                RowId { page_id: (i / 256) as u32, slot_index: (i % 256) as u16 },
+            );
+        }
+        bt.save().unwrap();
+
+        let reloaded = BTree::load(&tmp).unwrap();
+        assert_eq!(reloaded.len(), bt.len());
+        for i in 0..2000i64 {
+            let orig = bt.lookup_int(i);
+            let round = reloaded.lookup_int(i);
+            assert_eq!(orig, round, "mismatch at key {i}");
+            assert!(round.is_some());
+        }
+        // Missing keys stay missing.
+        assert_eq!(reloaded.lookup_int(-1), None);
+        assert_eq!(reloaded.lookup_int(9999), None);
+        // Range scan across splits should match order.
+        let orig_range: Vec<_> = bt.range(&Value::Int(500), &Value::Int(600)).collect();
+        let round_range: Vec<_> =
+            reloaded.range(&Value::Int(500), &Value::Int(600)).collect();
+        assert_eq!(orig_range, round_range);
+
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_save_load_roundtrip_mixed_value_types() {
+        // String keys exercise the variable-length value encoder path.
+        let tmp = std::env::temp_dir().join(format!(
+            "powdb_btree_save_mixed_{}.idx",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let mut bt = BTree::create(&tmp).unwrap();
+        let keys = [
+            ("alice", RowId { page_id: 1, slot_index: 0 }),
+            ("bob", RowId { page_id: 2, slot_index: 1 }),
+            ("charlie", RowId { page_id: 3, slot_index: 2 }),
+            ("diana", RowId { page_id: 4, slot_index: 3 }),
+            ("", RowId { page_id: 5, slot_index: 4 }),
+            ("unicode ⚡", RowId { page_id: 6, slot_index: 5 }),
+        ];
+        for (k, rid) in keys.iter() {
+            bt.insert(Value::Str((*k).into()), *rid);
+        }
+        bt.save().unwrap();
+
+        let reloaded = BTree::load(&tmp).unwrap();
+        assert_eq!(reloaded.len(), keys.len());
+        for (k, expected_rid) in keys.iter() {
+            let got = reloaded.lookup(&Value::Str((*k).into()));
+            assert_eq!(got, Some(*expected_rid), "mismatch at key {k:?}");
+        }
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_save_load_empty_tree() {
+        // A freshly created empty tree must round-trip (one empty leaf,
+        // root = 0).
+        let tmp = std::env::temp_dir().join(format!(
+            "powdb_btree_save_empty_{}.idx",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let mut bt = BTree::create(&tmp).unwrap();
+        bt.save().unwrap();
+        let reloaded = BTree::load(&tmp).unwrap();
+        assert_eq!(reloaded.len(), 0);
+        assert!(reloaded.is_empty());
+        assert_eq!(reloaded.lookup(&Value::Int(42)), None);
+        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]
