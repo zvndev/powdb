@@ -1,9 +1,12 @@
+use crate::row::encode_row_into;
 use crate::table::Table;
 use crate::types::*;
+use crate::wal::{Wal, WalRecordType};
 use rustc_hash::FxHashMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use tracing::{info, warn};
 
 /// On-disk catalog file: lists every table's schema so we can reopen them
 /// after a restart. Format is a small custom binary blob (no serde dep).
@@ -16,6 +19,15 @@ use std::path::{Path, PathBuf};
 const CATALOG_FILE: &str = "catalog.bin";
 const CATALOG_MAGIC: &[u8; 4] = b"BCAT";
 const CATALOG_VERSION: u16 = 2;
+
+/// Mission 2 (durability): the single shared WAL file lives under the catalog's
+/// data directory with this name. One WAL covers every table in the catalog.
+const WAL_FILE: &str = "wal.log";
+
+/// WAL batch size: flush auto-triggers after this many records, in addition
+/// to the explicit `wal.flush()` each top-level mutation does. Kept small so
+/// the tests see a predictable amount of buffering.
+const WAL_BATCH_SIZE: usize = 64;
 
 /// System catalog: registry of all tables.
 ///
@@ -38,16 +50,34 @@ pub struct Catalog {
     /// `create_table` / `open`.
     name_to_slot: FxHashMap<String, usize>,
     data_dir: PathBuf,
+    /// Mission 2: shared write-ahead log owned by the catalog. Every
+    /// mutation (insert/update/delete) records its intent here BEFORE
+    /// touching the heap so a mid-write crash can be recovered from on the
+    /// next open. Flushed to disk at the end of every top-level op.
+    wal: Wal,
+    /// Monotonic transaction-id counter — one "operation = transaction"
+    /// under our minimum-viable scope. Incremented per mutation so WAL
+    /// records can be grouped by op on replay if needed.
+    next_tx_id: u64,
+    /// Has this catalog been cleanly checkpointed at least once since it
+    /// was opened? Used by `Drop` to decide whether to treat its own flush
+    /// as fatal (it isn't — we still try best-effort).
+    checkpointed: bool,
 }
 
 impl Catalog {
     /// Create a brand-new catalog. Wipes any existing catalog file in this directory.
     pub fn create(data_dir: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
+        let wal_path = data_dir.join(WAL_FILE);
+        let wal = Wal::create(&wal_path, WAL_BATCH_SIZE)?;
         let cat = Catalog {
             tables: Vec::new(),
             name_to_slot: FxHashMap::default(),
             data_dir: data_dir.to_path_buf(),
+            wal,
+            next_tx_id: 1,
+            checkpointed: false,
         };
         cat.persist()?;
         Ok(cat)
@@ -56,6 +86,11 @@ impl Catalog {
     /// Open an existing catalog from disk, rehydrating every table. If no
     /// catalog file is present this returns NotFound — callers can fall back
     /// to `create` for a fresh data dir.
+    ///
+    /// Mission 2: after the per-table heap files are reopened, this replays
+    /// any records left in the WAL from a previous (crashed) session. The
+    /// WAL is then truncated once the replay lands cleanly on disk — that
+    /// re-establishes the "empty WAL = last shutdown was clean" invariant.
     pub fn open(data_dir: &Path) -> io::Result<Self> {
         let cat_path = data_dir.join(CATALOG_FILE);
         if !cat_path.exists() {
@@ -75,11 +110,158 @@ impl Catalog {
             name_to_slot.insert(name, tables.len());
             tables.push(table);
         }
-        Ok(Catalog {
+        let wal_path = data_dir.join(WAL_FILE);
+        let wal = Wal::open(&wal_path, WAL_BATCH_SIZE)?;
+        let mut cat = Catalog {
             tables,
             name_to_slot,
             data_dir: data_dir.to_path_buf(),
-        })
+            wal,
+            next_tx_id: 1,
+            checkpointed: false,
+        };
+        cat.replay_wal()?;
+        Ok(cat)
+    }
+
+    /// Replay every record currently buffered in the WAL file onto the open
+    /// tables. This is the recovery path: after a crash the heap files on
+    /// disk may be missing mutations that were logged to the WAL but never
+    /// written back to their pages. We re-apply every record unconditionally.
+    ///
+    /// **Idempotence:**
+    /// - `Delete`: idempotent — `HeapFile::delete` on an already-deleted or
+    ///   missing slot is a no-op.
+    /// - `Update`: idempotent — re-applies the same new row bytes to the
+    ///   same `RowId`, which either replaces the existing (already-updated)
+    ///   row with itself or lands the update for the first time.
+    /// - `Insert`: **NOT strictly idempotent**. `HeapFile::insert` allocates
+    ///   a fresh `RowId` on every call, so a row that was already flushed
+    ///   to disk will be re-inserted at a new location, producing a
+    ///   duplicate. See the mission report for the full caveat.
+    ///
+    /// The practical consequences are:
+    ///   1. On a "pure crash" (no heap pages ever flushed between open and
+    ///      crash), replay cleanly restores every logged row.
+    ///   2. On a crash where some heap pages were flushed by the hot-page
+    ///      eviction logic, replay may restore those rows a second time.
+    ///      A future mission can fix this with LSN-tagged pages.
+    ///
+    /// After a successful replay we truncate the WAL so the next shutdown
+    /// (crash or otherwise) replays only the NEW records.
+    fn replay_wal(&mut self) -> io::Result<()> {
+        let records = self.wal.read_all()?;
+        if records.is_empty() {
+            return Ok(());
+        }
+        info!(count = records.len(), "replaying WAL records");
+        let mut replayed_inserts = 0usize;
+        let mut replayed_updates = 0usize;
+        let mut replayed_deletes = 0usize;
+        for rec in records {
+            match rec.record_type {
+                WalRecordType::Insert => {
+                    if let Some((table_name, _rid, row_bytes)) = decode_wal_payload(&rec.data) {
+                        // Route around `Catalog::insert` so we don't
+                        // re-log during replay.
+                        if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
+                            // Write the raw encoded bytes directly to the
+                            // heap. We bypass Table::insert because that
+                            // would re-encode (we already have bytes) and
+                            // touch secondary indexes (which we rebuild
+                            // post-replay anyway — this mission doesn't
+                            // persist indexes).
+                            let tbl = &mut self.tables[slot];
+                            let _ = tbl.heap.insert(&row_bytes)?;
+                            replayed_inserts += 1;
+                        }
+                    }
+                }
+                WalRecordType::Update => {
+                    if let Some((table_name, rid, row_bytes)) = decode_wal_payload(&rec.data) {
+                        if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
+                            let tbl = &mut self.tables[slot];
+                            let _ = tbl.heap.update(rid, &row_bytes)?;
+                            replayed_updates += 1;
+                        }
+                    }
+                }
+                WalRecordType::Delete => {
+                    if let Some((table_name, rid, _)) = decode_wal_payload(&rec.data) {
+                        if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
+                            let tbl = &mut self.tables[slot];
+                            // Delete is idempotent on a missing/deleted slot.
+                            let _ = tbl.heap.delete(rid);
+                            replayed_deletes += 1;
+                        }
+                    }
+                }
+                WalRecordType::Commit | WalRecordType::Rollback => {
+                    // Mission 2: one-op-one-transaction model — Commit /
+                    // Rollback markers are unused. Kept here so a future
+                    // mission that adds multi-op transactions can extend
+                    // replay without a WAL format break.
+                }
+            }
+        }
+        info!(
+            inserts = replayed_inserts,
+            updates = replayed_updates,
+            deletes = replayed_deletes,
+            "WAL replay complete"
+        );
+        // Persist the replayed changes to disk before truncating the WAL,
+        // otherwise a crash between here and the next checkpoint would lose
+        // the replayed records. `flush_all_dirty` on every heap moves every
+        // dirty page through the normal write path.
+        for tbl in &mut self.tables {
+            tbl.heap.flush_all_dirty()?;
+            tbl.heap.flush()?;
+        }
+        self.wal.truncate()?;
+        Ok(())
+    }
+
+    /// Flush every dirty heap page and truncate the WAL. This is the
+    /// "clean shutdown" point — after this returns, the on-disk heap files
+    /// are fully consistent and the WAL is empty, so the next `open` will
+    /// skip replay entirely.
+    ///
+    /// Safe to call multiple times. Safe to call on a catalog that has
+    /// performed zero mutations since the last checkpoint (in which case
+    /// the flushes are no-ops and the truncate is a bounded syscall).
+    pub fn checkpoint(&mut self) -> io::Result<()> {
+        for tbl in &mut self.tables {
+            tbl.heap.flush_all_dirty()?;
+            tbl.heap.flush()?;
+        }
+        self.wal.flush()?;
+        self.wal.truncate()?;
+        self.checkpointed = true;
+        Ok(())
+    }
+
+    /// Allocate a new transaction id for a single top-level op.
+    #[inline]
+    fn next_tx(&mut self) -> u64 {
+        let id = self.next_tx_id;
+        self.next_tx_id = self.next_tx_id.wrapping_add(1);
+        id
+    }
+
+    /// Log a mutation to the WAL and flush so the log record is durable
+    /// before the caller mutates any page.
+    fn wal_log(
+        &mut self,
+        tx_id: u64,
+        record_type: WalRecordType,
+        table: &str,
+        rid: RowId,
+        row_bytes: &[u8],
+    ) -> io::Result<()> {
+        let payload = encode_wal_payload(table, rid, row_bytes);
+        self.wal.append(tx_id, record_type, &payload)?;
+        self.wal.flush()
     }
 
     pub fn create_table(&mut self, schema: Schema) -> io::Result<()> {
@@ -167,6 +349,23 @@ impl Catalog {
     }
 
     pub fn insert(&mut self, table: &str, values: &Row) -> io::Result<RowId> {
+        // Mission 2: encode the row into a scratch buffer first so we can
+        // log it to the WAL before touching the heap. We re-encode inside
+        // `Table::insert`, which keeps the insert hot path untouched — the
+        // WAL encode here is additive.
+        let tbl = self.by_name_mut(table)?;
+        let mut wal_bytes: Vec<u8> = Vec::new();
+        encode_row_into(&tbl.schema, values, &mut wal_bytes);
+        let tx_id = self.next_tx();
+        // Placeholder RowId — the real one is assigned by the heap below.
+        // Replay of an Insert record ignores the RowId field anyway.
+        self.wal_log(
+            tx_id,
+            WalRecordType::Insert,
+            table,
+            RowId { page_id: 0, slot_index: 0 },
+            &wal_bytes,
+        )?;
         self.by_name_mut(table)?.insert(values)
     }
 
@@ -175,6 +374,9 @@ impl Catalog {
     }
 
     pub fn delete(&mut self, table: &str, rid: RowId) -> io::Result<()> {
+        let tx_id = self.next_tx();
+        // Delete records carry only the rid — no row payload.
+        self.wal_log(tx_id, WalRecordType::Delete, table, rid, &[])?;
         self.by_name_mut(table)?.delete(rid)
     }
 
@@ -182,12 +384,26 @@ impl Catalog {
     /// maintenance. See [`Table::delete_many`] for the full explanation
     /// and fall-through rules. Returns the number of rows removed.
     pub fn delete_many(&mut self, table: &str, rids: &[RowId]) -> io::Result<u64> {
+        // Mission 2: log every rid as an individual Delete record. Batching
+        // here would require a new record type; the append is cheap (they
+        // all share the same WAL group commit via `wal.flush` at the end).
+        let tx_id = self.next_tx();
+        for &rid in rids {
+            let payload = encode_wal_payload(table, rid, &[]);
+            self.wal.append(tx_id, WalRecordType::Delete, &payload)?;
+        }
+        self.wal.flush()?;
         self.by_name_mut(table)?.delete_many(rids)
     }
 
     /// Mission C Phase 16: single-pass scan-and-delete driven by a
     /// raw-bytes predicate. See [`Table::scan_delete_matching`] and
     /// [`HeapFile::scan_delete_matching`] for the fusion rationale.
+    ///
+    /// Mission 2 caveat: this fused scan-delete does NOT per-row-log to
+    /// the WAL. The predicate is opaque and the target rids are only
+    /// discovered mid-scan. Callers that need crash durability for this
+    /// path must call [`Self::checkpoint`] afterwards.
     pub fn scan_delete_matching<P>(&mut self, table: &str, pred: P) -> io::Result<u64>
     where
         P: FnMut(&[u8]) -> bool,
@@ -196,6 +412,11 @@ impl Catalog {
     }
 
     pub fn update(&mut self, table: &str, rid: RowId, values: &Row) -> io::Result<RowId> {
+        let tbl = self.by_name_mut(table)?;
+        let mut wal_bytes: Vec<u8> = Vec::new();
+        encode_row_into(&tbl.schema, values, &mut wal_bytes);
+        let tx_id = self.next_tx();
+        self.wal_log(tx_id, WalRecordType::Update, table, rid, &wal_bytes)?;
         self.by_name_mut(table)?.update(rid, values)
     }
 
@@ -209,6 +430,11 @@ impl Catalog {
         values: &Row,
         changed_col_indices: Option<&[usize]>,
     ) -> io::Result<RowId> {
+        let tbl = self.by_name_mut(table)?;
+        let mut wal_bytes: Vec<u8> = Vec::new();
+        encode_row_into(&tbl.schema, values, &mut wal_bytes);
+        let tx_id = self.next_tx();
+        self.wal_log(tx_id, WalRecordType::Update, table, rid, &wal_bytes)?;
         self.by_name_mut(table)?.update_hinted(rid, values, changed_col_indices)
     }
 
@@ -216,6 +442,12 @@ impl Catalog {
     /// in place, skipping decode/encode. Caller guarantees the mutation
     /// preserves the row length and touches no indexed column. Returns
     /// `Ok(true)` if the patch landed, `Ok(false)` if the row is gone.
+    ///
+    /// Mission 2 caveat: this fast path does NOT log to the WAL. The
+    /// caller mutates raw bytes through a closure, so we can't cheaply
+    /// build an `Update` record without re-reading the slot. Callers that
+    /// need crash durability must call [`Self::checkpoint`] afterwards,
+    /// OR use [`Self::update_hinted`] which does log.
     #[inline]
     pub fn with_row_bytes_mut<F>(
         &mut self,
@@ -457,6 +689,71 @@ impl Catalog {
         self.persist()?;
         Ok(())
     }
+}
+
+impl Drop for Catalog {
+    fn drop(&mut self) {
+        // Mission 2: best-effort clean shutdown. `checkpoint` flushes
+        // every heap and truncates the WAL, which is what
+        // [`Catalog::open`] relies on to know that no replay is needed.
+        //
+        // We swallow errors here because Rust's `Drop` can't propagate
+        // them and panicking during unwind is always a bigger problem
+        // than a failed flush. The worst case on a failed drop-time
+        // checkpoint is that the next open sees a non-empty WAL and
+        // replays it (potentially producing duplicates — see the
+        // [`Self::replay_wal`] caveat). That's strictly better than
+        // losing committed writes.
+        if let Err(e) = self.checkpoint() {
+            warn!(error = %e, "catalog drop checkpoint failed");
+        }
+    }
+}
+
+// ─── WAL payload codec ─────────────────────────────────────────────────────
+//
+// Per-record payload layout (little-endian):
+//
+//   table_name_len : u32
+//   table_name     : utf-8 bytes
+//   page_id        : u32   (for insert: 0, ignored on replay)
+//   slot_index     : u16   (for insert: 0, ignored on replay)
+//   row_len        : u32
+//   row_bytes      : raw encoded row (length = row_len)
+//
+// Lives next to `Catalog` because this is the only code that produces or
+// consumes these records — the `Wal` itself is payload-agnostic.
+
+fn encode_wal_payload(table: &str, rid: RowId, row_bytes: &[u8]) -> Vec<u8> {
+    let name = table.as_bytes();
+    let mut out = Vec::with_capacity(4 + name.len() + 4 + 2 + 4 + row_bytes.len());
+    out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    out.extend_from_slice(name);
+    out.extend_from_slice(&rid.page_id.to_le_bytes());
+    out.extend_from_slice(&rid.slot_index.to_le_bytes());
+    out.extend_from_slice(&(row_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(row_bytes);
+    out
+}
+
+fn decode_wal_payload(data: &[u8]) -> Option<(String, RowId, Vec<u8>)> {
+    let mut pos = 0usize;
+    if data.len() < 4 { return None; }
+    let name_len = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+    pos += 4;
+    if pos + name_len > data.len() { return None; }
+    let name = std::str::from_utf8(&data[pos..pos + name_len]).ok()?.to_string();
+    pos += name_len;
+    if pos + 4 + 2 + 4 > data.len() { return None; }
+    let page_id = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?);
+    pos += 4;
+    let slot_index = u16::from_le_bytes(data[pos..pos + 2].try_into().ok()?);
+    pos += 2;
+    let row_len = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+    pos += 4;
+    if pos + row_len > data.len() { return None; }
+    let row_bytes = data[pos..pos + row_len].to_vec();
+    Some((name, RowId { page_id, slot_index }, row_bytes))
 }
 
 // ─── Catalog file format ────────────────────────────────────────────────────

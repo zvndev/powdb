@@ -71,12 +71,31 @@ impl HeapFile {
     }
 
     pub fn open(path: &Path) -> io::Result<Self> {
-        let disk = DiskManager::open(path)?;
+        let mut disk = DiskManager::open(path)?;
         let num_pages = disk.num_pages();
         let mut pages_with_space = Vec::new();
         let mut in_free_list = vec![false; num_pages as usize];
         for i in 0..num_pages {
             if let Ok(buf) = disk.read_page(i) {
+                // Mission 2: a page whose `page_type` byte is 0 was
+                // allocated by [`DiskManager::allocate_page`] (which
+                // writes an all-zero 4KB block) but never populated with
+                // a real [`Page`] header. This happens when a crash
+                // occurs between `allocate_page` extending the file and
+                // the first `write_page` that lands actual row data —
+                // which is exactly the state a WAL-replay-driven recovery
+                // sees. Reinitialize these pages in place as fresh empty
+                // Data pages so the insert path can treat them as normal
+                // free-space candidates. Without this, `Page::insert`
+                // takes `free_start = 0` as the write offset and stomps
+                // on the page header with row bytes.
+                if buf[4] == 0 {
+                    let fresh = Page::new(i, PageType::Data);
+                    let _ = disk.write_page(i, fresh.as_bytes());
+                    pages_with_space.push(i);
+                    in_free_list[i as usize] = true;
+                    continue;
+                }
                 if let Some(page) = Page::from_bytes(&buf) {
                     if page.free_space() > 64 {
                         pages_with_space.push(i);
