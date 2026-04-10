@@ -5,10 +5,11 @@ against PowDB. This is the **as-implemented** truth, not the design doc — when
 they disagree, this file wins. If you change the language or the wire protocol,
 update this file in the same commit.
 
-The design doc (`powql-language-design.md`) is the long-form vision and still
-has things the parser doesn't yet accept (links, group, let bindings, `??`
-defaults, etc.). Don't paste examples from there into a client without first
-checking they parse.
+The design doc (`docs/design/powql-language-design.md`) is the long-form vision
+and still has things the parser doesn't yet accept (links, let bindings, `??`
+defaults, etc.). The authoritative language reference is `docs/POWQL.md`. Don't
+paste examples from the design doc into a client without first checking they
+parse.
 
 ---
 
@@ -70,9 +71,9 @@ count(User filter .age > 27)
 avg(User filter .age > 27 | .age)   # not yet — pipe-into-agg is design only
 ```
 
-`count`, `avg`, `sum`, `min`, `max` exist as call-form aggregates. Anything more
-elaborate (group by, having, let bindings) is design-only — check the parser
-before using.
+`count`, `avg`, `sum`, `min`, `max` exist as call-form aggregates. GROUP BY and
+HAVING are shipped. Let bindings are design-only — check the parser before
+using.
 
 ### Things that look right but **don't parse**
 

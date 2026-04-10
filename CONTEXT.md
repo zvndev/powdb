@@ -53,26 +53,27 @@ PowDB is being built in **layers**, each with a checkpoint:
 
 | Layer | What | Status |
 |-------|------|--------|
-| **1. Storage engine** | heap, B-tree, WAL, MVCC, catalog, page cache | **Shipped.** 64 passing tests, reviewed, hardened. |
-| **2. Query engine** | lexer, parser, planner, executor, plan cache | **Shipped.** 36 passing tests. Planner IndexScan fold just landed. |
+| **1. Storage engine** | heap, B-tree, WAL, crash recovery, persistent indexes, mmap, pread/pwrite | **Shipped.** 102 passing tests. WAL with statement-boundary group commit, crash-safe BIDX indexes, concurrent reads via `Arc<RwLock<Engine>>`. |
+| **2. Query engine** | lexer, parser, planner, executor, plan cache | **Shipped.** Full SQL parity for core CRUD: joins (nested-loop + hash), GROUP BY, HAVING, DISTINCT, UNION, subqueries (IN, EXISTS), expressions, aggregates, materialized views, prepared queries. |
 | **3. Wire protocol + server** | binary protocol, Tokio TCP server, auth | **Shipped.** Deployed to Fly at `zvndev-powdb`. |
 | **4. Clients** | TypeScript client with codec | **Shipped.** `@zvndev/powdb-client` (not published). |
-| **5. Regression gate** | formal criterion bench with CI blocking | **← you are here.** |
-| **6. CLI polish** | REPL, error messages, schema inspection | Partial. |
-| **7. Migrations + DDL** | `alter type`, index management, schema versioning | Not started. |
-| **8. Replication / backup** | point-in-time restore, logical streaming | Design only. |
-| **9. Multi-tenancy / isolation** | namespaces, row-level auth | Design only. |
+| **5. Regression gate** | formal criterion bench with CI blocking | **Shipped.** 20 workloads, 4 thesis ratios, tiered thresholds (7/10/20%), blocks PRs to `main`. |
+| **6. Performance** | mmap, compiled predicates, fast paths | **Shipped.** 3–9x faster than SQLite on every workload. Missions C/D/E/F + D10/D11. |
+| **7. DDL** | `add_column`, `drop_column`, `create_index`, `drop` | **Shipped.** Full heap rewrite for schema changes, persistent B+tree indexes. |
+| **8. CLI polish** | REPL, error messages, schema inspection | Partial. |
+| **9. Replication / backup** | point-in-time restore, logical streaming | Design only. |
+| **10. Multi-tenancy / isolation** | namespaces, row-level auth | Design only. |
 
-**The planner fix that landed yesterday is the last load-bearing piece of the
-thesis.** Before it, the full PowQL query path was 7.5ms (133 ops/sec) because
-`.id = 42` was running as SeqScan+Filter over 50K rows. Now it's 2.6µs (378K
-ops/sec). That's the **3,020x speedup** you keep seeing mentioned — it's not
-a microbenchmark trick, it's "the planner was correctly using the index" vs
-"the planner was ignoring the index."
+**The thesis is validated.** The planner's IndexScan fold makes a full PowQL
+point lookup 2.6µs (378K ops/sec) — the ratio to raw B-tree is **~2.1x**
+(2,641ns ÷ 1,237ns). That's what the thesis predicted: single-digit-x, not
+40x. The benchmark suite enforces this via a `powql_point_over_btree_lookup`
+thesis ratio with a ceiling of 6.0x.
 
-With the fold in place, the ratio of full-query to raw-B-tree is **~2.1x**
-(2,641ns ÷ 1,237ns). That's the number the thesis predicted: single-digit-x,
-not 40x. The thesis is validated in Rust.
+As of PR #8 (2026-04-10), PowDB beats SQLite on all 15 comparison workloads
+by 2.5–9.4x, with the widest gaps on aggregation (8.6–9.4x) and indexed
+updates (8.3x). The durability layer (WAL + persistent indexes + crash
+recovery) shipped without losing the speed advantage.
 
 ---
 
@@ -122,10 +123,10 @@ That framing shapes every downstream decision:
 This is as important as what it is. The new session will drift if it forgets
 this list.
 
-- **Not a Postgres replacement.** No joins (yet), no subqueries, no stored
-  procedures, no extensions ecosystem, no `EXPLAIN ANALYZE`.
-- **Not a SQLite replacement.** Smaller feature surface, different query
-  language, needs a server (embedded mode is future).
+- **Not a Postgres replacement.** Has joins and subqueries now, but no stored
+  procedures, no extensions ecosystem, no `EXPLAIN ANALYZE`, no window functions.
+- **Not a SQLite replacement.** Different query language (PowQL, not SQL),
+  smaller ecosystem, no C API yet.
 - **Not distributed.** Single node, single process. Replication is in the
   design doc but not planned for this year.
 - **Not a public product yet.** Private repo, no landing page, no public
@@ -138,7 +139,7 @@ this list.
 
 ## The aspirational vs the shipped
 
-There are several design docs in the repo root (`powdb-implementation-brief.md`,
+There are several design docs in `docs/design/` (`powdb-implementation-brief.md`,
 `powdb-wire-protocol.md`, `powql-language-design.md`) that describe the full
 long-term vision. **These include things that are not built yet:**
 
@@ -150,9 +151,9 @@ long-term vision. **These include things that are not built yet:**
 - Cursor/pagination in the wire protocol
 
 If you read those docs, **verify against the actual code** before quoting them
-as fact. When the design doc and the code disagree, AGENTS.md at the repo root
-is the source of truth for what actually works. The design docs are
-north-star, not spec.
+as fact. When the design doc and the code disagree, `AGENTS.md` at the repo root
+is the source of truth for what actually works, and `docs/POWQL.md` is the
+authoritative language reference. The design docs are north-star, not spec.
 
 ---
 
