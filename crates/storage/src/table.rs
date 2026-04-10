@@ -79,19 +79,86 @@ impl Table {
     }
 
     /// Reopen an existing table from disk. Caller supplies the schema (loaded
-    /// from the catalog file). Indexes are not rebuilt — they live in memory
-    /// until `create_index` is called again.
+    /// from the catalog file). Indexes are NOT rebuilt — they live in memory
+    /// until `create_index` is called again. Prefer `open_with_indexes` when
+    /// the catalog knows which columns are indexed.
     pub fn open(schema: Schema, data_dir: &Path) -> io::Result<Self> {
+        Self::open_with_indexes(schema, data_dir, &[])
+    }
+
+    /// Mission 3: reopen an existing table from disk, also rehydrating any
+    /// persisted b-tree indexes.
+    ///
+    /// For each name in `indexed_col_names`:
+    ///   - If the `{table}_{col}.idx` file exists, load it via
+    ///     `BTree::load` — O(file size) memcpy+decode, no heap scan.
+    ///   - If the file is missing (e.g. first open after upgrading from
+    ///     pre-Mission-3 catalogs), fall back to the create-time rebuild
+    ///     path: scan the heap and insert every non-empty value. After the
+    ///     rebuild, `save` the freshly built tree so subsequent opens hit
+    ///     the fast path.
+    pub fn open_with_indexes(
+        schema: Schema,
+        data_dir: &Path,
+        indexed_col_names: &[String],
+    ) -> io::Result<Self> {
         let heap_path = data_dir.join(format!("{}.heap", schema.table_name));
         let heap = HeapFile::open(&heap_path)?;
         let row_layout = RowLayout::new(&schema);
-        Ok(Table {
+        let mut table = Table {
             schema,
             heap,
             encode_scratch: Vec::new(),
             indexed_cols: Vec::new(),
             row_layout,
-        })
+        };
+
+        for col_name in indexed_col_names {
+            let col_idx = match table.schema.column_index(col_name) {
+                Some(i) => i,
+                // Schema drift: the catalog lists an index on a column that
+                // no longer exists. Silently drop the index rather than
+                // failing the whole open — matches the `drop column`
+                // rewrite path, which already blows away indexes.
+                None => continue,
+            };
+            let is_int = table.schema.columns[col_idx].type_id == TypeId::Int;
+            let idx_path = data_dir.join(format!(
+                "{}_{}.idx",
+                table.schema.table_name, col_name
+            ));
+
+            let btree = if idx_path.exists() {
+                BTree::load(&idx_path)?
+            } else {
+                // Missing file: rebuild from the heap and save so we
+                // take the fast path next time.
+                let mut bt = BTree::create(&idx_path)?;
+                for (rid, row) in table.heap.scan() {
+                    let row = crate::row::decode_row(&table.schema, &row);
+                    if !row[col_idx].is_empty() {
+                        bt.insert(row[col_idx].clone(), rid);
+                    }
+                }
+                bt.save()?;
+                bt
+            };
+
+            table.indexed_cols.push(IndexedCol {
+                col_idx,
+                col_name: col_name.clone(),
+                is_int,
+                btree,
+            });
+        }
+
+        Ok(table)
+    }
+
+    /// Mission 3: catalog uses this to snapshot the list of columns that
+    /// currently have an index, so it can be persisted in `catalog.bin`.
+    pub(crate) fn indexed_column_names(&self) -> Vec<String> {
+        self.indexed_cols.iter().map(|c| c.col_name.clone()).collect()
     }
 
     /// Recalculate the cached row layout from the current schema. Must be
@@ -129,6 +196,7 @@ impl Table {
         &mut self,
         old_schema: &Schema,
         fill_values: &[Value],
+        data_dir: &Path,
     ) -> io::Result<()> {
         debug_assert_eq!(fill_values.len(), self.schema.columns.len());
 
@@ -192,10 +260,15 @@ impl Table {
             self.indexed_cols.clear();
 
             for (col_idx, col_name, is_int) in existing {
-                // Reuse the existing index file path. `BTree::create`
-                // is in-memory only (the path is purely informational
-                // today), so this does not touch the filesystem.
-                let idx_path = std::path::PathBuf::new();
+                // Mission 3: write the freshly rebuilt index back to its
+                // canonical `{table}_{col}.idx` file so a subsequent
+                // restart loads the up-to-date tree instead of the stale
+                // pre-rewrite version (whose RowIds may now point at
+                // moved rows).
+                let idx_path = data_dir.join(format!(
+                    "{}_{}.idx",
+                    self.schema.table_name, col_name
+                ));
                 let mut btree = crate::btree::BTree::create(&idx_path)?;
                 for (rid, row) in self.heap.scan() {
                     let row = decode_row(&self.schema, &row);
@@ -211,6 +284,7 @@ impl Table {
                     }
                     btree.insert(v.clone(), rid);
                 }
+                btree.save()?;
                 self.indexed_cols.push(IndexedCol {
                     col_idx,
                     col_name,
@@ -290,6 +364,11 @@ impl Table {
         // (bench's `User.id` case) the body compiles down to one
         // bounds-checked vec access + one `insert_int` call, no
         // FxHash(col_name) / HashMap probe at all.
+        //
+        // Mission 3: track which indexes we actually touched so we can
+        // `save` them at the end. Non-touched indexes (e.g. the row had
+        // an Empty value for that indexed column) don't need a rewrite.
+        let mut touched = false;
         for entry in &mut self.indexed_cols {
             let val = &values[entry.col_idx];
             if val.is_empty() {
@@ -298,12 +377,58 @@ impl Table {
             if entry.is_int {
                 if let Value::Int(i) = val {
                     entry.btree.insert_int(*i, rid);
+                    touched = true;
                     continue;
                 }
             }
             entry.btree.insert(val.clone(), rid);
+            touched = true;
+        }
+        if touched {
+            self.save_touched_indexes(values, None)?;
         }
         Ok(rid)
+    }
+
+    /// Mission 3: rewrite every `.idx` file whose column was touched by
+    /// the row values (`new_values`, or the post-update values). If
+    /// `prev_values` is provided, also save indexes whose column changed
+    /// between old and new (used by `update_hinted`).
+    ///
+    /// Save-per-write is a known hot-path cost — see the mission report.
+    /// For a table with a single int index, each insert incurs one
+    /// `BTree::save` = serialize the whole node vec + rename. For small
+    /// trees that's a few hundred microseconds; at ORDER=256 with 1M
+    /// rows it's several ms. The parent PR is expected to iterate on this
+    /// (dirty flag + lazy checkpoint) once the other Mission 3 work
+    /// lands.
+    fn save_touched_indexes(
+        &self,
+        values: &Row,
+        prev_values: Option<&Row>,
+    ) -> io::Result<()> {
+        for entry in &self.indexed_cols {
+            let new_val = &values[entry.col_idx];
+            let touched = !new_val.is_empty()
+                || prev_values
+                    .map(|p| !p[entry.col_idx].is_empty() && p[entry.col_idx] != *new_val)
+                    .unwrap_or(false);
+            if touched {
+                entry.btree.save()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Mission 3: save every index file unconditionally. Used by the
+    /// delete / bulk-delete paths, where the "touched" set is the full
+    /// set of indexes (we can't cheaply reason about which btrees
+    /// actually removed an entry without reading old rows).
+    fn save_all_indexes(&self) -> io::Result<()> {
+        for entry in &self.indexed_cols {
+            entry.btree.save()?;
+        }
+        Ok(())
     }
 
     pub fn get(&self, rid: RowId) -> Option<Row> {
@@ -360,7 +485,11 @@ impl Table {
             }
         })?;
 
-        self.heap.delete(rid)
+        self.heap.delete(rid)?;
+        // Mission 3: flush every touched index to disk so deletes survive
+        // restart. Same save-per-write caveat as `insert`.
+        self.save_all_indexes()?;
+        Ok(())
     }
 
     /// Mission C Phase 12: bulk delete a list of rids, batching the
@@ -448,6 +577,13 @@ impl Table {
             entry.btree.delete_many_int(keys);
         }
 
+        // Mission 3: persist the mutated indexes once per bulk call —
+        // much cheaper than a save per rid. Inline here because the
+        // split-borrow above means `self` is no longer fully owned.
+        for entry in indexed_cols.iter() {
+            entry.btree.save()?;
+        }
+
         Ok(count)
     }
 
@@ -507,6 +643,11 @@ impl Table {
                 keys.sort_unstable();
                 entry.btree.delete_many_int(keys);
             }
+            // Mission 3: flush the batched mutations to disk. `self` is
+            // split-borrowed so we save through `indexed_cols` directly.
+            for entry in indexed_cols.iter() {
+                entry.btree.save()?;
+            }
             return Ok(count);
         }
 
@@ -528,6 +669,10 @@ impl Table {
             for v in &values_per_index[slot_i] {
                 entry.btree.delete(v);
             }
+        }
+        // Mission 3: persist the mutated indexes once after the batch.
+        for entry in indexed_cols.iter() {
+            entry.btree.save()?;
         }
         Ok(count)
     }
@@ -587,6 +732,7 @@ impl Table {
         );
         let new_rid = self.heap.update(rid, &self.encode_scratch)?;
 
+        let mut any_index_changed = false;
         if touches_index {
             // Mission C Phase 17: walk the Vec<IndexedCol> directly.
             // `col_idx` is already precomputed on each entry, so we
@@ -601,11 +747,21 @@ impl Table {
                     }
                     if !old_val.is_empty() {
                         entry.btree.delete(old_val);
+                        any_index_changed = true;
                     }
                 }
                 if !new_val.is_empty() {
                     entry.btree.insert(new_val.clone(), new_rid);
+                    any_index_changed = true;
                 }
+            }
+        }
+        // Mission 3: persist any mutated indexes. Skipped entirely on the
+        // overwhelmingly common non-indexed-column update path, since
+        // `touches_index` is already false there.
+        if any_index_changed {
+            for entry in self.indexed_cols.iter() {
+                entry.btree.save()?;
             }
         }
         Ok(new_rid)
@@ -718,6 +874,12 @@ impl Table {
                 btree.insert(row[col_idx].clone(), rid);
             }
         }
+
+        // Mission 3: persist the freshly-built index so it survives a
+        // restart. `BTree::create` stashed the path inside the tree, so
+        // `save()` writes to the right place. Subsequent inserts / updates
+        // / deletes will re-save after each mutation (see `save_if_touched`).
+        btree.save()?;
 
         // Mission C Phase 17: store the btree inline alongside the
         // cached col_idx / col_name / is_int metadata — single tight

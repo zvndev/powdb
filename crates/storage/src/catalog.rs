@@ -7,9 +7,15 @@ use std::path::{Path, PathBuf};
 
 /// On-disk catalog file: lists every table's schema so we can reopen them
 /// after a restart. Format is a small custom binary blob (no serde dep).
+///
+/// Mission 3: version 2 appends a per-table list of indexed column names
+/// after the column list, so indexes can be rehydrated on `Catalog::open`.
+/// Version 1 files still load cleanly — they're treated as having zero
+/// indexed columns, and the next `create_index` (or implicit rebuild on
+/// first open, depending on the caller) will populate the list.
 const CATALOG_FILE: &str = "catalog.bin";
 const CATALOG_MAGIC: &[u8; 4] = b"BCAT";
-const CATALOG_VERSION: u16 = 1;
+const CATALOG_VERSION: u16 = 2;
 
 /// System catalog: registry of all tables.
 ///
@@ -55,12 +61,17 @@ impl Catalog {
         if !cat_path.exists() {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no catalog file"));
         }
-        let schemas = read_catalog_file(&cat_path)?;
-        let mut tables: Vec<Table> = Vec::with_capacity(schemas.len());
-        let mut name_to_slot = FxHashMap::with_capacity_and_hasher(schemas.len(), Default::default());
-        for schema in schemas {
+        let entries = read_catalog_file(&cat_path)?;
+        let mut tables: Vec<Table> = Vec::with_capacity(entries.len());
+        let mut name_to_slot = FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
+        for CatalogEntry { schema, indexed_cols } in entries {
             let name = schema.table_name.clone();
-            let table = Table::open(schema, data_dir)?;
+            // Mission 3: rehydrate persisted indexes. `Table::open_with_indexes`
+            // tries to `BTree::load` each named index file; if a file is
+            // missing (e.g. first open after upgrade from catalog v1) it
+            // falls back to rebuilding from the heap scan and saving to
+            // disk so subsequent opens hit the fast path.
+            let table = Table::open_with_indexes(schema, data_dir, &indexed_cols)?;
             name_to_slot.insert(name, tables.len());
             tables.push(table);
         }
@@ -86,11 +97,21 @@ impl Catalog {
     }
 
     /// Write the current set of schemas to disk atomically (write-then-rename).
+    ///
+    /// Mission 3: also writes the per-table list of indexed column names so
+    /// `Catalog::open` can rehydrate b-tree indexes on restart.
     fn persist(&self) -> io::Result<()> {
         let cat_path = self.data_dir.join(CATALOG_FILE);
         let tmp_path = self.data_dir.join(format!("{CATALOG_FILE}.tmp"));
-        let schemas: Vec<&Schema> = self.tables.iter().map(|t| &t.schema).collect();
-        write_catalog_file(&tmp_path, &schemas)?;
+        let entries: Vec<CatalogEntryRef<'_>> = self
+            .tables
+            .iter()
+            .map(|t| CatalogEntryRef {
+                schema: &t.schema,
+                indexed_cols: t.indexed_column_names(),
+            })
+            .collect();
+        write_catalog_file(&tmp_path, &entries)?;
         fs::rename(&tmp_path, &cat_path)?;
         Ok(())
     }
@@ -255,7 +276,11 @@ impl Catalog {
 
     pub fn create_index(&mut self, table: &str, column: &str) -> io::Result<()> {
         let data_dir = self.data_dir.clone();
-        self.by_name_mut(table)?.create_index(column, &data_dir)
+        self.by_name_mut(table)?.create_index(column, &data_dir)?;
+        // Mission 3: persist the updated catalog so the indexed column
+        // list survives a restart. `Table::create_index` already saved
+        // the btree file itself.
+        self.persist()
     }
 
     pub fn index_lookup(&self, table: &str, column: &str, key: &Value) -> io::Result<Option<Row>> {
@@ -281,13 +306,17 @@ impl Catalog {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{name}' not found")))?;
         // Remove the data file.
         let table = &self.tables[slot];
-        let heap_path = self.data_dir.join(format!("{}.dat", table.schema.table_name));
+        let heap_path = self.data_dir.join(format!("{}.heap", table.schema.table_name));
         if heap_path.exists() {
             fs::remove_file(&heap_path)?;
         }
-        // Remove index files.
-        for col in &table.schema.columns {
-            let idx_path = self.data_dir.join(format!("{}_{}.idx", name, col.name));
+        // Mission 3: remove only the .idx files that actually exist
+        // (i.e. the columns the table currently has indexed). The pre-
+        // Mission-3 code iterated every schema column blindly — harmless
+        // but noisy. Now that we persist a real list of indexed columns,
+        // we can be precise.
+        for col_name in table.indexed_column_names() {
+            let idx_path = self.data_dir.join(format!("{name}_{col_name}.idx"));
             if idx_path.exists() {
                 let _ = fs::remove_file(&idx_path);
             }
@@ -328,6 +357,7 @@ impl Catalog {
     /// and silently storing `Empty` in a required slot would just
     /// shift the invariant violation to the next query.
     pub fn alter_table_add_column(&mut self, table: &str, col: ColumnDef) -> io::Result<()> {
+        let data_dir = self.data_dir.clone();
         let tbl = self.by_name_mut(table)?;
         // Check for duplicate column name.
         if tbl.schema.columns.iter().any(|c| c.name == col.name) {
@@ -367,7 +397,7 @@ impl Catalog {
             // overwrite old-column slots from each live row and leave
             // the new slot as Empty.
             let fill: Vec<Value> = vec![Value::Empty; tbl.schema.columns.len()];
-            tbl.rewrite_rows_for_schema_change(&old_schema, &fill)?;
+            tbl.rewrite_rows_for_schema_change(&old_schema, &fill, &data_dir)?;
         }
 
         self.persist()?;
@@ -397,6 +427,7 @@ impl Catalog {
     /// through [`Table::rewrite_rows_for_schema_change`]. Dropping a
     /// column from an empty table skips the rewrite.
     pub fn alter_table_drop_column(&mut self, table: &str, col_name: &str) -> io::Result<()> {
+        let data_dir = self.data_dir.clone();
         let tbl = self.by_name_mut(table)?;
         let idx = tbl.schema.columns.iter().position(|c| c.name == col_name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound,
@@ -420,7 +451,7 @@ impl Catalog {
             // matters for brand-new columns — drop has none, so
             // `Empty` is a safe placeholder that never gets read.
             let fill: Vec<Value> = vec![Value::Empty; tbl.schema.columns.len()];
-            tbl.rewrite_rows_for_schema_change(&old_schema, &fill)?;
+            tbl.rewrite_rows_for_schema_change(&old_schema, &fill, &data_dir)?;
         }
 
         self.persist()?;
@@ -430,7 +461,7 @@ impl Catalog {
 
 // ─── Catalog file format ────────────────────────────────────────────────────
 //
-// Layout:
+// Layout (version 2):
 //   magic     [4]      = "BCAT"
 //   version   u16
 //   n_tables  u32
@@ -444,14 +475,37 @@ impl Catalog {
 //       type_id       u8
 //       required      u8
 //       position      u16
+//     ── version 2 appends: ──
+//     n_indexed_cols  u16
+//     for each indexed column:
+//       name_len      u32
+//       name          utf8 bytes
+//
+// Version 1 files are accepted by the reader (same shape minus the
+// trailing indexed-column block) and treated as having zero indexed
+// columns. Writers always emit version 2 from Mission 3 onwards.
 
-fn write_catalog_file(path: &Path, schemas: &[&Schema]) -> io::Result<()> {
+/// In-memory catalog entry pairing a schema with its indexed column list.
+/// Produced by the reader; the writer takes the borrowed counterpart below.
+pub(crate) struct CatalogEntry {
+    pub schema: Schema,
+    pub indexed_cols: Vec<String>,
+}
+
+/// Borrowed view passed to the writer.
+pub(crate) struct CatalogEntryRef<'a> {
+    pub schema: &'a Schema,
+    pub indexed_cols: Vec<String>,
+}
+
+fn write_catalog_file(path: &Path, entries: &[CatalogEntryRef<'_>]) -> io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     buf.extend_from_slice(CATALOG_MAGIC);
     buf.extend_from_slice(&CATALOG_VERSION.to_le_bytes());
-    buf.extend_from_slice(&(schemas.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
 
-    for schema in schemas {
+    for entry in entries {
+        let schema = entry.schema;
         let name = schema.table_name.as_bytes();
         buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
         buf.extend_from_slice(name);
@@ -464,6 +518,13 @@ fn write_catalog_file(path: &Path, schemas: &[&Schema]) -> io::Result<()> {
             buf.push(if col.required { 1 } else { 0 });
             buf.extend_from_slice(&col.position.to_le_bytes());
         }
+        // Mission 3: per-table indexed column list (version 2 only).
+        buf.extend_from_slice(&(entry.indexed_cols.len() as u16).to_le_bytes());
+        for col_name in &entry.indexed_cols {
+            let cn = col_name.as_bytes();
+            buf.extend_from_slice(&(cn.len() as u32).to_le_bytes());
+            buf.extend_from_slice(cn);
+        }
     }
 
     let mut f = fs::OpenOptions::new()
@@ -474,7 +535,7 @@ fn write_catalog_file(path: &Path, schemas: &[&Schema]) -> io::Result<()> {
     Ok(())
 }
 
-fn read_catalog_file(path: &Path) -> io::Result<Vec<Schema>> {
+fn read_catalog_file(path: &Path) -> io::Result<Vec<CatalogEntry>> {
     let mut f = fs::File::open(path)?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)?;
@@ -486,13 +547,18 @@ fn read_catalog_file(path: &Path) -> io::Result<Vec<Schema>> {
     pos += 4;
     let version = u16::from_le_bytes(buf[pos..pos+2].try_into().unwrap());
     pos += 2;
-    if version != CATALOG_VERSION {
+    // Mission 3: accept version 1 files for forward compatibility.
+    // `create_index` was the only mutator that added indexes before, and
+    // those indexes were in-memory only, so on open we simply treat them
+    // as absent and let the first `create_index` call repopulate the
+    // metadata (and mint a version 2 file).
+    if version != CATALOG_VERSION && version != 1 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unsupported catalog version: {version}")));
     }
     let n_tables = u32::from_le_bytes(buf[pos..pos+4].try_into().unwrap()) as usize;
     pos += 4;
 
-    let mut schemas = Vec::with_capacity(n_tables);
+    let mut entries = Vec::with_capacity(n_tables);
     for _ in 0..n_tables {
         let name_len = read_u32(&buf, &mut pos)? as usize;
         let table_name = read_string(&buf, &mut pos, name_len)?;
@@ -508,10 +574,28 @@ fn read_catalog_file(path: &Path) -> io::Result<Vec<Schema>> {
             let position = read_u16(&buf, &mut pos)?;
             columns.push(ColumnDef { name, type_id, required, position });
         }
-        schemas.push(Schema { table_name, columns });
+
+        // Version 2 appends the indexed column list. Version 1 stops
+        // after the column block — default to an empty list.
+        let indexed_cols = if version >= 2 {
+            let n = read_u16(&buf, &mut pos)? as usize;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                let l = read_u32(&buf, &mut pos)? as usize;
+                v.push(read_string(&buf, &mut pos, l)?);
+            }
+            v
+        } else {
+            Vec::new()
+        };
+
+        entries.push(CatalogEntry {
+            schema: Schema { table_name, columns },
+            indexed_cols,
+        });
     }
 
-    Ok(schemas)
+    Ok(entries)
 }
 
 fn read_u8(buf: &[u8], pos: &mut usize) -> io::Result<u8> {
