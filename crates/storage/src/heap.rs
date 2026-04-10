@@ -571,7 +571,7 @@ impl HeapFile {
     ) -> io::Result<u64>
     where
         P: FnMut(&[u8]) -> bool,
-        H: FnMut(&[u8]),
+        H: FnMut(RowId, &[u8]),
     {
         let num_pages = self.disk.num_pages();
         if num_pages == 0 {
@@ -592,7 +592,11 @@ impl HeapFile {
                     let should_delete = match hot.page.get(slot) {
                         Some(bytes) => {
                             if pred(bytes) {
-                                hook(bytes);
+                                // Mission B2: hook receives the rid so the
+                                // catalog's WAL-logged wrapper can emit one
+                                // Delete record per matched row in the same
+                                // single-pass scan.
+                                hook(RowId { page_id, slot_index: slot }, bytes);
                                 true
                             } else {
                                 false
@@ -1112,7 +1116,7 @@ mod tests {
                     _ => false,
                 }
             },
-            |data| {
+            |_rid, data| {
                 if let Value::Int(i) = crate::row::decode_column(&schema, &layout, data, 1) {
                     deleted_keys.push(i);
                 }
@@ -1146,12 +1150,12 @@ mod tests {
             heap.insert(&encode_row(&schema, &row)).unwrap();
         }
         // Predicate never matches — zero deletions, scan count unchanged.
-        let c = heap.scan_delete_matching(|_| false, |_| {}).unwrap();
+        let c = heap.scan_delete_matching(|_| false, |_rid, _| {}).unwrap();
         assert_eq!(c, 0);
         assert_eq!(heap.scan().count(), 50);
 
         // Predicate always matches — everything gone.
-        let c = heap.scan_delete_matching(|_| true, |_| {}).unwrap();
+        let c = heap.scan_delete_matching(|_| true, |_rid, _| {}).unwrap();
         assert_eq!(c, 50);
         assert_eq!(heap.scan().count(), 0);
         drop(heap);

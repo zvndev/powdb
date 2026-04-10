@@ -1452,6 +1452,11 @@ impl Engine {
         //    the btree lookup is the linear scan over `indexed_cols`.
         //    Single btree.lookup_int + one `with_row_bytes_mut` call.
         //    No Vec allocations at all.
+        //
+        // Mission B2: route the in-place patch through the catalog's
+        // WAL-logged wrapper so crash recovery sees the update. The
+        // extra cost is one WAL append + fsync per query — the hot
+        // loop structure is unchanged.
         let tbl = self.catalog.table_by_slot_mut(fast.table_slot);
         let Some(btree) = tbl.index(&fast.key_col) else {
             // Index dropped since prepare — bail to the generic path.
@@ -1461,14 +1466,21 @@ impl Engine {
             return Ok(Some(QueryResult::Modified(0)));
         };
 
-        let ok = tbl.with_row_bytes_mut(rid, |row| {
-            // Idempotent null-bit clear — safe even when the column was
-            // already non-null (the overwhelmingly common case).
-            row[fast.bitmap_byte_off] &= !fast.bit_mask;
-            let field_bytes = bytes.as_slice();
-            row[fast.field_off..fast.field_off + field_bytes.len()]
-                .copy_from_slice(field_bytes);
-        }).map_err(|e| e.to_string())?;
+        let fast_table_slot = fast.table_slot;
+        let bitmap_byte_off = fast.bitmap_byte_off;
+        let bit_mask = fast.bit_mask;
+        let field_off = fast.field_off;
+        let ok = self
+            .catalog
+            .update_row_bytes_logged_by_slot(fast_table_slot, rid, |row| {
+                // Idempotent null-bit clear — safe even when the column was
+                // already non-null (the overwhelmingly common case).
+                row[bitmap_byte_off] &= !bit_mask;
+                let field_bytes = bytes.as_slice();
+                row[field_off..field_off + field_bytes.len()]
+                    .copy_from_slice(field_bytes);
+            })
+            .map_err(|e| e.to_string())?;
 
         Ok(Some(QueryResult::Modified(if ok { 1 } else { 0 })))
     }
@@ -2153,7 +2165,11 @@ impl Engine {
                 if let Some(patches) = fast_patch {
                     let mut count = 0u64;
                     for rid in matching_rids {
-                        let ok = self.catalog.with_row_bytes_mut(table, rid, |row| {
+                        // Mission B2: WAL-log every patch so crash
+                        // recovery replays the update. Same mutation
+                        // closure as before — the wrapper just sandwiches
+                        // it between a hot-page read and a WAL append.
+                        let ok = self.catalog.update_row_bytes_logged(table, rid, |row| {
                             for p in &patches {
                                 row[p.bitmap_byte_off] &= !p.bit_mask;
                                 let field_bytes = p.bytes.as_slice();
@@ -2202,8 +2218,13 @@ impl Engine {
                     let mut count = 0u64;
                     let mut fallback_rids: Vec<RowId> = Vec::new();
                     for rid in &matching_rids {
+                        // Mission B2: logged variant so crash recovery
+                        // replays the shrink. On a false return (row
+                        // would have to grow), the rid is pushed to
+                        // `fallback_rids` and the slower `update_hinted`
+                        // path — which is already WAL-logged — picks it up.
                         let ok = self.catalog
-                            .patch_var_col_in_place(table, *rid, col_idx, new_bytes_ref)
+                            .patch_var_col_logged(table, *rid, col_idx, new_bytes_ref)
                             .map_err(|e| e.to_string())?;
                         if ok {
                             count += 1;
@@ -2304,8 +2325,13 @@ impl Engine {
                             let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
                             let fast = FastLayout::new(schema);
                             if let Some(compiled) = compile_predicate(predicate, &columns, &fast, schema) {
+                                // Mission B2: logged variant so every
+                                // matched rid hits the WAL during the
+                                // single-pass scan. Structure of the
+                                // fused scan is unchanged — only the
+                                // hook closure now also appends.
                                 let count = self.catalog
-                                    .scan_delete_matching(table, |data| compiled(data))
+                                    .scan_delete_matching_logged(table, |data| compiled(data))
                                     .map_err(|e| e.to_string())?;
                                 self.view_registry.mark_dependents_dirty(table);
                                 return Ok(QueryResult::Modified(count));
@@ -2316,8 +2342,9 @@ impl Engine {
                     if t == table {
                         // `delete from T` with no predicate — every live
                         // row matches. One pass is still the right shape.
+                        // Mission B2: logged variant — see above.
                         let count = self.catalog
-                            .scan_delete_matching(table, |_| true)
+                            .scan_delete_matching_logged(table, |_| true)
                             .map_err(|e| e.to_string())?;
                         self.view_registry.mark_dependents_dirty(table);
                         return Ok(QueryResult::Modified(count));
@@ -2744,9 +2771,11 @@ impl Engine {
             QueryResult::Rows { columns, rows } => (columns, rows),
             _ => return Err("view source query must be a SELECT".into()),
         };
-        // Clear old data and insert fresh results.
+        // Clear old data and insert fresh results. Mission B2: logged
+        // variant — view refreshes are a mutation and crash recovery
+        // must see them.
         self.catalog
-            .scan_delete_matching(name, |_| true)
+            .scan_delete_matching_logged(name, |_| true)
             .map_err(|e| e.to_string())?;
         for row in &rows {
             self.catalog.insert(name, row).map_err(|e| e.to_string())?;

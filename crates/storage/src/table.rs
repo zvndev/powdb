@@ -611,8 +611,32 @@ impl Table {
     where
         P: FnMut(&[u8]) -> bool,
     {
+        self.scan_delete_matching_with_hook(pred, |_, _| {})
+    }
+
+    /// Variant of [`Self::scan_delete_matching`] that lets the caller
+    /// observe every matched row just before it's marked deleted. Used
+    /// by [`crate::catalog::Catalog::scan_delete_matching_logged`] to
+    /// emit one WAL `Delete` record per victim in the same single-pass
+    /// scan — no second walk over the heap, no per-row `ensure_hot`
+    /// round-trip.
+    ///
+    /// The user hook runs inside the heap's pinned hot-page borrow, so
+    /// it must not call back into the catalog / table / heap. The WAL
+    /// append path only writes into an in-memory buffer and is safe.
+    pub fn scan_delete_matching_with_hook<P, H>(
+        &mut self,
+        pred: P,
+        mut user_hook: H,
+    ) -> io::Result<u64>
+    where
+        P: FnMut(&[u8]) -> bool,
+        H: FnMut(RowId, &[u8]),
+    {
         if self.indexed_cols.is_empty() {
-            return self.heap.scan_delete_matching(pred, |_| {});
+            return self.heap.scan_delete_matching(pred, |rid, bytes| {
+                user_hook(rid, bytes);
+            });
         }
 
         // Split the borrow so the hook closure can capture schema /
@@ -636,12 +660,13 @@ impl Table {
             let mut keys_per_index: Vec<Vec<i64>> =
                 (0..n_indexed).map(|_| Vec::with_capacity(1024)).collect();
 
-            let count = heap.scan_delete_matching(pred, |data| {
+            let count = heap.scan_delete_matching(pred, |rid, data| {
                 for (slot_i, entry) in indexed_cols.iter().enumerate() {
                     if let Value::Int(i) = decode_column(schema, layout, data, entry.col_idx) {
                         keys_per_index[slot_i].push(i);
                     }
                 }
+                user_hook(rid, data);
             })?;
 
             // Mission C Phase 17: btrees live inline in indexed_cols,
@@ -662,13 +687,14 @@ impl Table {
         let mut values_per_index: Vec<Vec<Value>> =
             (0..n_indexed).map(|_| Vec::with_capacity(256)).collect();
 
-        let count = heap.scan_delete_matching(pred, |data| {
+        let count = heap.scan_delete_matching(pred, |rid, data| {
             for (slot_i, entry) in indexed_cols.iter().enumerate() {
                 let v = decode_column(schema, layout, data, entry.col_idx);
                 if !v.is_empty() {
                     values_per_index[slot_i].push(v);
                 }
             }
+            user_hook(rid, data);
         })?;
 
         for (slot_i, entry) in indexed_cols.iter_mut().enumerate() {
