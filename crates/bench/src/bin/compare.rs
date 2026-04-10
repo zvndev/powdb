@@ -106,16 +106,19 @@ fn threshold_for(workload: &str) -> f64 {
         | "powql_aggregation"
         | "point_lookup_nonindexed" => VERY_NOISY_ABSOLUTE_THRESHOLD,
 
-        // Sort over a filtered scan + top-N limit: mixed allocation path,
-        // noisier than pure scans.
+        // GHA-variance-dominated workloads: back-to-back same-commit PR #9
+        // runs showed scan_filter_sort_limit10 +11.9%, update_by_pk +86%,
+        // delete_by_filter +17.7% — all with zero code change. Promoted
+        // from NOISY (10%) to VERY_NOISY (20%).
         "scan_filter_sort_limit10"
-        // Bulk writes: fixture growth, WAL sync, btree splits — naturally
-        // more variance than point reads.
-        | "insert_single"
-        | "insert_batch_1k"
         | "update_by_pk"
-        | "update_by_filter"
-        | "delete_by_filter" => NOISY_ABSOLUTE_THRESHOLD,
+        | "delete_by_filter" => VERY_NOISY_ABSOLUTE_THRESHOLD,
+
+        // Bulk writes: fixture growth, WAL sync, btree splits — naturally
+        // more variance than point reads, but not as extreme as the above.
+        "insert_single"
+        | "insert_batch_1k"
+        | "update_by_filter" => NOISY_ABSOLUTE_THRESHOLD,
         _ => DEFAULT_ABSOLUTE_THRESHOLD,
     }
 }
