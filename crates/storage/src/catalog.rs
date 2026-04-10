@@ -214,9 +214,24 @@ impl Catalog {
         // otherwise a crash between here and the next checkpoint would lose
         // the replayed records. `flush_all_dirty` on every heap moves every
         // dirty page through the normal write path.
+        //
+        // Blocker B3: under the deferred-index-save model, the on-disk
+        // `.idx` files may lag the heap because the pre-crash session
+        // never got to its next `checkpoint`. Replay restored the
+        // heap rows above, but the btrees that loaded from those
+        // possibly-stale `.idx` files don't know about them. Rebuild
+        // every secondary index from the post-replay heap so the
+        // trees exactly match disk. The rebuild is O(heap) per
+        // indexed column, which is fine on a crash-recovery path.
         for tbl in &mut self.tables {
             tbl.heap.flush_all_dirty()?;
             tbl.heap.flush()?;
+            tbl.rebuild_indexes_from_heap()?;
+            // Flush the rebuilt indexes now so a crash between here
+            // and the next mutation still leaves `.idx` files matching
+            // the heap. Without this, a second crash before any
+            // insert could leave us back where we started.
+            tbl.save_dirty_indexes()?;
         }
         self.wal.truncate()?;
         Ok(())
@@ -234,6 +249,11 @@ impl Catalog {
         for tbl in &mut self.tables {
             tbl.heap.flush_all_dirty()?;
             tbl.heap.flush()?;
+            // Blocker B3: the hot insert/update/delete paths no longer
+            // fsync index files per row — they only mark the in-memory
+            // btree dirty. Checkpoint is where those deferred saves
+            // actually hit disk. Clean (non-dirty) indexes are free.
+            tbl.save_dirty_indexes()?;
         }
         self.wal.flush()?;
         self.wal.truncate()?;

@@ -62,6 +62,12 @@ pub struct BTree {
     /// Backing file for on-disk persistence. Set at `create`/`load` time;
     /// `save` writes to this path atomically (write-then-rename).
     path: std::path::PathBuf,
+    /// Blocker B3: has this tree been mutated in memory since the last
+    /// `save_if_dirty` / `save` call? Every mutating method flips this to
+    /// `true`; `save_if_dirty` skips the serialize+rename when the flag
+    /// is clear, so a checkpoint that touches an untouched tree is free.
+    /// Set to `false` on `create` / `load` / any successful `save_to`.
+    dirty: bool,
 }
 
 impl BTree {
@@ -75,10 +81,19 @@ impl BTree {
             nodes: vec![root_node],
             root: 0,
             path: path.to_path_buf(),
+            // Fresh trees have no on-disk content yet; the caller is
+            // expected to `save` once after bulk-loading before the
+            // dirty flag is meaningful.
+            dirty: false,
         })
     }
 
     pub fn insert(&mut self, key: Value, rid: RowId) {
+        // Blocker B3: any mutation flips the dirty flag. Callers
+        // (Table::insert, Table::update_hinted, ...) defer the actual
+        // disk write to the next `save_if_dirty` — typically at
+        // `Catalog::checkpoint` or on `Drop`.
+        self.dirty = true;
         let root = self.root;
         if let Some((mid_key, new_node_id)) = self.insert_recursive(root, key, rid) {
             // Root was split — create new root
@@ -105,6 +120,8 @@ impl BTree {
     /// compatible with the generic `insert` / `lookup` paths.
     #[inline]
     pub fn insert_int(&mut self, key: i64, rid: RowId) {
+        // Blocker B3: mark dirty; checkpoint flushes later.
+        self.dirty = true;
         let root = self.root;
         if let Some((mid_key, new_node_id)) = self.insert_recursive_int(root, key, rid) {
             let new_root = Node::Internal {
@@ -424,6 +441,10 @@ impl BTree {
     /// Returns `true` if the key was found and removed.
     #[inline]
     pub fn delete_int(&mut self, key: i64) -> bool {
+        // Blocker B3: we mark dirty optimistically even if the key
+        // turns out to be missing — the cost of re-checking is higher
+        // than the cost of one no-op save.
+        self.dirty = true;
         let mut node_id = self.root;
         loop {
             // Walk internal nodes via single-sided comparison.
@@ -476,6 +497,10 @@ impl BTree {
         if sorted_keys.is_empty() {
             return 0;
         }
+        // Blocker B3: mark dirty; non-empty input means we will try
+        // at least one leaf compaction, which may or may not remove
+        // anything — still cheaper than a counted "only on match" flip.
+        self.dirty = true;
 
         // Walk to the leftmost leaf. From there we can follow `next_leaf`
         // to visit every leaf in order — matching the sorted-key cursor.
@@ -555,6 +580,9 @@ impl BTree {
 
     /// Delete a key from the tree. Returns true if the key was found and removed.
     pub fn delete(&mut self, key: &Value) -> bool {
+        // Blocker B3: mark dirty; see `delete_int` for the optimistic
+        // marking rationale.
+        self.dirty = true;
         // Simple deletion: find leaf and remove (no rebalancing for now — acceptable
         // for initial implementation, tree stays valid just potentially underfull)
         let mut node_id = self.root;
@@ -667,14 +695,43 @@ impl BTree {
     /// Persist the tree to its backing file atomically. Writes to a
     /// sibling `.tmp` path then renames over the target, matching the
     /// catalog's persist strategy.
-    pub fn save(&self) -> io::Result<()> {
-        self.save_to(&self.path)
+    pub fn save(&mut self) -> io::Result<()> {
+        let path = self.path.clone();
+        self.save_to(&path)?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Blocker B3: persist the tree only if it has been mutated since
+    /// the last successful `save` / `save_if_dirty`. Wired into
+    /// [`crate::catalog::Catalog::checkpoint`] and its `Drop` impl so
+    /// the write cost is paid at most once per checkpoint instead of
+    /// once per insert/update/delete on the hot path.
+    pub fn save_if_dirty(&mut self) -> io::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        self.save()
+    }
+
+    /// Is there unflushed work in this tree? Exposed for tests + the
+    /// `Table::rebuild_dirty_indexes_from_heap` recovery path.
+    #[inline]
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Force the dirty flag. Used by crash-recovery paths that know
+    /// the in-memory tree may lag the heap (e.g. after WAL replay).
+    #[inline]
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
     }
 
     /// Persist the tree to an arbitrary path. Primarily used by tests
     /// and by the create-index rebuild path, which wants to write the
     /// file at a location supplied by the caller. Does NOT update
-    /// `self.path`.
+    /// `self.path` or the dirty flag.
     pub fn save_to(&self, path: &Path) -> io::Result<()> {
         let mut buf: Vec<u8> = Vec::with_capacity(64 + 32 * self.nodes.len());
         buf.extend_from_slice(BTREE_MAGIC);
@@ -830,6 +887,8 @@ impl BTree {
             nodes,
             root,
             path: path.to_path_buf(),
+            // Loaded tree matches its backing file exactly.
+            dirty: false,
         })
     }
 }
@@ -1288,7 +1347,7 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_file(&tmp);
-        let bt = BTree::create(&tmp).unwrap();
+        let mut bt = BTree::create(&tmp).unwrap();
         bt.save().unwrap();
         let reloaded = BTree::load(&tmp).unwrap();
         assert_eq!(reloaded.len(), 0);

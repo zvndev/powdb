@@ -365,10 +365,12 @@ impl Table {
         // bounds-checked vec access + one `insert_int` call, no
         // FxHash(col_name) / HashMap probe at all.
         //
-        // Mission 3: track which indexes we actually touched so we can
-        // `save` them at the end. Non-touched indexes (e.g. the row had
-        // an Empty value for that indexed column) don't need a rewrite.
-        let mut touched = false;
+        // Blocker B3: each `insert` / `insert_int` flips the btree's
+        // dirty flag in memory; the actual `save` (serialize + fsync
+        // + rename) is deferred to the next `Catalog::checkpoint` /
+        // `Catalog::drop`. Mission 3 used to do one fsync per row
+        // here, which cost `insert_batch_1k` ~1000 fsyncs per
+        // iteration and wiped out the D10/D11 wins.
         for entry in &mut self.indexed_cols {
             let val = &values[entry.col_idx];
             if val.is_empty() {
@@ -377,56 +379,65 @@ impl Table {
             if entry.is_int {
                 if let Value::Int(i) = val {
                     entry.btree.insert_int(*i, rid);
-                    touched = true;
                     continue;
                 }
             }
             entry.btree.insert(val.clone(), rid);
-            touched = true;
-        }
-        if touched {
-            self.save_touched_indexes(values, None)?;
         }
         Ok(rid)
     }
 
-    /// Mission 3: rewrite every `.idx` file whose column was touched by
-    /// the row values (`new_values`, or the post-update values). If
-    /// `prev_values` is provided, also save indexes whose column changed
-    /// between old and new (used by `update_hinted`).
-    ///
-    /// Save-per-write is a known hot-path cost — see the mission report.
-    /// For a table with a single int index, each insert incurs one
-    /// `BTree::save` = serialize the whole node vec + rename. For small
-    /// trees that's a few hundred microseconds; at ORDER=256 with 1M
-    /// rows it's several ms. The parent PR is expected to iterate on this
-    /// (dirty flag + lazy checkpoint) once the other Mission 3 work
-    /// lands.
-    fn save_touched_indexes(
-        &self,
-        values: &Row,
-        prev_values: Option<&Row>,
-    ) -> io::Result<()> {
-        for entry in &self.indexed_cols {
-            let new_val = &values[entry.col_idx];
-            let touched = !new_val.is_empty()
-                || prev_values
-                    .map(|p| !p[entry.col_idx].is_empty() && p[entry.col_idx] != *new_val)
-                    .unwrap_or(false);
-            if touched {
-                entry.btree.save()?;
-            }
+    /// Blocker B3: flush every dirty btree index to disk. Wired into
+    /// [`crate::catalog::Catalog::checkpoint`] and its `Drop` impl so
+    /// we get one fsync + rename per dirty index per checkpoint, not
+    /// one per inserted row. Clean trees (no mutations since last
+    /// save) are free — `BTree::save_if_dirty` early-returns.
+    pub(crate) fn save_dirty_indexes(&mut self) -> io::Result<()> {
+        for entry in self.indexed_cols.iter_mut() {
+            entry.btree.save_if_dirty()?;
         }
         Ok(())
     }
 
-    /// Mission 3: save every index file unconditionally. Used by the
-    /// delete / bulk-delete paths, where the "touched" set is the full
-    /// set of indexes (we can't cheaply reason about which btrees
-    /// actually removed an entry without reading old rows).
-    fn save_all_indexes(&self) -> io::Result<()> {
-        for entry in &self.indexed_cols {
-            entry.btree.save()?;
+    /// Blocker B3: rebuild every secondary index from the heap.
+    ///
+    /// Used by the crash-recovery path in `Catalog::open`: after WAL
+    /// replay lands rows back in the heap, the on-disk `.idx` files
+    /// may lag (or lead) the heap because the prior session deferred
+    /// btree saves until checkpoint. Replaying is cheap — we walk the
+    /// heap once per index — and produces a tree that exactly matches
+    /// the current heap state, which is the invariant subsequent
+    /// inserts assume.
+    ///
+    /// After this call, every indexed tree is marked dirty so the
+    /// next `Catalog::checkpoint` persists the recovered state.
+    pub(crate) fn rebuild_indexes_from_heap(&mut self) -> io::Result<()> {
+        if self.indexed_cols.is_empty() {
+            return Ok(());
+        }
+
+        let schema = &self.schema;
+        for entry in self.indexed_cols.iter_mut() {
+            let mut fresh = BTree::create(entry.btree.file_path())?;
+            for (rid, row) in self.heap.scan() {
+                let row = crate::row::decode_row(schema, &row);
+                let v = &row[entry.col_idx];
+                if v.is_empty() {
+                    continue;
+                }
+                if entry.is_int {
+                    if let Value::Int(i) = v {
+                        fresh.insert_int(*i, rid);
+                        continue;
+                    }
+                }
+                fresh.insert(v.clone(), rid);
+            }
+            // Force-mark dirty so the next checkpoint flushes the
+            // freshly rebuilt tree, even if no further mutations
+            // happen before shutdown.
+            fresh.mark_dirty();
+            entry.btree = fresh;
         }
         Ok(())
     }
@@ -486,9 +497,9 @@ impl Table {
         })?;
 
         self.heap.delete(rid)?;
-        // Mission 3: flush every touched index to disk so deletes survive
-        // restart. Same save-per-write caveat as `insert`.
-        self.save_all_indexes()?;
+        // Blocker B3: btree mutations above marked the indexes dirty.
+        // The actual persist happens at the next `Catalog::checkpoint`
+        // (or `Drop`), batching many deletes into one fsync per index.
         Ok(())
     }
 
@@ -577,12 +588,9 @@ impl Table {
             entry.btree.delete_many_int(keys);
         }
 
-        // Mission 3: persist the mutated indexes once per bulk call —
-        // much cheaper than a save per rid. Inline here because the
-        // split-borrow above means `self` is no longer fully owned.
-        for entry in indexed_cols.iter() {
-            entry.btree.save()?;
-        }
+        // Blocker B3: indexes are now dirty in memory; `delete_many_int`
+        // already flipped the dirty flag on each mutated btree above.
+        // Checkpoint batches the persist.
 
         Ok(count)
     }
@@ -643,11 +651,9 @@ impl Table {
                 keys.sort_unstable();
                 entry.btree.delete_many_int(keys);
             }
-            // Mission 3: flush the batched mutations to disk. `self` is
-            // split-borrowed so we save through `indexed_cols` directly.
-            for entry in indexed_cols.iter() {
-                entry.btree.save()?;
-            }
+            // Blocker B3: dirty flags are already set by the
+            // per-btree `delete_many_int` call above; checkpoint
+            // handles the persist.
             return Ok(count);
         }
 
@@ -670,10 +676,8 @@ impl Table {
                 entry.btree.delete(v);
             }
         }
-        // Mission 3: persist the mutated indexes once after the batch.
-        for entry in indexed_cols.iter() {
-            entry.btree.save()?;
-        }
+        // Blocker B3: btree dirty flags are set by `delete`; checkpoint
+        // flushes later.
         Ok(count)
     }
 
@@ -732,7 +736,6 @@ impl Table {
         );
         let new_rid = self.heap.update(rid, &self.encode_scratch)?;
 
-        let mut any_index_changed = false;
         if touches_index {
             // Mission C Phase 17: walk the Vec<IndexedCol> directly.
             // `col_idx` is already precomputed on each entry, so we
@@ -747,23 +750,15 @@ impl Table {
                     }
                     if !old_val.is_empty() {
                         entry.btree.delete(old_val);
-                        any_index_changed = true;
                     }
                 }
                 if !new_val.is_empty() {
                     entry.btree.insert(new_val.clone(), new_rid);
-                    any_index_changed = true;
                 }
             }
         }
-        // Mission 3: persist any mutated indexes. Skipped entirely on the
-        // overwhelmingly common non-indexed-column update path, since
-        // `touches_index` is already false there.
-        if any_index_changed {
-            for entry in self.indexed_cols.iter() {
-                entry.btree.save()?;
-            }
-        }
+        // Blocker B3: any mutated btree is now dirty; checkpoint will
+        // persist it. No per-row fsync on this hot path.
         Ok(new_rid)
     }
 
