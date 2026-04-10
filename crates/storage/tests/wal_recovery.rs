@@ -66,10 +66,13 @@ fn test_crash_recovery_100_rows() {
             )
             .unwrap();
         }
+        // Mission B (post-review): `wal_log` no longer flushes per call
+        // — the Engine flushes at statement boundary. Tests that bypass
+        // the Engine must flush explicitly before simulating a crash.
+        cat.sync_wal().unwrap();
         // Crash simulation: skip every Drop underneath the Catalog so
-        // the in-memory hot-page cache is lost. `wal.flush` already
-        // ran inside every `insert` call, so the WAL file on disk
-        // holds all 100 records.
+        // the in-memory hot-page cache is lost. The WAL file on disk
+        // now holds all 100 records (we just synced).
         std::mem::forget(cat);
     }
 
@@ -175,6 +178,10 @@ fn test_crash_recovery_deletes_idempotent() {
         for rid in &rids_to_delete {
             cat.delete("users", *rid).unwrap();
         }
+        // Mission B (post-review): WAL flush is now statement-boundary,
+        // so this test (which bypasses the Engine) must explicitly sync
+        // before the crash simulation.
+        cat.sync_wal().unwrap();
         std::mem::forget(cat);
     }
 
@@ -303,6 +310,9 @@ fn test_crash_recovery_update_by_pk_fast_path() {
             .unwrap();
         assert!(ok, "update_row_bytes_logged should find the row");
 
+        // Mission B (post-review): WAL flush is statement-boundary now.
+        // Bypass-the-Engine tests must sync explicitly before crashing.
+        cat.sync_wal().unwrap();
         // Crash — skip every Drop, leaving the WAL with exactly one
         // Update record and the heap on disk still showing age=25.
         std::mem::forget(cat);
@@ -371,6 +381,9 @@ fn test_crash_recovery_var_col_update() {
             .unwrap();
         assert!(ok, "patch_var_col_logged should succeed on shrink");
 
+        // Mission B (post-review): statement-boundary WAL flush — sync
+        // explicitly before the crash since this test bypasses the Engine.
+        cat.sync_wal().unwrap();
         std::mem::forget(cat);
     }
 
@@ -436,6 +449,9 @@ fn test_crash_recovery_delete_by_filter() {
             .unwrap();
         assert_eq!(count, 49, "ages 51..=99 inclusive is 49 rows");
 
+        // Mission B (post-review): statement-boundary WAL flush — sync
+        // explicitly before the crash since this test bypasses the Engine.
+        cat.sync_wal().unwrap();
         std::mem::forget(cat);
     }
 
@@ -496,6 +512,9 @@ fn test_checkpoint_then_crash_no_duplicates() {
             cat.insert("users", &vec![Value::Int(i), Value::Str(format!("b_{i}"))])
                 .unwrap();
         }
+        // Mission B (post-review): statement-boundary WAL flush — sync
+        // explicitly before the crash since this test bypasses the Engine.
+        cat.sync_wal().unwrap();
         // Crash — the post-checkpoint 10 rows are only in the WAL.
         std::mem::forget(cat);
     }

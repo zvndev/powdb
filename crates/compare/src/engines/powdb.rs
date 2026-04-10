@@ -30,6 +30,7 @@ use powdb_query::plan::PlanNode;
 use powdb_query::result::QueryResult;
 use powdb_storage::row::RowLayout;
 use powdb_storage::types::Value;
+use powdb_storage::wal::WalSyncMode;
 use tempfile::TempDir;
 
 use super::{gen_row, BenchEngine};
@@ -55,7 +56,12 @@ pub struct PowdbEngine {
 impl PowdbEngine {
     pub fn new() -> Self {
         let tmp = TempDir::new().expect("create tempdir");
-        let engine = Engine::new(tmp.path()).expect("engine init");
+        let mut engine = Engine::new(tmp.path()).expect("engine init");
+        // Mission B: SQLite uses `:memory:` (zero fsync); match by
+        // disabling WAL fsync in the wide-bench harness so we measure
+        // execute_powql throughput, not durability cost. See bench/
+        // benches/powql.rs for the same toggle on the criterion side.
+        engine.catalog_mut().set_wal_sync_mode(WalSyncMode::Off);
         PowdbEngine {
             engine: RefCell::new(engine),
             layout: None,
@@ -207,7 +213,9 @@ impl BenchEngine for PowdbEngine {
         // rows from a prior iteration.
         if self.engine.get_mut().catalog().get_table("User").is_some() {
             let fresh_tmp = TempDir::new().expect("create tempdir");
-            let fresh_engine = Engine::new(fresh_tmp.path()).expect("engine reset");
+            let mut fresh_engine = Engine::new(fresh_tmp.path()).expect("engine reset");
+            // Re-apply the bench-only sync-off mode (see `new()`).
+            fresh_engine.catalog_mut().set_wal_sync_mode(WalSyncMode::Off);
             self.engine = RefCell::new(fresh_engine);
             self.layout = None;
             // Mission C Phase 5: a fresh engine means a fresh catalog,

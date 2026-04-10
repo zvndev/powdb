@@ -12,6 +12,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use powdb_query::executor::Engine;
 use powdb_storage::types::*;
+use powdb_storage::wal::WalSyncMode;
 use std::path::Path;
 use tempfile::TempDir;
 
@@ -24,6 +25,10 @@ const N_INSERT: usize = 10_000;
 fn setup_user_table(n: usize) -> (Engine, TempDir) {
     let tmp = TempDir::new().expect("create tempdir");
     let mut engine = Engine::new(tmp.path()).expect("engine init");
+    // Mission B: bench in `:memory:`-equivalent mode (no WAL append, no
+    // fsync). The reference SQLite engine uses `:memory:`; matching that
+    // is the only way the comparison stays apples-to-apples.
+    engine.catalog_mut().set_wal_sync_mode(WalSyncMode::Off);
 
     engine
         .execute_powql(
@@ -71,6 +76,8 @@ fn bench_insert_10k(c: &mut Criterion) {
                 // Insert throughput is a closed batch; this is the honest way.
                 let tmp = TempDir::new().expect("create tempdir");
                 let mut engine = Engine::new(tmp.path()).expect("engine init");
+                // Mission B: match the bench-mode contract — no WAL.
+                engine.catalog_mut().set_wal_sync_mode(WalSyncMode::Off);
                 engine
                     .execute_powql(
                         "type User { required id: int, required name: str, required age: int, required email: str }",

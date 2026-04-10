@@ -1,7 +1,7 @@
 use crate::row::encode_row_into;
 use crate::table::Table;
 use crate::types::*;
-use crate::wal::{Wal, WalRecordType};
+use crate::wal::{Wal, WalRecordType, WalSyncMode};
 use rustc_hash::FxHashMap;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -269,8 +269,20 @@ impl Catalog {
         id
     }
 
-    /// Log a mutation to the WAL and flush so the log record is durable
-    /// before the caller mutates any page.
+    /// Append a mutation record to the WAL buffer. **Does not flush.**
+    ///
+    /// Mission B (post-review): per-row `wal.flush()` was a ~1ms fsync on
+    /// every mutation, turning `update_by_filter` into a ~19s workload.
+    /// The flush is now deferred to [`Self::sync_wal`], which the executor
+    /// calls exactly once at the end of every mutating statement. This
+    /// gives us statement-level group commit: N-row updates pay one fsync,
+    /// not N.
+    ///
+    /// Durability contract: any path that observes `Ok(...)` back from
+    /// the executor must have called `sync_wal` before returning that
+    /// Ok. Replay is still correct because WAL records are appended in
+    /// order and only records that reached `fdatasync`ed bytes are
+    /// replayed.
     fn wal_log(
         &mut self,
         tx_id: u64,
@@ -279,9 +291,38 @@ impl Catalog {
         rid: RowId,
         row_bytes: &[u8],
     ) -> io::Result<()> {
+        // Mission B (post-review, second pass): when the WAL is in Off
+        // mode the `append` call below is a no-op, so building the
+        // payload first wastes a `Vec` allocation + ~3 extends per
+        // mutation. The catalog hot paths check `wal.is_off()` before
+        // calling here, but this guard is the belt-and-braces version
+        // for any internal caller that doesn't.
+        if self.wal.is_off() {
+            return Ok(());
+        }
         let payload = encode_wal_payload(table, rid, row_bytes);
-        self.wal.append(tx_id, record_type, &payload)?;
+        self.wal.append(tx_id, record_type, &payload)
+    }
+
+    /// Flush any buffered WAL records to disk. Called by the executor
+    /// at the end of every mutating statement so the group-commit
+    /// window is exactly one statement.
+    ///
+    /// See [`Self::wal_log`] for the durability contract.
+    #[inline]
+    pub fn sync_wal(&mut self) -> io::Result<()> {
         self.wal.flush()
+    }
+
+    /// Set the WAL sync mode. Production code should leave this at the
+    /// default ([`WalSyncMode::Full`]). Benchmarks set it to
+    /// [`WalSyncMode::Off`] to compare apples-to-apples against
+    /// `:memory:` SQLite (which has zero fsync cost).
+    ///
+    /// **Never** call this with `Off` in production — a machine crash
+    /// can lose any record written since the last `sync_wal` returned.
+    pub fn set_wal_sync_mode(&mut self, mode: WalSyncMode) {
+        self.wal.set_sync_mode(mode);
     }
 
     pub fn create_table(&mut self, schema: Schema) -> io::Result<()> {
@@ -373,6 +414,13 @@ impl Catalog {
         // log it to the WAL before touching the heap. We re-encode inside
         // `Table::insert`, which keeps the insert hot path untouched — the
         // WAL encode here is additive.
+        //
+        // Mission B (post-review, second pass): in `WalSyncMode::Off` the
+        // entire WAL pipeline is a no-op, so skip the per-row
+        // `encode_row_into` allocation and `wal_log` call entirely.
+        if self.wal.is_off() {
+            return self.by_name_mut(table)?.insert(values);
+        }
         let tbl = self.by_name_mut(table)?;
         let mut wal_bytes: Vec<u8> = Vec::new();
         encode_row_into(&tbl.schema, values, &mut wal_bytes);
@@ -394,6 +442,11 @@ impl Catalog {
     }
 
     pub fn delete(&mut self, table: &str, rid: RowId) -> io::Result<()> {
+        // Mission B (post-review, second pass): WAL Off → no payload
+        // construction.
+        if self.wal.is_off() {
+            return self.by_name_mut(table)?.delete(rid);
+        }
         let tx_id = self.next_tx();
         // Delete records carry only the rid — no row payload.
         self.wal_log(tx_id, WalRecordType::Delete, table, rid, &[])?;
@@ -404,15 +457,21 @@ impl Catalog {
     /// maintenance. See [`Table::delete_many`] for the full explanation
     /// and fall-through rules. Returns the number of rows removed.
     pub fn delete_many(&mut self, table: &str, rids: &[RowId]) -> io::Result<u64> {
-        // Mission 2: log every rid as an individual Delete record. Batching
-        // here would require a new record type; the append is cheap (they
-        // all share the same WAL group commit via `wal.flush` at the end).
+        // Mission 2: log every rid as an individual Delete record. The
+        // WAL flush is deferred to the executor's statement-end
+        // `sync_wal` — see [`Self::wal_log`] for the group-commit rules.
+        //
+        // Mission B (post-review, second pass): in Off mode skip the
+        // entire per-row payload loop — `wal.append` would no-op every
+        // call but the `encode_wal_payload` Vec alloc would still run.
+        if self.wal.is_off() {
+            return self.by_name_mut(table)?.delete_many(rids);
+        }
         let tx_id = self.next_tx();
         for &rid in rids {
             let payload = encode_wal_payload(table, rid, &[]);
             self.wal.append(tx_id, WalRecordType::Delete, &payload)?;
         }
-        self.wal.flush()?;
         self.by_name_mut(table)?.delete_many(rids)
     }
 
@@ -446,6 +505,14 @@ impl Catalog {
     where
         P: FnMut(&[u8]) -> bool,
     {
+        // Mission B (post-review, second pass): in Off mode the per-row
+        // hook would build a Vec, do five extends, and then `append`
+        // would no-op. Skip the WAL hook entirely and route through
+        // the no-WAL primitive — same single-pass scan, zero per-row
+        // payload work.
+        if self.wal.is_off() {
+            return self.by_name_mut(table)?.scan_delete_matching(pred);
+        }
         // Resolve slot up front so we can split the borrow — the user
         // hook closes over `&mut self.wal`, which can't coexist with a
         // `by_name_mut` borrow of `self.tables`.
@@ -479,13 +546,16 @@ impl Catalog {
             // which would fail the outer flush below as well.
             let _ = wal.append(tx_id, WalRecordType::Delete, &payload);
         })?;
-        // Single group-commit fsync at the end of the batch. Matches
-        // the existing `delete_many` shape.
-        self.wal.flush()?;
+        // Flush is deferred to the executor's statement-end `sync_wal`.
         Ok(count)
     }
 
     pub fn update(&mut self, table: &str, rid: RowId, values: &Row) -> io::Result<RowId> {
+        // Mission B (post-review, second pass): WAL Off → no payload
+        // construction.
+        if self.wal.is_off() {
+            return self.by_name_mut(table)?.update(rid, values);
+        }
         let tbl = self.by_name_mut(table)?;
         let mut wal_bytes: Vec<u8> = Vec::new();
         encode_row_into(&tbl.schema, values, &mut wal_bytes);
@@ -504,6 +574,12 @@ impl Catalog {
         values: &Row,
         changed_col_indices: Option<&[usize]>,
     ) -> io::Result<RowId> {
+        // Mission B (post-review, second pass): WAL Off → no payload
+        // construction. The `update_by_filter` powql bench drives this
+        // path tens of thousands of times per iteration.
+        if self.wal.is_off() {
+            return self.by_name_mut(table)?.update_hinted(rid, values, changed_col_indices);
+        }
         let tbl = self.by_name_mut(table)?;
         let mut wal_bytes: Vec<u8> = Vec::new();
         encode_row_into(&tbl.schema, values, &mut wal_bytes);
@@ -586,6 +662,12 @@ impl Catalog {
         if !ok {
             return Ok(false);
         }
+        // Mission B (post-review, second pass): in Off mode the per-row
+        // get + clone + table-name clone + wal_log call are all wasted
+        // — `wal.append` would no-op. Skip the snapshot path entirely.
+        if self.wal.is_off() {
+            return Ok(true);
+        }
         // Step 2: snapshot the now-mutated bytes. `HeapFile::get`
         // observes the pinned hot page, so it returns the fresh row.
         let new_bytes = match tbl.heap.get(rid) {
@@ -642,6 +724,11 @@ impl Catalog {
         let ok = tbl.patch_var_col_in_place(rid, col_idx, new_value)?;
         if !ok {
             return Ok(false);
+        }
+        // Mission B (post-review, second pass): WAL Off → skip the
+        // snapshot + clone + log entirely.
+        if self.wal.is_off() {
+            return Ok(true);
         }
         let new_bytes = match tbl.heap.get(rid) {
             Some(b) => b,

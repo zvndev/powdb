@@ -208,6 +208,12 @@ fn test_index_crash_before_save_rebuilds_from_heap() {
         // dirty in memory — if we drop cleanly they would be saved,
         // so bypass Drop with `mem::forget` to emulate a crash
         // between the last insert and the next checkpoint.
+        //
+        // Mission B (post-review): WAL flush is statement-boundary, so
+        // tests that bypass the Engine must sync explicitly. Without
+        // this, the 100 inserts above sit in the WalWriter's BufWriter
+        // and never reach disk before `mem::forget`.
+        cat.sync_wal().unwrap();
         std::mem::forget(cat);
     }
 

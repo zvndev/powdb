@@ -324,13 +324,22 @@ impl Engine {
                 let cached = self.plan_cache.lock().unwrap()
                     .get_with_substitution(hash, &literals);
                 if let Some(plan) = cached {
-                    return self.execute_plan(&plan);
+                    let result = self.execute_plan(&plan);
+                    // Mission B (post-review): statement-boundary WAL
+                    // group commit. Catalog::wal_log now only appends;
+                    // the fsync happens here exactly once per statement.
+                    // `sync_wal` is a no-op when nothing was buffered
+                    // (pure reads pay zero fsync).
+                    self.catalog.sync_wal().map_err(|e| e.to_string())?;
+                    return result;
                 }
                 // Miss — plan, insert, execute.
                 return match planner::plan(input) {
                     Ok(plan) => {
                         self.plan_cache.lock().unwrap().insert(hash, plan.clone());
-                        self.execute_plan(&plan)
+                        let result = self.execute_plan(&plan);
+                        self.catalog.sync_wal().map_err(|e| e.to_string())?;
+                        result
                     }
                     Err(e) => Err(e.message),
                 };
@@ -338,7 +347,11 @@ impl Engine {
             // Lex error — fall through to the planner so the caller gets a
             // consistent error shape.
             return match planner::plan(input) {
-                Ok(plan) => self.execute_plan(&plan),
+                Ok(plan) => {
+                    let result = self.execute_plan(&plan);
+                    self.catalog.sync_wal().map_err(|e| e.to_string())?;
+                    result
+                }
                 Err(e) => Err(e.message),
             };
         }
@@ -354,6 +367,8 @@ impl Engine {
 
         let exec_start = Instant::now();
         let result = self.execute_plan(&plan);
+        // Mission B (post-review): statement-boundary WAL flush.
+        let _ = self.catalog.sync_wal();
         let exec_us = exec_start.elapsed().as_micros();
 
         let total_us = total_start.elapsed().as_micros();
@@ -1356,6 +1371,11 @@ impl Engine {
                 if let PlanNode::Update { table, .. } = &prep.plan_template {
                     self.view_registry.mark_dependents_dirty(table);
                 }
+                // Mission B (post-review): statement-boundary WAL group
+                // commit. The fast path appended an Update record but did
+                // not flush — flush it now so the executor's contract is
+                // "WAL is on disk before this returns".
+                self.catalog.sync_wal().map_err(|e| e.to_string())?;
                 return Ok(result);
             }
         }
@@ -1397,6 +1417,8 @@ impl Engine {
             if let PlanNode::Insert { table, .. } = &prep.plan_template {
                 self.view_registry.mark_dependents_dirty(table);
             }
+            // Mission B (post-review): statement-boundary WAL group commit.
+            self.catalog.sync_wal().map_err(|e| e.to_string())?;
             return Ok(QueryResult::Modified(1));
         }
 
@@ -1404,7 +1426,11 @@ impl Engine {
         let mut idx = 0usize;
         crate::plan_cache::substitute_plan(&mut plan, literals, &mut idx);
         debug_assert_eq!(idx, literals.len());
-        self.execute_plan(&plan)
+        let result = self.execute_plan(&plan);
+        // Mission B (post-review): statement-boundary WAL group commit.
+        // No-op when nothing was buffered (read-only plans).
+        self.catalog.sync_wal().map_err(|e| e.to_string())?;
+        result
     }
 
     /// Mission C Phase 14: point-update fast path for prepared
@@ -1526,6 +1552,8 @@ impl Engine {
             values.clear();
             self.insert_values_scratch = values;
             res?;
+            // Mission B (post-review): statement-boundary WAL group commit.
+            self.catalog.sync_wal().map_err(|e| e.to_string())?;
             return Ok(QueryResult::Modified(1));
         }
 

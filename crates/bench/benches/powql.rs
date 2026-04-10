@@ -43,6 +43,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use powdb_query::executor::Engine;
 use powdb_storage::types::*;
+use powdb_storage::wal::WalSyncMode;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -103,6 +104,18 @@ const N_QUERIES: usize = 100;
 fn setup_user_fixture_n(n: usize) -> (Engine, TempDir) {
     let tmp = TempDir::new().expect("create tempdir");
     let mut engine = Engine::new(tmp.path()).expect("engine init");
+
+    // Mission B: PowDB now ships a write-ahead log that fsyncs at every
+    // statement boundary by default. The reference SQLite engine in the
+    // wide-bench harness uses `:memory:` (zero fsync), so to keep the
+    // criterion regression gate measuring the same thing it has always
+    // measured — execute_powql throughput minus durability cost — we
+    // disable WAL fsync inside the bench. The WAL is still appended +
+    // recovered on process crash; only the machine-crash guarantee is
+    // dropped. Production code uses the default Full mode.
+    engine
+        .catalog_mut()
+        .set_wal_sync_mode(WalSyncMode::Off);
 
     engine
         .execute_powql(

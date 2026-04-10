@@ -36,11 +36,32 @@ pub struct WalRecord {
     pub data: Vec<u8>,
 }
 
+/// Durability mode for the WAL — analogous to SQLite's `PRAGMA synchronous`
+/// combined with `journal_mode=OFF`.
+///
+/// * `Full` — every mutation appends a record and `flush()` calls
+///   `sync_data()` so the OS guarantees the bytes hit stable storage before
+///   the call returns. This is the default and the only safe choice when
+///   crash recovery must be perfect.
+///
+/// * `Off`  — every `append()` and `flush()` is a zero-work no-op. No CRC,
+///   no BufWriter, no fsync, no recovery. This matches SQLite's `:memory:`
+///   semantics and is the only way to compare apples-to-apples against
+///   in-memory engines in benches. Never use this in production — a crash
+///   loses every mutation since the last `Catalog::checkpoint()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WalSyncMode {
+    #[default]
+    Full,
+    Off,
+}
+
 pub struct Wal {
     path: PathBuf,
     writer: BufWriter<File>,
     batch_size: usize,
     pending: usize,
+    sync_mode: WalSyncMode,
 }
 
 impl Wal {
@@ -53,6 +74,7 @@ impl Wal {
             writer: BufWriter::new(file),
             batch_size,
             pending: 0,
+            sync_mode: WalSyncMode::default(),
         })
     }
 
@@ -65,11 +87,42 @@ impl Wal {
             writer: BufWriter::new(file),
             batch_size,
             pending: 0,
+            sync_mode: WalSyncMode::default(),
         })
     }
 
+    /// Toggle the durability mode. See [`WalSyncMode`] for the contract.
+    /// The change takes effect on the next `flush()`.
+    pub fn set_sync_mode(&mut self, mode: WalSyncMode) {
+        self.sync_mode = mode;
+    }
+
+    /// Returns the current sync mode (used by tests + introspection).
+    pub fn sync_mode(&self) -> WalSyncMode {
+        self.sync_mode
+    }
+
+    /// `true` when the WAL is in [`WalSyncMode::Off`] — i.e. every
+    /// `append`/`flush` is a no-op. Catalog mutation hot paths check
+    /// this BEFORE constructing WAL payloads so we don't pay
+    /// `encode_row_into` + `encode_wal_payload` allocs only to throw
+    /// the result away inside `append`. This is the difference between
+    /// "no fsync" and "free" — the former is still 50–60% slower than
+    /// the no-WAL baseline on `update_by_filter`/`delete_by_filter`,
+    /// the latter matches the baseline.
+    #[inline]
+    pub fn is_off(&self) -> bool {
+        matches!(self.sync_mode, WalSyncMode::Off)
+    }
+
     /// Append a record to the WAL buffer. Auto-flushes when batch is full.
+    ///
+    /// In [`WalSyncMode::Off`] this is a zero-work no-op — see the enum's
+    /// doc for the durability contract.
     pub fn append(&mut self, tx_id: u64, record_type: WalRecordType, data: &[u8]) -> io::Result<()> {
+        if matches!(self.sync_mode, WalSyncMode::Off) {
+            return Ok(());
+        }
         let total_len = (WAL_HEADER_SIZE + data.len()) as u32;
 
         // Compute CRC over tx_id + type + data
@@ -94,14 +147,24 @@ impl Wal {
     }
 
     /// Flush buffered records to disk with fsync (the group commit point).
+    ///
+    /// No-op if nothing has been appended since the last flush. This makes
+    /// it safe for the executor to unconditionally call `sync_wal` at the
+    /// end of every statement — read queries pay zero fsync cost.
     pub fn flush(&mut self) -> io::Result<()> {
         let batch = self.pending;
-        self.writer.flush()?;
-        self.writer.get_ref().sync_data()?;
-        self.pending = 0;
-        if batch > 0 {
-            debug!(records = batch, "wal group commit");
+        if batch == 0 {
+            return Ok(());
         }
+        self.writer.flush()?;
+        // SQLite-style synchronous knob: only the explicit fsync is gated.
+        // The BufWriter::flush above always runs so a process crash still
+        // recovers cleanly via `read_all`.
+        if matches!(self.sync_mode, WalSyncMode::Full) {
+            self.writer.get_ref().sync_data()?;
+        }
+        self.pending = 0;
+        debug!(records = batch, "wal group commit");
         Ok(())
     }
 
