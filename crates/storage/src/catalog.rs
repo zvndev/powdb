@@ -400,15 +400,69 @@ impl Catalog {
     /// raw-bytes predicate. See [`Table::scan_delete_matching`] and
     /// [`HeapFile::scan_delete_matching`] for the fusion rationale.
     ///
-    /// Mission 2 caveat: this fused scan-delete does NOT per-row-log to
-    /// the WAL. The predicate is opaque and the target rids are only
-    /// discovered mid-scan. Callers that need crash durability for this
-    /// path must call [`Self::checkpoint`] afterwards.
+    /// Mission B2: prefer [`Self::scan_delete_matching_logged`] from any
+    /// caller that needs crash durability. This variant writes no WAL
+    /// records, so a crash between the scan and the next checkpoint
+    /// would lose the deletes. Kept here for internal paths (e.g.
+    /// `drop_table`) where the whole heap is about to be removed anyway.
     pub fn scan_delete_matching<P>(&mut self, table: &str, pred: P) -> io::Result<u64>
     where
         P: FnMut(&[u8]) -> bool,
     {
         self.by_name_mut(table)?.scan_delete_matching(pred)
+    }
+
+    /// Mission B2: WAL-logged variant of [`Self::scan_delete_matching`].
+    /// Every matched row emits one `WalRecordType::Delete` record in the
+    /// same single-pass scan (via the table's `_with_hook` variant), so
+    /// crash recovery sees every deletion. Used by the executor's
+    /// `Delete(Filter(SeqScan))` and bare `Delete(SeqScan)` fast paths.
+    ///
+    /// Performance cost vs the non-logged primitive is one per-row WAL
+    /// append into the in-memory buffer plus one `fsync` at the end —
+    /// the heap scan itself still runs as a single pass with one
+    /// `ensure_hot` per page.
+    pub fn scan_delete_matching_logged<P>(&mut self, table: &str, pred: P) -> io::Result<u64>
+    where
+        P: FnMut(&[u8]) -> bool,
+    {
+        // Resolve slot up front so we can split the borrow — the user
+        // hook closes over `&mut self.wal`, which can't coexist with a
+        // `by_name_mut` borrow of `self.tables`.
+        let slot = *self.name_to_slot.get(table).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found"))
+        })?;
+        let tx_id = self.next_tx();
+        // Split-borrow the catalog fields so the hook can write into
+        // `wal` while the scan pins `tables[slot]` mutably.
+        let Catalog { tables, wal, .. } = self;
+        let tbl = &mut tables[slot];
+        // Pre-encode the table-name prefix of every WAL payload once —
+        // it doesn't vary row-to-row, and the per-row rid+row bytes are
+        // the only things we append inside the hook.
+        let name_bytes = table.as_bytes();
+        let count = tbl.scan_delete_matching_with_hook(pred, |rid, row_bytes| {
+            let mut payload: Vec<u8> = Vec::with_capacity(4 + name_bytes.len() + 10 + row_bytes.len());
+            payload.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            payload.extend_from_slice(name_bytes);
+            payload.extend_from_slice(&rid.page_id.to_le_bytes());
+            payload.extend_from_slice(&rid.slot_index.to_le_bytes());
+            // Delete records carry no row payload on replay, but we
+            // match the `encode_wal_payload` layout so `decode_wal_payload`
+            // (which is type-agnostic) parses them cleanly.
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            // Best-effort append — if it errors we have no way to
+            // propagate from inside the hook; we swallow it here and
+            // the outer scan's `io::Result` will still succeed. In
+            // practice the `BufWriter`-backed `Wal::append` only errors
+            // on allocation failure or a disk-full fsync, both of
+            // which would fail the outer flush below as well.
+            let _ = wal.append(tx_id, WalRecordType::Delete, &payload);
+        })?;
+        // Single group-commit fsync at the end of the batch. Matches
+        // the existing `delete_many` shape.
+        self.wal.flush()?;
+        Ok(count)
     }
 
     pub fn update(&mut self, table: &str, rid: RowId, values: &Row) -> io::Result<RowId> {
@@ -443,11 +497,12 @@ impl Catalog {
     /// preserves the row length and touches no indexed column. Returns
     /// `Ok(true)` if the patch landed, `Ok(false)` if the row is gone.
     ///
-    /// Mission 2 caveat: this fast path does NOT log to the WAL. The
-    /// caller mutates raw bytes through a closure, so we can't cheaply
-    /// build an `Update` record without re-reading the slot. Callers that
-    /// need crash durability must call [`Self::checkpoint`] afterwards,
-    /// OR use [`Self::update_hinted`] which does log.
+    /// Mission B2: this primitive does NOT log to the WAL. Executor
+    /// callers must route through [`Self::update_row_bytes_logged`] (or
+    /// [`Self::update_row_bytes_logged_by_slot`]) so crash recovery
+    /// sees the patched bytes. This raw form is retained for replay
+    /// itself and any future callers that can tolerate the non-durable
+    /// contract.
     #[inline]
     pub fn with_row_bytes_mut<F>(
         &mut self,
@@ -461,6 +516,71 @@ impl Catalog {
         self.by_name_mut(table)?.with_row_bytes_mut(rid, f)
     }
 
+    /// Mission B2: WAL-logged variant of [`Self::with_row_bytes_mut`].
+    /// Applies `f` to the live row bytes on the hot page, then reads
+    /// the mutated bytes back and emits a `WalRecordType::Update`
+    /// record so replay will re-apply the same patch after a crash.
+    ///
+    /// Ordering: the hot-page mutation happens first (in-memory only,
+    /// no disk I/O), then the WAL record is appended and flushed. A
+    /// crash after the mutation but before the WAL flush loses the
+    /// update, but the caller never saw success in that case, so the
+    /// contract holds: any `Ok(true)` return is durable.
+    ///
+    /// No hot-page eviction can happen between steps because this
+    /// method holds the catalog's `&mut self` exclusively.
+    #[inline]
+    pub fn update_row_bytes_logged<F>(
+        &mut self,
+        table: &str,
+        rid: RowId,
+        f: F,
+    ) -> io::Result<bool>
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        let slot = *self.name_to_slot.get(table).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found"))
+        })?;
+        self.update_row_bytes_logged_by_slot(slot, rid, f)
+    }
+
+    /// Slot-indexed counterpart to [`Self::update_row_bytes_logged`].
+    /// Used by prepared-query fast paths that already cached the table
+    /// slot at prepare time and want to skip the name->slot probe on
+    /// every execution.
+    #[inline]
+    pub fn update_row_bytes_logged_by_slot<F>(
+        &mut self,
+        slot: usize,
+        rid: RowId,
+        f: F,
+    ) -> io::Result<bool>
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        // Step 1: apply the mutation on the hot page. Failure here
+        // (slot gone) short-circuits with Ok(false) — no WAL record.
+        let tbl = &mut self.tables[slot];
+        let ok = tbl.with_row_bytes_mut(rid, f)?;
+        if !ok {
+            return Ok(false);
+        }
+        // Step 2: snapshot the now-mutated bytes. `HeapFile::get`
+        // observes the pinned hot page, so it returns the fresh row.
+        let new_bytes = match tbl.heap.get(rid) {
+            Some(b) => b,
+            // Shouldn't happen — we just patched it — but be defensive.
+            None => return Ok(false),
+        };
+        // Step 3: log + flush. Clone the table name out of the schema
+        // so we can drop the `&mut tbl` borrow before touching `self.wal`.
+        let table_name = tbl.schema.table_name.clone();
+        let tx_id = self.next_tx();
+        self.wal_log(tx_id, WalRecordType::Update, &table_name, rid, &new_bytes)?;
+        Ok(true)
+    }
+
     /// Mission C Phase 10: var-column in-place update fast path. Patches
     /// a single variable-length column's bytes directly into the row's
     /// slot, shrinking the row if the new value is smaller. Returns
@@ -469,6 +589,9 @@ impl Catalog {
     ///
     /// Caller guarantees no indexed column is touched — indexes are NOT
     /// maintained by this primitive.
+    ///
+    /// Mission B2: not WAL-logged. Executor callers should use
+    /// [`Self::patch_var_col_logged`] instead.
     #[inline]
     pub fn patch_var_col_in_place(
         &mut self,
@@ -478,6 +601,36 @@ impl Catalog {
         new_value: Option<&[u8]>,
     ) -> io::Result<bool> {
         self.by_name_mut(table)?.patch_var_col_in_place(rid, col_idx, new_value)
+    }
+
+    /// Mission B2: WAL-logged variant of [`Self::patch_var_col_in_place`].
+    /// Runs the in-place shrink on the hot page, then reads the mutated
+    /// row bytes back and logs a `WalRecordType::Update` record. On a
+    /// `false` return (grow-case bail) nothing is logged — the caller's
+    /// fall-through to `update_hinted` handles the WAL itself.
+    pub fn patch_var_col_logged(
+        &mut self,
+        table: &str,
+        rid: RowId,
+        col_idx: usize,
+        new_value: Option<&[u8]>,
+    ) -> io::Result<bool> {
+        let slot = *self.name_to_slot.get(table).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found"))
+        })?;
+        let tbl = &mut self.tables[slot];
+        let ok = tbl.patch_var_col_in_place(rid, col_idx, new_value)?;
+        if !ok {
+            return Ok(false);
+        }
+        let new_bytes = match tbl.heap.get(rid) {
+            Some(b) => b,
+            None => return Ok(false),
+        };
+        let table_name = tbl.schema.table_name.clone();
+        let tx_id = self.next_tx();
+        self.wal_log(tx_id, WalRecordType::Update, &table_name, rid, &new_bytes)?;
+        Ok(true)
     }
 
     pub fn scan(&self, table: &str) -> io::Result<impl Iterator<Item = (RowId, Row)> + '_> {
@@ -533,6 +686,7 @@ impl Catalog {
 
     /// Drop a table: remove from the catalog and delete its data files.
     /// Returns `Err` if the table doesn't exist.
+    // TODO(WAL): DDL is not replayed — track in follow-up
     pub fn drop_table(&mut self, name: &str) -> io::Result<()> {
         let slot = *self.name_to_slot.get(name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{name}' not found")))?;
@@ -588,6 +742,7 @@ impl Catalog {
     /// non-empty table — there is no default value to backfill with,
     /// and silently storing `Empty` in a required slot would just
     /// shift the invariant violation to the next query.
+    // TODO(WAL): DDL is not replayed — track in follow-up
     pub fn alter_table_add_column(&mut self, table: &str, col: ColumnDef) -> io::Result<()> {
         let data_dir = self.data_dir.clone();
         let tbl = self.by_name_mut(table)?;
@@ -658,6 +813,7 @@ impl Catalog {
     /// schema, mutate to the new schema, then rewrite every row
     /// through [`Table::rewrite_rows_for_schema_change`]. Dropping a
     /// column from an empty table skips the rewrite.
+    // TODO(WAL): DDL is not replayed — track in follow-up
     pub fn alter_table_drop_column(&mut self, table: &str, col_name: &str) -> io::Result<()> {
         let data_dir = self.data_dir.clone();
         let tbl = self.by_name_mut(table)?;

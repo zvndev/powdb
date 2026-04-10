@@ -14,7 +14,7 @@
 //! (empty) heap, restoring every row.
 
 use powdb_storage::catalog::Catalog;
-use powdb_storage::types::{ColumnDef, Schema, TypeId, Value};
+use powdb_storage::types::{ColumnDef, RowId, Schema, TypeId, Value};
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
@@ -211,6 +211,261 @@ fn test_crash_recovery_deletes_idempotent() {
         let cat = Catalog::open(&dir).unwrap();
         let rows: Vec<_> = cat.scan("users").unwrap().collect();
         assert_eq!(rows.len(), 15);
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ─── Mission B2: executor fast-path bypass recovery ────────────────────────
+//
+// These tests cover the WAL-logged wrappers (`update_row_bytes_logged`,
+// `patch_var_col_logged`, `scan_delete_matching_logged`) that the query
+// executor now routes its hot-path variants through. Before Mission B2,
+// all three bypassed the WAL entirely — a crash between the mutation and
+// the next checkpoint would silently lose the write on replay. Each test
+// simulates exactly that crash and asserts the mutation survives.
+
+fn user_schema_with_age() -> Schema {
+    Schema {
+        table_name: "users".into(),
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                type_id: TypeId::Int,
+                required: true,
+                position: 0,
+            },
+            ColumnDef {
+                name: "name".into(),
+                type_id: TypeId::Str,
+                required: true,
+                position: 1,
+            },
+            ColumnDef {
+                name: "age".into(),
+                type_id: TypeId::Int,
+                required: false,
+                position: 2,
+            },
+        ],
+    }
+}
+
+/// Fixed-width in-place patch via `update_row_bytes_logged`. Simulates the
+/// executor's `update_by_pk` fast path: insert cleanly, patch `age` through
+/// the byte-level closure, crash, reopen, verify the patch replayed.
+#[test]
+fn test_crash_recovery_update_by_pk_fast_path() {
+    let dir = temp_dir("update_pk_fast");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let target_rid: RowId;
+    // Session 1: insert cleanly, then the real work — one logged update
+    // via the fast-path wrapper, then crash without checkpoint.
+    {
+        let mut cat = Catalog::create(&dir).unwrap();
+        cat.create_table(user_schema_with_age()).unwrap();
+        let mut all = Vec::new();
+        for i in 0..10i64 {
+            let rid = cat
+                .insert(
+                    "users",
+                    &vec![
+                        Value::Int(i),
+                        Value::Str(format!("user_{i}")),
+                        Value::Int(20 + i),
+                    ],
+                )
+                .unwrap();
+            all.push(rid);
+        }
+        // Clean-checkpoint the inserts so the heap has all 10 rows on
+        // disk and the WAL is empty going into the fast-path update.
+        cat.checkpoint().unwrap();
+
+        // Row 5 is our target: patch age from 25 → 999 via the logged
+        // byte-mutation wrapper. This is the exact API the executor's
+        // `try_execute_update_pk_fast` now routes through.
+        target_rid = all[5];
+        let schema = cat.schema("users").unwrap().clone();
+        let layout = powdb_storage::row::RowLayout::new(&schema);
+        let bitmap_size = layout.bitmap_size();
+        // age is column index 2 — fixed Int, 8 bytes.
+        let age_off = 2 + bitmap_size + layout.fixed_offset(2).unwrap();
+        let age_bitmap_byte = 2 + (2 / 8);
+        let age_bit_mask = 1u8 << (2 % 8);
+        let new_age: i64 = 999;
+        let ok = cat
+            .update_row_bytes_logged("users", target_rid, |row| {
+                row[age_bitmap_byte] &= !age_bit_mask;
+                row[age_off..age_off + 8].copy_from_slice(&new_age.to_le_bytes());
+            })
+            .unwrap();
+        assert!(ok, "update_row_bytes_logged should find the row");
+
+        // Crash — skip every Drop, leaving the WAL with exactly one
+        // Update record and the heap on disk still showing age=25.
+        std::mem::forget(cat);
+    }
+
+    // Session 2: reopen, replay, confirm the update landed.
+    {
+        let cat = Catalog::open(&dir).unwrap();
+        let row = cat
+            .get("users", target_rid)
+            .expect("row 5 should exist after replay");
+        assert_eq!(row[0], Value::Int(5));
+        assert_eq!(
+            row[2],
+            Value::Int(999),
+            "update_row_bytes_logged should replay the age patch"
+        );
+        // And a crude sanity check: every other row kept its original age.
+        let mut saw_999 = 0;
+        for (_, r) in cat.scan("users").unwrap() {
+            if let Value::Int(999) = r[2] {
+                saw_999 += 1;
+            }
+        }
+        assert_eq!(saw_999, 1, "exactly one row should have age=999");
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Var-column shrink via `patch_var_col_logged`. Writes a longer name
+/// cleanly, then shrinks it through the logged wrapper, crash, reopen,
+/// verify the shorter name replayed.
+#[test]
+fn test_crash_recovery_var_col_update() {
+    let dir = temp_dir("var_col_update");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let target_rid: RowId;
+    {
+        let mut cat = Catalog::create(&dir).unwrap();
+        cat.create_table(user_schema_with_age()).unwrap();
+        let mut all = Vec::new();
+        for i in 0..10i64 {
+            let rid = cat
+                .insert(
+                    "users",
+                    &vec![
+                        Value::Int(i),
+                        // Pad the name so we have room to shrink.
+                        Value::Str(format!("original_user_name_{i}")),
+                        Value::Int(20 + i),
+                    ],
+                )
+                .unwrap();
+            all.push(rid);
+        }
+        cat.checkpoint().unwrap();
+
+        target_rid = all[3];
+        // Shrink the name column (index 1) from 21 chars to 1 char via
+        // the var-col fast path. Strictly smaller, so `patch_var_col_logged`
+        // stays on the in-place shrink path.
+        let ok = cat
+            .patch_var_col_logged("users", target_rid, 1, Some(b"x"))
+            .unwrap();
+        assert!(ok, "patch_var_col_logged should succeed on shrink");
+
+        std::mem::forget(cat);
+    }
+
+    {
+        let cat = Catalog::open(&dir).unwrap();
+        let row = cat
+            .get("users", target_rid)
+            .expect("row 3 should exist after replay");
+        assert_eq!(row[0], Value::Int(3));
+        assert_eq!(
+            row[1],
+            Value::Str("x".into()),
+            "patch_var_col_logged should replay the var-col shrink"
+        );
+        // Other rows should still have their original names.
+        let cnt_short = cat
+            .scan("users")
+            .unwrap()
+            .filter(|(_, r)| matches!(&r[1], Value::Str(s) if s == "x"))
+            .count();
+        assert_eq!(cnt_short, 1, "exactly one row should have the shrunk name");
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Single-pass filtered delete via `scan_delete_matching_logged`. Inserts
+/// cleanly, deletes every row where age > 50 through the logged variant,
+/// crash, reopen, verify only the matching rows are gone.
+#[test]
+fn test_crash_recovery_delete_by_filter() {
+    let dir = temp_dir("delete_filter");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    {
+        let mut cat = Catalog::create(&dir).unwrap();
+        cat.create_table(user_schema_with_age()).unwrap();
+        for i in 0..100i64 {
+            cat.insert(
+                "users",
+                &vec![
+                    Value::Int(i),
+                    Value::Str(format!("user_{i}")),
+                    Value::Int(i), // age = id for a clean age > 50 filter
+                ],
+            )
+            .unwrap();
+        }
+        cat.checkpoint().unwrap();
+
+        // Delete every row whose age > 50 via the raw-bytes predicate.
+        // This is the exact shape the executor's `Delete(Filter(SeqScan))`
+        // fast path now routes through.
+        let schema = cat.schema("users").unwrap().clone();
+        let layout = powdb_storage::row::RowLayout::new(&schema);
+        let count = cat
+            .scan_delete_matching_logged("users", |data| {
+                match powdb_storage::row::decode_column(&schema, &layout, data, 2) {
+                    Value::Int(v) => v > 50,
+                    _ => false,
+                }
+            })
+            .unwrap();
+        assert_eq!(count, 49, "ages 51..=99 inclusive is 49 rows");
+
+        std::mem::forget(cat);
+    }
+
+    {
+        let cat = Catalog::open(&dir).unwrap();
+        let rows: Vec<_> = cat.scan("users").unwrap().collect();
+        assert_eq!(
+            rows.len(),
+            51,
+            "expected 100 − 49 = 51 rows after replay of filtered delete"
+        );
+        // Every surviving row must have age <= 50.
+        for (_, r) in &rows {
+            if let Value::Int(v) = &r[2] {
+                assert!(*v <= 50, "surviving row has age {v} > 50");
+            } else {
+                panic!("expected Int age");
+            }
+        }
+        // And every id from 0..=50 must still be present.
+        let mut ids: Vec<i64> = rows
+            .iter()
+            .map(|(_, r)| match &r[0] {
+                Value::Int(i) => *i,
+                _ => panic!(),
+            })
+            .collect();
+        ids.sort();
+        let expected: Vec<i64> = (0..=50).collect();
+        assert_eq!(ids, expected);
     }
 
     std::fs::remove_dir_all(&dir).ok();
