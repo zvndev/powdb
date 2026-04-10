@@ -998,16 +998,24 @@ impl Drop for HeapFile {
 // while the map is active. The HeapFile is not Send/Sync anyway (it
 // contains DiskManager with File), so this is fine for single-threaded use.
 unsafe impl Send for HeapFile {}
-// SAFETY: Mission infra-1. `HeapFile` now lives behind an
-// `Arc<RwLock<Engine>>` that enforces the standard `&self`/`&mut self`
-// discipline: multiple readers share immutable access (scanning the
-// mmap, reading `pages_with_space`, etc.) and the writer has exclusive
-// access for any field mutation. The only `!Sync` field is `mmap_ptr`, a
-// raw `*const u8` pointing into a read-only mmap. Concurrent reads of a
-// shared immutable byte range through different `&self` borrows are
-// sound — the reads go through `std::slice::from_raw_parts` which
-// materialises a `&[u8]` and the aliasing rules are respected because
-// no `&mut` coexists with the readers (the RwLock guarantees it).
+// SAFETY: Blocker B1 fix. `HeapFile` lives behind `Arc<RwLock<Engine>>`,
+// so the standard `&self`/`&mut self` discipline applies: many readers
+// or one writer, never both. The interesting question is whether the
+// `&self` read path is itself thread-safe across multiple reader threads.
+//
+// The disk fallback (`DiskManager::read_page` / `write_page`) now uses
+// `FileExt::read_exact_at` / `write_all_at`, which map to pread(2) /
+// pwrite(2). POSIX guarantees these are atomic with respect to the kernel
+// file offset, so concurrent `&self` callers sharing a single `&File`
+// cannot race on a seek cursor the way a `seek + read_exact` pair would.
+// Byte-level corruption under concurrent reads — the old bug — is gone.
+//
+// The `mmap_ptr` field is a `*const u8` into a read-only mmap. Read-only
+// `&[u8]` views derived via `std::slice::from_raw_parts` are fine to
+// alias across threads: no `&mut` can coexist with the readers because
+// the RwLock write guard excludes them. Writers still take the write
+// guard for higher-level consistency (catalog/header mutation); this
+// SAFETY note is strictly about the read path not corrupting bytes.
 unsafe impl Sync for HeapFile {}
 
 #[cfg(test)]
