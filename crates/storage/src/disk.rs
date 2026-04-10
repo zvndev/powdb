@@ -1,7 +1,16 @@
 use crate::page::PAGE_SIZE;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io;
 use std::path::Path;
+
+// Unix-only: PowDB is Unix-first (see RUSTFLAGS story). `FileExt::read_exact_at`
+// and `write_all_at` map to pread(2)/pwrite(2), which are atomic with respect
+// to the kernel file offset per POSIX and are therefore safe to call
+// concurrently on a shared `&File` from multiple threads.
+// TODO(windows): Implement equivalent using `std::os::windows::fs::FileExt`
+// (`seek_read`/`seek_write`) if we ever support Windows.
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 
 /// Manages page-level I/O to a single data file.
 /// Each page is PAGE_SIZE bytes at offset = page_id * PAGE_SIZE.
@@ -32,8 +41,7 @@ impl DiskManager {
         let id = self.num_pages;
         let zeros = [0u8; PAGE_SIZE];
         let offset = id as u64 * PAGE_SIZE as u64;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(&zeros)?;
+        self.file.write_all_at(&zeros, offset)?;
         self.num_pages += 1;
         Ok(id)
     }
@@ -41,18 +49,20 @@ impl DiskManager {
     pub fn write_page(&mut self, page_id: u32, data: &[u8]) -> io::Result<()> {
         debug_assert_eq!(data.len(), PAGE_SIZE);
         let offset = page_id as u64 * PAGE_SIZE as u64;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(data)?;
+        // pwrite(2): atomic w.r.t. the kernel file offset, so this is safe
+        // on a shared `&File` across threads.
+        self.file.write_all_at(data, offset)?;
         Ok(())
     }
 
     pub fn read_page(&self, page_id: u32) -> io::Result<[u8; PAGE_SIZE]> {
         let mut buf = [0u8; PAGE_SIZE];
         let offset = page_id as u64 * PAGE_SIZE as u64;
-        // Use a borrowed reference to avoid needing &mut self
-        let mut file_ref = &self.file;
-        file_ref.seek(SeekFrom::Start(offset))?;
-        file_ref.read_exact(&mut buf)?;
+        // pread(2): atomic w.r.t. the kernel file offset per POSIX. Multiple
+        // reader threads can call this concurrently through a shared `&self`
+        // (and thus a shared `&File`) without interfering with each other.
+        // This is the correctness foundation for `unsafe impl Sync for HeapFile`.
+        self.file.read_exact_at(&mut buf, offset)?;
         Ok(buf)
     }
 

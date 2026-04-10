@@ -12,9 +12,19 @@
 //! generous enough to not flake on a loaded CI box but strict enough to
 //! reject the old `Mutex<Engine>` behaviour — which would show a
 //! threaded-to-sequential ratio of ~1.0, not ~0.25).
+//!
+//! Blocker B1 — concurrent read *correctness* test (not just liveness).
+//! `concurrent_readers_correctness` scans a table big enough to overflow
+//! the single-slot hot-page cache, so every scan hammers
+//! `DiskManager::read_page` on a shared `&File`. Each row carries a
+//! known `id` the test can verify, so any byte-level corruption from the
+//! old `seek + read_exact` race shows up as wrong ids / wrong row counts
+//! rather than a silent timing anomaly.
 
+use powdb_query::ast::Literal;
 use powdb_query::executor::Engine;
 use powdb_query::result::QueryResult;
+use powdb_storage::types::Value;
 use std::sync::{Arc, Barrier, RwLock};
 use std::thread;
 use std::time::Instant;
@@ -132,6 +142,205 @@ fn concurrent_readers_make_progress_in_parallel() {
          (sequential={seq_elapsed:?}, concurrent={conc_elapsed:?}). \
          A ratio near 1.0 suggests reads are serialising on a mutex again.",
     );
+}
+
+/// Blocker B1 regression test — byte-level correctness of the concurrent
+/// `heap.get(rid)` path (point lookups by indexed key).
+///
+/// Before the pread/pwrite fix, `DiskManager::read_page` did
+/// `file.seek(offset); file.read_exact(buf)` on a shared `&File`, which
+/// races on the kernel file offset under multiple reader threads. The
+/// failure mode: thread A seeks to page X, thread B seeks to page Y,
+/// and whichever `read_exact` wins returns bytes from the *wrong* page.
+///
+/// The filtered SeqScan fast path uses `libc::mmap` and is unaffected,
+/// so to actually exercise `disk.read_page` across threads we drive the
+/// **IndexScan** path: `filter .id = <literal>` with a B-tree index on
+/// `id` plans as `IndexScan`, which calls `btree.lookup_int` →
+/// `heap.get(rid)` → `disk.read_page` with *no* mmap fallback. Each
+/// thread hammers random ids from a 100K-row table, well past the
+/// single-slot hot-page cache, so nearly every lookup hits `read_page`.
+/// Each row carries a known `payload` derived from its `id`, so any
+/// byte-level cross-feed between threads shows up as a payload that
+/// doesn't match its id. On the unpatched code this test fails loudly;
+/// on the fixed code every lookup must return the expected payload.
+#[test]
+fn concurrent_readers_see_uncorrupted_rows() {
+    // Inline fresh-engine setup so we can hang on to the data_dir path —
+    // we need it to pass through to `Table::create_index`.
+    let data_dir = {
+        let test_id = std::process::id();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir()
+            .join(format!("powdb_conc_read_corr_{test_id}_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    };
+    let engine = Arc::new(RwLock::new(Engine::new(&data_dir).unwrap()));
+
+    // `HeapFile`'s write-back cache is a single slot (`hot_page`). At
+    // PAGE_SIZE = 4 KiB and ~30 bytes per row, 100K rows fills ~1000
+    // data pages, so the overwhelming majority of lookups miss the hot
+    // page and fall through to `DiskManager::read_page` — the exact
+    // code path we're trying to stress. (Per the fix spec: "at least
+    // 100K rows".)
+    const N: usize = 100_000;
+
+    {
+        let mut eng = engine.write().unwrap();
+        eng.execute_powql(
+            "type Row { required id: int, required payload: str }",
+        )
+        .unwrap();
+        // Seed via the prepared-insert fast path — parse + plan once,
+        // bind new literals per row. Without this, seeding N=100K rows
+        // through `execute_powql` format!() strings takes ~10 minutes
+        // because each call re-parses/re-plans/re-resolves the catalog.
+        let prep = eng
+            .prepare(r#"insert Row { id := 0, payload := "x" }"#)
+            .unwrap();
+        for i in 0..N {
+            let literals = [
+                Literal::Int(i as i64),
+                Literal::String(format!("p_{i}")),
+            ];
+            eng.execute_prepared(&prep, &literals).unwrap();
+        }
+
+        // Build a B-tree index on `id` so that `filter .id = <k>` plans
+        // to IndexScan and the executor takes `btree.lookup_int` →
+        // `heap.get(rid)` → `disk.read_page`. This is the path the old
+        // `seek + read_exact` race corrupts under concurrent readers.
+        let tbl = eng
+            .catalog_mut()
+            .get_table_mut("Row")
+            .expect("Row table exists");
+        tbl.create_index("id", &data_dir)
+            .expect("build id index");
+
+        // Force every dirty page out of `HeapFile`'s write-back buffer
+        // and onto disk. Without this, `heap.get` short-circuits every
+        // lookup through `dirty_buffer` (an in-memory HashMap) and
+        // never touches `disk.read_page` — which would make this test a
+        // no-op regression check. After `flush_all_dirty`, subsequent
+        // `heap.get` calls for anything other than the current
+        // `hot_page` fall straight through to `disk.read_page`.
+        tbl.heap.flush_all_dirty().expect("flush dirty pages");
+    }
+
+    // Sanity: the indexed point lookup returns the expected row.
+    {
+        let eng = engine.read().unwrap();
+        let res = eng
+            .execute_powql_readonly("Row filter .id = 42 { .id, .payload }")
+            .unwrap();
+        match res {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1, "expected one row for .id = 42");
+                let id = match &rows[0][0] {
+                    Value::Int(n) => *n,
+                    other => panic!("expected Int id, got {other:?}"),
+                };
+                let payload = match &rows[0][1] {
+                    Value::Str(s) => s.as_str(),
+                    other => panic!("expected Str payload, got {other:?}"),
+                };
+                assert_eq!(id, 42);
+                assert_eq!(payload, "p_42");
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    // Concurrent lookups: several threads each do LOOKUPS_PER_THREAD
+    // indexed point lookups for varying ids. Each lookup drives
+    // `btree.lookup_int` → `heap.get(rid)` → `disk.read_page` with no
+    // mmap fallback (the test never calls `enable_mmap`). With a
+    // shared `&File` and the old seek+read race, threads would
+    // cross-feed bytes and the payload returned for id K would not
+    // equal "p_K".
+    //
+    // We skip `execute_powql_readonly` here and call straight into
+    // `Table::index_lookup` — the parse/plan/plan-cache overhead of
+    // the query path dwarfs the actual I/O window we're trying to
+    // race, and minimising that overhead makes the race much more
+    // likely to surface under concurrent load.
+    //
+    // Coprime strides per thread make every thread walk every id in a
+    // different order — different seek patterns per thread are what
+    // makes the old race observable.
+    const LOOKUPS_PER_THREAD: usize = 10_000;
+    let n_threads = 16;
+    let barrier = Arc::new(Barrier::new(n_threads));
+    let handles: Vec<_> = (0..n_threads)
+        .map(|thread_idx| {
+            let eng = engine.clone();
+            let bar = barrier.clone();
+            thread::spawn(move || {
+                let stride: usize = 7 * (thread_idx + 1) + 1;
+                let mut k = thread_idx * 13;
+                bar.wait();
+                // Take the read guard once and hammer `index_lookup`
+                // directly. This keeps the hot loop tight: every
+                // iteration is just btree lookup + heap.get, no
+                // parser/planner frames in between.
+                let guard = eng.read().unwrap();
+                let tbl = guard
+                    .catalog()
+                    .get_table("Row")
+                    .expect("Row table");
+                for _ in 0..LOOKUPS_PER_THREAD {
+                    k = (k + stride) % N;
+                    let key = Value::Int(k as i64);
+                    let (_rid, row) = tbl
+                        .index_lookup("id", &key)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "index_lookup for id {k} returned None \
+                                 — btree/heap disagreement, likely a \
+                                 torn read from a racing seek+read"
+                            )
+                        });
+                    assert_eq!(
+                        row.len(),
+                        2,
+                        "expected 2 columns per row"
+                    );
+                    let got_id = match &row[0] {
+                        Value::Int(n) => *n,
+                        other => panic!("expected Int id, got {other:?}"),
+                    };
+                    let got_payload = match &row[1] {
+                        Value::Str(s) => s.as_str(),
+                        other => panic!(
+                            "expected Str payload, got {other:?}"
+                        ),
+                    };
+                    assert_eq!(
+                        got_id, k as i64,
+                        "lookup for id {k} returned id {got_id} \
+                         — byte corruption from a racing seek+read \
+                         on the shared &File"
+                    );
+                    let expected = format!("p_{k}");
+                    assert_eq!(
+                        got_payload, expected,
+                        "lookup for id {k} returned payload \
+                         {got_payload:?}, expected {expected:?} \
+                         — byte corruption from a racing seek+read \
+                         on the shared &File"
+                    );
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
 }
 
 #[test]
