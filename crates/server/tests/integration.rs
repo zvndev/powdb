@@ -57,7 +57,7 @@ async fn test_full_lifecycle() {
     // Start server in background
     let handle = tokio::spawn(async move {
         let engine = powdb_query::executor::Engine::new(std::path::Path::new(&data_dir_str)).unwrap();
-        let engine = std::sync::Arc::new(std::sync::Mutex::new(engine));
+        let engine = std::sync::Arc::new(std::sync::RwLock::new(engine));
         let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
 
         loop {

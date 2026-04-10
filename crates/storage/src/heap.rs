@@ -979,6 +979,17 @@ impl Drop for HeapFile {
 // while the map is active. The HeapFile is not Send/Sync anyway (it
 // contains DiskManager with File), so this is fine for single-threaded use.
 unsafe impl Send for HeapFile {}
+// SAFETY: Mission infra-1. `HeapFile` now lives behind an
+// `Arc<RwLock<Engine>>` that enforces the standard `&self`/`&mut self`
+// discipline: multiple readers share immutable access (scanning the
+// mmap, reading `pages_with_space`, etc.) and the writer has exclusive
+// access for any field mutation. The only `!Sync` field is `mmap_ptr`, a
+// raw `*const u8` pointing into a read-only mmap. Concurrent reads of a
+// shared immutable byte range through different `&self` borrows are
+// sound — the reads go through `std::slice::from_raw_parts` which
+// materialises a `&[u8]` and the aliasing rules are respected because
+// no `&mut` coexists with the readers (the RwLock guarantees it).
+unsafe impl Sync for HeapFile {}
 
 #[cfg(test)]
 mod tests {

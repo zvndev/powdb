@@ -1,6 +1,6 @@
 use powdb_query::executor::Engine;
 use powdb_server::handler;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tracing::{info, error};
 use tracing_subscriber::EnvFilter;
@@ -80,7 +80,10 @@ async fn main() {
 
     let engine = Engine::new(std::path::Path::new(&args.data_dir))
         .expect("failed to initialize storage engine");
-    let engine = Arc::new(Mutex::new(engine));
+    // Mission infra-1: `RwLock` lets concurrent read queries proceed in
+    // parallel. The handler classifies each query up front and takes
+    // `.read()` for SELECTs and `.write()` for mutations.
+    let engine = Arc::new(RwLock::new(engine));
 
     let addr = format!("0.0.0.0:{}", args.port);
     let listener = TcpListener::bind(&addr).await

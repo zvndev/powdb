@@ -12,20 +12,59 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::io;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Instant;
 use tracing::{info, error, Level};
+
+/// Sentinel error returned by `Engine::execute_powql_readonly` when the
+/// query touches a materialized view whose backing table is dirty. The
+/// read path holds only `&self`, so it can't refresh the view — the caller
+/// is expected to recognise this prefix and retry with the write lock.
+///
+/// Mission infra-1: this is the escalation hook between the RwLock reader
+/// fast path and the generic write path. Handlers match on it verbatim.
+pub const READONLY_NEEDS_WRITE: &str = "__POWDB_READONLY_NEEDS_WRITE__";
 
 /// Plan cache capacity. Bench workloads fill ~15 slots; real apps will sit
 /// comfortably in 256. Lookup is O(1), collisions clear the cache (see
 /// `plan_cache::PlanCache::insert`).
 const PLAN_CACHE_CAPACITY: usize = 256;
 
+/// Mission infra-1: classify a parsed statement as read-only vs. mutating.
+/// Used by [`Engine::execute_powql_readonly`] and by the server handler
+/// to decide between the RwLock reader and writer sides. `Union` recurses
+/// because each side can independently be read/write (though in practice
+/// both sides are reads — the parser only builds Union from query shapes).
+pub fn is_read_only_statement(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::Query(_) => true,
+        Statement::Union(u) => {
+            is_read_only_statement(&u.left) && is_read_only_statement(&u.right)
+        }
+        Statement::Insert(_)
+        | Statement::UpdateQuery(_)
+        | Statement::DeleteQuery(_)
+        | Statement::CreateType(_)
+        | Statement::AlterTable(_)
+        | Statement::DropTable(_)
+        | Statement::CreateView(_)
+        | Statement::RefreshView(_)
+        | Statement::DropView(_) => false,
+    }
+}
+
 pub struct Engine {
     catalog: Catalog,
     /// Mission D9 — cached parsed+planned query trees keyed by canonical
     /// hash. Saves the ~3μs parse+plan cost on repeat queries that differ
     /// only in literal values.
-    plan_cache: PlanCache,
+    ///
+    /// Mission infra-1: wrapped in `Mutex` so the read path can be driven
+    /// by `&self`. The critical section is extremely short — a single
+    /// hashmap lookup + plan clone on a hit, or a single insert on a miss.
+    /// A full `RwLock` would be over-engineered here; the contention window
+    /// is smaller than the read-path scan work it gates.
+    plan_cache: Mutex<PlanCache>,
     /// Mission C Phase 13: reusable `Vec<Value>` scratch buffer for the
     /// prepared-insert fast path. `execute_prepared` used to allocate a
     /// fresh `vec![Value::Empty; n_cols]` on every insert; recycling this
@@ -159,7 +198,7 @@ impl Engine {
             .unwrap_or_else(|_| ViewRegistry::new(data_dir));
         Ok(Engine {
             catalog,
-            plan_cache: PlanCache::new(PLAN_CACHE_CAPACITY),
+            plan_cache: Mutex::new(PlanCache::new(PLAN_CACHE_CAPACITY)),
             insert_values_scratch: Vec::new(),
             view_registry,
         })
@@ -188,13 +227,15 @@ impl Engine {
             // D9: try the plan cache first. Canonicalisation lexes the
             // query once; on a hit we skip the parser and planner entirely.
             if let Ok((hash, literals)) = canonicalize(input) {
-                if let Some(plan) = self.plan_cache.get_with_substitution(hash, &literals) {
+                let cached = self.plan_cache.lock().unwrap()
+                    .get_with_substitution(hash, &literals);
+                if let Some(plan) = cached {
                     return self.execute_plan(&plan);
                 }
                 // Miss — plan, insert, execute.
                 return match planner::plan(input) {
                     Ok(plan) => {
-                        self.plan_cache.insert(hash, plan.clone());
+                        self.plan_cache.lock().unwrap().insert(hash, plan.clone());
                         self.execute_plan(&plan)
                     }
                     Err(e) => Err(e.message),
@@ -248,7 +289,786 @@ impl Engine {
 
     /// Plan cache stats — useful for benches and debugging.
     pub fn plan_cache_stats(&self) -> (u64, u64, usize) {
-        (self.plan_cache.hits, self.plan_cache.misses, self.plan_cache.len())
+        let cache = self.plan_cache.lock().unwrap();
+        (cache.hits, cache.misses, cache.len())
+    }
+
+    /// Mission infra-1: read-only entry point.
+    ///
+    /// Parses + plans + executes a PowQL query using only a shared borrow
+    /// on the engine. Rejects any statement that would mutate state
+    /// (Insert/Update/Delete/CreateTable/AlterTable/DropTable/CreateView/
+    /// RefreshView/DropView) by returning [`READONLY_NEEDS_WRITE`] so the
+    /// caller can escalate to the write lock.
+    ///
+    /// Also returns [`READONLY_NEEDS_WRITE`] if a materialized view in the
+    /// query is dirty — refreshing one requires `&mut self`, so the caller
+    /// must retake the write lock for the first refresh.
+    ///
+    /// This method is the concurrent-read fast path behind
+    /// `Arc<RwLock<Engine>>`: multiple threads can call it simultaneously
+    /// under a shared `.read()` lock and each will scan independently.
+    pub fn execute_powql_readonly(&self, input: &str) -> Result<QueryResult, String> {
+        // Parse the statement first so we can classify read vs. write
+        // without touching the catalog. This is the same lex+parse cost
+        // the hot path would pay anyway.
+        let stmt = crate::parser::parse(input).map_err(|e| e.message)?;
+        if !is_read_only_statement(&stmt) {
+            return Err(READONLY_NEEDS_WRITE.to_string());
+        }
+
+        // Try the plan cache first — identical hash scheme to
+        // `execute_powql` so both paths share cache state. The mutex
+        // section is just a hashmap lookup + plan clone.
+        if let Ok((hash, literals)) = canonicalize(input) {
+            let cached = self.plan_cache.lock().unwrap()
+                .get_with_substitution(hash, &literals);
+            if let Some(plan) = cached {
+                return self.execute_plan_readonly(&plan);
+            }
+            // Miss: plan + insert + execute. The planner is pure, so this
+            // is safe from `&self`.
+            let plan = crate::planner::plan_statement(stmt).map_err(|e| e.message)?;
+            self.plan_cache.lock().unwrap().insert(hash, plan.clone());
+            return self.execute_plan_readonly(&plan);
+        }
+        // Lex error — fall through to the planner for a consistent error
+        // shape (though `parse` above would usually have caught it).
+        let plan = crate::planner::plan_statement(stmt).map_err(|e| e.message)?;
+        self.execute_plan_readonly(&plan)
+    }
+
+    /// Read-only version of [`Engine::execute_plan`]. Dispatches the
+    /// read-path plan variants by calling `&self` helpers and errors with
+    /// [`READONLY_NEEDS_WRITE`] on any write variant. This is the
+    /// recursion target for composite read plans under the RwLock reader.
+    ///
+    /// The dispatch mirrors `execute_plan` for the read branches but does
+    /// not carry any of the fast-paths that need `&mut self` (e.g. plan-
+    /// cache mutation on inner subqueries is handled via the shared mutex
+    /// in [`Engine::execute_powql_readonly`]; in-flight subquery
+    /// materialisation uses [`Engine::materialize_subqueries_readonly`]).
+    fn execute_plan_readonly(&self, plan: &PlanNode) -> Result<QueryResult, String> {
+        match plan {
+            PlanNode::SeqScan { table } => {
+                // Dirty view means we'd need to refresh it — can't do that
+                // under `&self`. Escalate to the write path.
+                if self.view_registry.is_dirty(table) {
+                    return Err(READONLY_NEEDS_WRITE.to_string());
+                }
+                let schema = self.catalog.schema(table)
+                    .ok_or_else(|| format!("table '{table}' not found"))?
+                    .clone();
+                let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+                let rows: Vec<Vec<Value>> = self.catalog.scan(table)
+                    .map_err(|e| e.to_string())?
+                    .map(|(_, row)| row)
+                    .collect();
+                Ok(QueryResult::Rows { columns, rows })
+            }
+
+            PlanNode::AliasScan { table, alias } => {
+                let schema = self.catalog.schema(table)
+                    .ok_or_else(|| format!("table '{table}' not found"))?
+                    .clone();
+                let columns: Vec<String> = schema.columns.iter()
+                    .map(|c| format!("{alias}.{}", c.name))
+                    .collect();
+                let rows: Vec<Vec<Value>> = self.catalog.scan(table)
+                    .map_err(|e| e.to_string())?
+                    .map(|(_, row)| row)
+                    .collect();
+                Ok(QueryResult::Rows { columns, rows })
+            }
+
+            PlanNode::IndexScan { table, column, key } => {
+                let schema = self.catalog.schema(table)
+                    .ok_or_else(|| format!("table '{table}' not found"))?
+                    .clone();
+                let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+                let key_value = literal_to_value(key)?;
+                let tbl = self.catalog.get_table(table)
+                    .ok_or_else(|| format!("table '{table}' not found"))?;
+
+                if let Some(btree) = tbl.index(column) {
+                    let hit = match &key_value {
+                        Value::Int(k) => btree.lookup_int(*k),
+                        other => btree.lookup(other),
+                    };
+                    let rows = match hit {
+                        Some(rid) => match tbl.heap.get(rid) {
+                            Some(data) => vec![decode_row(&tbl.schema, &data)],
+                            None => Vec::new(),
+                        },
+                        None => Vec::new(),
+                    };
+                    return Ok(QueryResult::Rows { columns, rows });
+                }
+
+                // No index: synthetic eq predicate + compiled scan.
+                let fast = FastLayout::new(&schema);
+                let synth_pred = Expr::BinaryOp(
+                    Box::new(Expr::Field(column.clone())),
+                    BinOp::Eq,
+                    Box::new(key.clone()),
+                );
+                if let Some(compiled) = compile_predicate(&synth_pred, &columns, &fast, &schema) {
+                    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
+                    self.catalog.for_each_row_raw(table, |_rid, data| {
+                        if compiled(data) {
+                            rows.push(decode_row(&schema, data));
+                        }
+                    }).map_err(|e| e.to_string())?;
+                    return Ok(QueryResult::Rows { columns, rows });
+                }
+
+                // Last resort: slow eq-check.
+                let col_idx = schema.column_index(column)
+                    .ok_or_else(|| format!("column '{column}' not found"))?;
+                let rows: Vec<Vec<Value>> = tbl.scan()
+                    .filter_map(|(_, row)| {
+                        if row[col_idx] == key_value { Some(row) } else { None }
+                    })
+                    .collect();
+                Ok(QueryResult::Rows { columns, rows })
+            }
+
+            PlanNode::Filter { input, predicate } => {
+                // Materialise subqueries using the `&self` variant.
+                let materialized;
+                let predicate = if contains_subquery(predicate) {
+                    materialized = self.materialize_subqueries_readonly(predicate)?;
+                    &materialized
+                } else {
+                    predicate
+                };
+
+                // Fused Filter+SeqScan fast path.
+                if let PlanNode::SeqScan { table } = input.as_ref() {
+                    if self.view_registry.is_dirty(table) {
+                        return Err(READONLY_NEEDS_WRITE.to_string());
+                    }
+                    let schema = self.catalog.schema(table)
+                        .ok_or_else(|| format!("table '{table}' not found"))?
+                        .clone();
+                    let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+                    let fast = FastLayout::new(&schema);
+                    let row_layout = RowLayout::new(&schema);
+                    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
+
+                    if let Some(compiled) = compile_predicate(predicate, &columns, &fast, &schema) {
+                        self.catalog.for_each_row_raw(table, |_rid, data| {
+                            if compiled(data) {
+                                rows.push(decode_row(&schema, data));
+                            }
+                        }).map_err(|e| e.to_string())?;
+                    } else {
+                        let pred_cols = predicate_column_indices(predicate, &columns);
+                        self.catalog.for_each_row_raw(table, |_rid, data| {
+                            let pred_row = decode_selective(&schema, &row_layout, data, &pred_cols);
+                            if eval_predicate(predicate, &pred_row, &columns) {
+                                rows.push(decode_row(&schema, data));
+                            }
+                        }).map_err(|e| e.to_string())?;
+                    }
+
+                    return Ok(QueryResult::Rows { columns, rows });
+                }
+
+                // General path.
+                let result = self.execute_plan_readonly(input)?;
+                match result {
+                    QueryResult::Rows { columns, rows } => {
+                        let filtered: Vec<Vec<Value>> = rows.into_iter()
+                            .filter(|row| eval_predicate(predicate, row, &columns))
+                            .collect();
+                        Ok(QueryResult::Rows { columns, rows: filtered })
+                    }
+                    _ => Err("filter requires row input".into()),
+                }
+            }
+
+            PlanNode::Project { input, fields } => {
+                // Fast path: Project over IndexScan.
+                if let PlanNode::IndexScan { table, column, key } = input.as_ref() {
+                    let schema = self.catalog.schema(table)
+                        .ok_or_else(|| format!("table '{table}' not found"))?
+                        .clone();
+                    let all_columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+                    let key_value = literal_to_value(key)?;
+                    let tbl = self.catalog.get_table(table)
+                        .ok_or_else(|| format!("table '{table}' not found"))?;
+
+                    let proj_columns: Vec<String> = fields.iter().map(|f| {
+                        f.alias.clone().unwrap_or_else(|| match &f.expr {
+                            Expr::Field(name) => name.clone(),
+                            _ => "?".into(),
+                        })
+                    }).collect();
+
+                    let proj_indices: Vec<usize> = fields.iter().filter_map(|f| {
+                        if let Expr::Field(name) = &f.expr {
+                            all_columns.iter().position(|c| c == name)
+                        } else {
+                            None
+                        }
+                    }).collect();
+
+                    if let Some(btree) = tbl.index(column) {
+                        let layout = RowLayout::new(&schema);
+                        let lookup_result = match &key_value {
+                            Value::Int(k) => btree.lookup_int(*k),
+                            other => btree.lookup(other),
+                        };
+                        let rows = match lookup_result {
+                            Some(rid) => match tbl.heap.get(rid) {
+                                Some(data) => {
+                                    let row: Vec<Value> = proj_indices.iter()
+                                        .map(|&ci| decode_column(&schema, &layout, &data, ci))
+                                        .collect();
+                                    vec![row]
+                                }
+                                None => Vec::new(),
+                            },
+                            None => Vec::new(),
+                        };
+                        return Ok(QueryResult::Rows { columns: proj_columns, rows });
+                    }
+                }
+
+                // Fast paths over Limit(Sort(...)) / Limit(Filter(...)) / Limit(SeqScan).
+                if let PlanNode::Limit { input: inner, count: limit_expr } = input.as_ref() {
+                    if let PlanNode::Sort { input: sort_input, keys } = inner.as_ref() {
+                        if keys.len() == 1 {
+                            let sort_field = &keys[0].field;
+                            let descending = keys[0].descending;
+                            let limit = match limit_expr {
+                                Expr::Literal(Literal::Int(v)) if *v >= 0 => *v as usize,
+                                _ => usize::MAX,
+                            };
+                            let (table_opt, pred_opt): (Option<&str>, Option<&Expr>) = match sort_input.as_ref() {
+                                PlanNode::SeqScan { table } => (Some(table.as_str()), None),
+                                PlanNode::Filter { input: fi, predicate } => {
+                                    if let PlanNode::SeqScan { table } = fi.as_ref() {
+                                        (Some(table.as_str()), Some(predicate))
+                                    } else {
+                                        (None, None)
+                                    }
+                                }
+                                _ => (None, None),
+                            };
+                            if let Some(table) = table_opt {
+                                if let Some(result) = self.project_filter_sort_limit_fast(
+                                    table, fields, sort_field, descending, limit, pred_opt,
+                                )? {
+                                    return Ok(result);
+                                }
+                            }
+                        }
+                    }
+                    if let PlanNode::Filter { input: fi, predicate } = inner.as_ref() {
+                        if let PlanNode::SeqScan { table } = fi.as_ref() {
+                            let limit = match limit_expr {
+                                Expr::Literal(Literal::Int(v)) if *v >= 0 => *v as usize,
+                                _ => usize::MAX,
+                            };
+                            if let Some(result) = self.project_filter_limit_fast(
+                                table, fields, limit, Some(predicate),
+                            )? {
+                                return Ok(result);
+                            }
+                        }
+                    }
+                    if let PlanNode::SeqScan { table } = inner.as_ref() {
+                        let limit = match limit_expr {
+                            Expr::Literal(Literal::Int(v)) if *v >= 0 => *v as usize,
+                            _ => usize::MAX,
+                        };
+                        if let Some(result) = self.project_filter_limit_fast(
+                            table, fields, limit, None,
+                        )? {
+                            return Ok(result);
+                        }
+                    }
+                }
+
+                // Project(Filter(SeqScan)) without Limit.
+                if let PlanNode::Filter { input: fi, predicate } = input.as_ref() {
+                    if let PlanNode::SeqScan { table } = fi.as_ref() {
+                        if let Some(result) = self.project_filter_limit_fast(
+                            table, fields, usize::MAX, Some(predicate),
+                        )? {
+                            return Ok(result);
+                        }
+                    }
+                }
+
+                // Project(SeqScan) without Filter or Limit.
+                if let PlanNode::SeqScan { table } = input.as_ref() {
+                    if let Some(result) = self.project_filter_limit_fast(
+                        table, fields, usize::MAX, None,
+                    )? {
+                        return Ok(result);
+                    }
+                }
+
+                // Generic path.
+                let result = self.execute_plan_readonly(input)?;
+                match result {
+                    QueryResult::Rows { columns, rows } => {
+                        let proj_columns: Vec<String> = fields.iter().map(|f| {
+                            f.alias.clone().unwrap_or_else(|| match &f.expr {
+                                Expr::Field(name) => name.clone(),
+                                Expr::QualifiedField { qualifier, field } => {
+                                    format!("{qualifier}.{field}")
+                                }
+                                _ => "?".into(),
+                            })
+                        }).collect();
+                        let proj_rows: Vec<Vec<Value>> = rows.iter().map(|row| {
+                            fields.iter().map(|f| eval_expr(&f.expr, row, &columns)).collect()
+                        }).collect();
+                        Ok(QueryResult::Rows { columns: proj_columns, rows: proj_rows })
+                    }
+                    _ => Err("project requires row input".into()),
+                }
+            }
+
+            PlanNode::Sort { input, keys } => {
+                let result = self.execute_plan_readonly(input)?;
+                match result {
+                    QueryResult::Rows { columns, mut rows } => {
+                        let key_indices: Vec<(usize, bool)> = keys.iter().map(|k| {
+                            let idx = columns.iter().position(|c| c == &k.field)
+                                .expect(&format!("column '{}' not found", k.field));
+                            (idx, k.descending)
+                        }).collect();
+                        rows.sort_by(|a, b| {
+                            for &(col_idx, descending) in &key_indices {
+                                let cmp = a[col_idx].cmp(&b[col_idx]);
+                                let cmp = if descending { cmp.reverse() } else { cmp };
+                                if cmp != std::cmp::Ordering::Equal {
+                                    return cmp;
+                                }
+                            }
+                            std::cmp::Ordering::Equal
+                        });
+                        Ok(QueryResult::Rows { columns, rows })
+                    }
+                    _ => Err("sort requires row input".into()),
+                }
+            }
+
+            PlanNode::Limit { input, count } => {
+                let result = self.execute_plan_readonly(input)?;
+                let n = match count {
+                    Expr::Literal(Literal::Int(v)) => *v as usize,
+                    _ => return Err("limit must be integer literal".into()),
+                };
+                match result {
+                    QueryResult::Rows { columns, rows } => {
+                        Ok(QueryResult::Rows { columns, rows: rows.into_iter().take(n).collect() })
+                    }
+                    _ => Err("limit requires row input".into()),
+                }
+            }
+
+            PlanNode::Offset { input, count } => {
+                let result = self.execute_plan_readonly(input)?;
+                let n = match count {
+                    Expr::Literal(Literal::Int(v)) => *v as usize,
+                    _ => return Err("offset must be integer literal".into()),
+                };
+                match result {
+                    QueryResult::Rows { columns, rows } => {
+                        Ok(QueryResult::Rows { columns, rows: rows.into_iter().skip(n).collect() })
+                    }
+                    _ => Err("offset requires row input".into()),
+                }
+            }
+
+            PlanNode::Aggregate { input, function, field } => {
+                // Fast path: count() over SeqScan.
+                if *function == AggFunc::Count {
+                    if let PlanNode::SeqScan { table } = input.as_ref() {
+                        let mut count: i64 = 0;
+                        self.catalog.for_each_row_raw(table, |_rid, _data| {
+                            count += 1;
+                        }).map_err(|e| e.to_string())?;
+                        return Ok(QueryResult::Scalar(Value::Int(count)));
+                    }
+                    if let PlanNode::Filter { input: inner, predicate } = input.as_ref() {
+                        if let PlanNode::SeqScan { table } = inner.as_ref() {
+                            let schema = self.catalog.schema(table)
+                                .ok_or_else(|| format!("table '{table}' not found"))?
+                                .clone();
+                            let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+                            let fast = FastLayout::new(&schema);
+                            let row_layout = RowLayout::new(&schema);
+
+                            if let Some(compiled) = compile_predicate(predicate, &columns, &fast, &schema) {
+                                let mut count: i64 = 0;
+                                self.catalog.for_each_row_raw(table, |_rid, data| {
+                                    if compiled(data) {
+                                        count += 1;
+                                    }
+                                }).map_err(|e| e.to_string())?;
+                                return Ok(QueryResult::Scalar(Value::Int(count)));
+                            }
+
+                            let pred_cols = predicate_column_indices(predicate, &columns);
+                            let mut count: i64 = 0;
+                            self.catalog.for_each_row_raw(table, |_rid, data| {
+                                let pred_row = decode_selective(&schema, &row_layout, data, &pred_cols);
+                                if eval_predicate(predicate, &pred_row, &columns) {
+                                    count += 1;
+                                }
+                            }).map_err(|e| e.to_string())?;
+                            return Ok(QueryResult::Scalar(Value::Int(count)));
+                        }
+                    }
+                }
+
+                // Fast path: sum/avg/min/max over single fixed-size numeric.
+                if matches!(function, AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max | AggFunc::CountDistinct) {
+                    if let Some(col) = field.as_ref() {
+                        let (table_opt, pred_opt): (Option<&str>, Option<&Expr>) = match input.as_ref() {
+                            PlanNode::SeqScan { table } => (Some(table.as_str()), None),
+                            PlanNode::Filter { input: inner, predicate } => {
+                                if let PlanNode::SeqScan { table } = inner.as_ref() {
+                                    (Some(table.as_str()), Some(predicate))
+                                } else {
+                                    (None, None)
+                                }
+                            }
+                            _ => (None, None),
+                        };
+                        if let Some(table) = table_opt {
+                            if let Some(result) = self.agg_single_col_fast(table, col, *function, pred_opt)? {
+                                return Ok(result);
+                            }
+                        }
+                    }
+                }
+
+                // Generic path.
+                let result = self.execute_plan_readonly(input)?;
+                match result {
+                    QueryResult::Rows { columns, rows } => {
+                        match function {
+                            AggFunc::Count => Ok(QueryResult::Scalar(Value::Int(rows.len() as i64))),
+                            AggFunc::CountDistinct => {
+                                let col = field.as_ref().ok_or("count distinct requires field")?;
+                                let idx = columns.iter().position(|c| c == col).ok_or("col not found")?;
+                                let mut seen = std::collections::HashSet::new();
+                                for row in &rows {
+                                    let v = &row[idx];
+                                    if !v.is_empty() { seen.insert(v.clone()); }
+                                }
+                                Ok(QueryResult::Scalar(Value::Int(seen.len() as i64)))
+                            }
+                            AggFunc::Avg => {
+                                let col = field.as_ref().ok_or("avg requires field")?;
+                                let idx = columns.iter().position(|c| c == col).ok_or("col not found")?;
+                                let sum: f64 = rows.iter().filter_map(|r| match &r[idx] {
+                                    Value::Int(v) => Some(*v as f64),
+                                    Value::Float(v) => Some(*v),
+                                    _ => None,
+                                }).sum();
+                                let count = rows.len() as f64;
+                                Ok(QueryResult::Scalar(Value::Float(sum / count)))
+                            }
+                            AggFunc::Sum => {
+                                let col = field.as_ref().ok_or("sum requires field")?;
+                                let idx = columns.iter().position(|c| c == col).ok_or("col not found")?;
+                                let mut int_sum: i64 = 0;
+                                let mut float_sum: f64 = 0.0;
+                                let mut saw_float = false;
+                                for r in &rows {
+                                    match &r[idx] {
+                                        Value::Int(v)   => int_sum += *v,
+                                        Value::Float(v) => { float_sum += *v; saw_float = true; }
+                                        _ => {}
+                                    }
+                                }
+                                let result = if saw_float {
+                                    Value::Float(float_sum + int_sum as f64)
+                                } else {
+                                    Value::Int(int_sum)
+                                };
+                                Ok(QueryResult::Scalar(result))
+                            }
+                            AggFunc::Min | AggFunc::Max => {
+                                let col = field.as_ref().ok_or("min/max requires field")?;
+                                let idx = columns.iter().position(|c| c == col).ok_or("col not found")?;
+                                let vals: Vec<&Value> = rows.iter().map(|r| &r[idx]).collect();
+                                let result = if *function == AggFunc::Min {
+                                    vals.into_iter().min().cloned()
+                                } else {
+                                    vals.into_iter().max().cloned()
+                                };
+                                Ok(QueryResult::Scalar(result.unwrap_or(Value::Empty)))
+                            }
+                        }
+                    }
+                    _ => Err("aggregate requires row input".into()),
+                }
+            }
+
+            PlanNode::Distinct { input } => {
+                let result = self.execute_plan_readonly(input)?;
+                match result {
+                    QueryResult::Rows { columns, rows } => {
+                        let mut seen = std::collections::HashSet::new();
+                        let mut unique_rows = Vec::new();
+                        for row in rows {
+                            if seen.insert(row.clone()) {
+                                unique_rows.push(row);
+                            }
+                        }
+                        Ok(QueryResult::Rows { columns, rows: unique_rows })
+                    }
+                    other => Ok(other),
+                }
+            }
+
+            PlanNode::GroupBy { input, keys, aggregates, having } => {
+                let result = self.execute_plan_readonly(input)?;
+                match result {
+                    QueryResult::Rows { columns, rows } => {
+                        let key_indices: Vec<usize> = keys.iter().map(|k| {
+                            columns.iter().position(|c| c == k)
+                                .ok_or_else(|| format!("group-by column '{k}' not found"))
+                        }).collect::<Result<Vec<_>, _>>()?;
+
+                        let agg_field_indices: Vec<usize> = aggregates.iter().map(|a| {
+                            if a.field == "*" {
+                                Ok(usize::MAX)
+                            } else {
+                                columns.iter().position(|c| c == &a.field)
+                                    .ok_or_else(|| format!("aggregate column '{}' not found", a.field))
+                            }
+                        }).collect::<Result<Vec<_>, _>>()?;
+
+                        let mut group_map: rustc_hash::FxHashMap<Vec<Value>, usize> =
+                            rustc_hash::FxHashMap::default();
+                        let mut groups: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
+                        for (ri, row) in rows.iter().enumerate() {
+                            let key: Vec<Value> = key_indices.iter()
+                                .map(|&i| row[i].clone()).collect();
+                            match group_map.get(&key) {
+                                Some(&idx) => groups[idx].1.push(ri),
+                                None => {
+                                    let idx = groups.len();
+                                    group_map.insert(key.clone(), idx);
+                                    groups.push((key, vec![ri]));
+                                }
+                            }
+                        }
+
+                        let mut out_columns: Vec<String> = keys.clone();
+                        for agg in aggregates.iter() {
+                            out_columns.push(agg.output_name.clone());
+                        }
+
+                        let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
+                        for (key_vals, row_indices) in &groups {
+                            let mut row = key_vals.clone();
+                            for (ai, agg) in aggregates.iter().enumerate() {
+                                let col_idx = agg_field_indices[ai];
+                                let val = compute_group_aggregate(
+                                    agg.function, &rows, row_indices, col_idx,
+                                );
+                                row.push(val);
+                            }
+                            out_rows.push(row);
+                        }
+
+                        if let Some(having_expr) = having {
+                            out_rows.retain(|row| eval_predicate(having_expr, row, &out_columns));
+                        }
+
+                        Ok(QueryResult::Rows { columns: out_columns, rows: out_rows })
+                    }
+                    _ => Err("group by requires row input".into()),
+                }
+            }
+
+            PlanNode::NestedLoopJoin { left, right, on, kind } => {
+                let left_result = self.execute_plan_readonly(left)?;
+                let right_result = self.execute_plan_readonly(right)?;
+                let (left_columns, left_rows) = match left_result {
+                    QueryResult::Rows { columns, rows } => (columns, rows),
+                    _ => return Err("join left side must produce rows".into()),
+                };
+                let (right_columns, right_rows) = match right_result {
+                    QueryResult::Rows { columns, rows } => (columns, rows),
+                    _ => return Err("join right side must produce rows".into()),
+                };
+
+                if !matches!(kind, JoinKind::Cross) {
+                    if let Some(pred) = on {
+                        if let Some((l_idx, r_idx)) = try_extract_equi_join_keys(
+                            pred, &left_columns, &right_columns,
+                        ) {
+                            return Ok(hash_join(
+                                left_columns, left_rows,
+                                right_columns, right_rows,
+                                l_idx, r_idx,
+                                *kind,
+                            ));
+                        }
+                    }
+                }
+
+                let n_left = left_columns.len();
+                let n_right = right_columns.len();
+                let mut columns = Vec::with_capacity(n_left + n_right);
+                columns.extend(left_columns);
+                columns.extend(right_columns);
+
+                let mut rows: Vec<Vec<Value>> = Vec::with_capacity(left_rows.len());
+                let mut combined: Vec<Value> = Vec::with_capacity(n_left + n_right);
+
+                for left_row in &left_rows {
+                    let mut matched = false;
+                    for right_row in &right_rows {
+                        combined.clear();
+                        combined.extend_from_slice(left_row);
+                        combined.extend_from_slice(right_row);
+                        let keep = match kind {
+                            JoinKind::Cross => true,
+                            JoinKind::Inner | JoinKind::LeftOuter => match on {
+                                Some(pred) => eval_predicate(pred, &combined, &columns),
+                                None => true,
+                            },
+                            JoinKind::RightOuter => unreachable!(
+                                "planner rewrites RightOuter to LeftOuter"
+                            ),
+                        };
+                        if keep {
+                            rows.push(combined.clone());
+                            matched = true;
+                        }
+                    }
+                    if !matched && matches!(kind, JoinKind::LeftOuter) {
+                        let mut row = Vec::with_capacity(n_left + n_right);
+                        row.extend_from_slice(left_row);
+                        row.resize(n_left + n_right, Value::Empty);
+                        rows.push(row);
+                    }
+                }
+
+                Ok(QueryResult::Rows { columns, rows })
+            }
+
+            PlanNode::Union { left, right, all } => {
+                let left_result = self.execute_plan_readonly(left)?;
+                let right_result = self.execute_plan_readonly(right)?;
+                let (left_cols, left_rows) = match left_result {
+                    QueryResult::Rows { columns, rows } => (columns, rows),
+                    _ => return Err("UNION requires query results on left side".into()),
+                };
+                let (_, right_rows) = match right_result {
+                    QueryResult::Rows { columns, rows } => (columns, rows),
+                    _ => return Err("UNION requires query results on right side".into()),
+                };
+                let mut combined = left_rows;
+                if *all {
+                    combined.extend(right_rows);
+                } else {
+                    let mut seen = std::collections::HashSet::new();
+                    for row in &combined {
+                        seen.insert(row.clone());
+                    }
+                    for row in right_rows {
+                        if seen.insert(row.clone()) {
+                            combined.push(row);
+                        }
+                    }
+                }
+                Ok(QueryResult::Rows { columns: left_cols, rows: combined })
+            }
+
+            // All write variants — caller must escalate to the write lock.
+            PlanNode::Insert { .. }
+            | PlanNode::Update { .. }
+            | PlanNode::Delete { .. }
+            | PlanNode::CreateTable { .. }
+            | PlanNode::AlterTable { .. }
+            | PlanNode::DropTable { .. }
+            | PlanNode::CreateView { .. }
+            | PlanNode::RefreshView { .. }
+            | PlanNode::DropView { .. } => Err(READONLY_NEEDS_WRITE.to_string()),
+        }
+    }
+
+    /// `&self` variant of [`Engine::materialize_subqueries`]. Used by the
+    /// read path so `Filter` predicates with `InSubquery`/`ExistsSubquery`
+    /// children can evaluate their inner queries without taking the write
+    /// lock. Inner queries that would themselves need a write (e.g. dirty
+    /// view) escalate via [`READONLY_NEEDS_WRITE`] just like the top-level
+    /// read path does.
+    fn materialize_subqueries_readonly(&self, expr: &Expr) -> Result<Expr, String> {
+        match expr {
+            Expr::InSubquery { expr: inner, subquery, negated } => {
+                let inner = self.materialize_subqueries_readonly(inner)?;
+                let sub_plan = crate::planner::plan_statement(
+                    Statement::Query(*subquery.clone()),
+                ).map_err(|e| e.message)?;
+                let result = self.execute_plan_readonly(&sub_plan)?;
+                let values = match result {
+                    QueryResult::Rows { rows, .. } => {
+                        rows.into_iter()
+                            .filter_map(|mut row| {
+                                if row.is_empty() { None }
+                                else { Some(value_to_expr(row.swap_remove(0))) }
+                            })
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                };
+                Ok(Expr::InList {
+                    expr: Box::new(inner),
+                    list: values,
+                    negated: *negated,
+                })
+            }
+            Expr::ExistsSubquery { subquery, negated } => {
+                let sub_plan = crate::planner::plan_statement(
+                    Statement::Query(*subquery.clone()),
+                ).map_err(|e| e.message)?;
+                let result = self.execute_plan_readonly(&sub_plan)?;
+                let has_rows = match result {
+                    QueryResult::Rows { rows, .. } => !rows.is_empty(),
+                    _ => false,
+                };
+                let truth = if *negated { !has_rows } else { has_rows };
+                Ok(Expr::Literal(Literal::Bool(truth)))
+            }
+            Expr::BinaryOp(l, op, r) => {
+                let l = self.materialize_subqueries_readonly(l)?;
+                let r = self.materialize_subqueries_readonly(r)?;
+                Ok(Expr::BinaryOp(Box::new(l), *op, Box::new(r)))
+            }
+            Expr::UnaryOp(op, inner) => {
+                let inner = self.materialize_subqueries_readonly(inner)?;
+                Ok(Expr::UnaryOp(*op, Box::new(inner)))
+            }
+            Expr::Case { whens, else_expr } => {
+                let whens = whens.iter().map(|(c, r)| {
+                    let c = self.materialize_subqueries_readonly(c)?;
+                    let r = self.materialize_subqueries_readonly(r)?;
+                    Ok((Box::new(c), Box::new(r)))
+                }).collect::<Result<Vec<_>, String>>()?;
+                let else_expr = match else_expr {
+                    Some(e) => Some(Box::new(self.materialize_subqueries_readonly(e)?)),
+                    None => None,
+                };
+                Ok(Expr::Case { whens, else_expr })
+            }
+            other => Ok(other.clone()),
+        }
     }
 
     /// Parse and plan a query once, returning a [`PreparedQuery`] handle
