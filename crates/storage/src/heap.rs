@@ -38,6 +38,13 @@ pub struct HeapFile {
     /// `delete_by_filter`.
     in_free_list: Vec<bool>,
     /// Optional mmap for zero-syscall reads. Activated by `enable_mmap()`.
+    ///
+    /// # Safety invariant
+    ///
+    /// Valid only while the file size is stable. `disable_mmap()` must be
+    /// called before any mutation that extends the file (e.g., `insert`
+    /// allocating a new page). Without invalidation the pointer covers
+    /// stale/incomplete data beyond the original mapped length.
     mmap_ptr: Option<(*const u8, usize)>,
     /// Mission C Phase 1: write-back cache for the most recently touched
     /// page. All insert/update/delete operations land here first and only
@@ -281,6 +288,17 @@ impl HeapFile {
         }
     }
 
+    /// Tear down the persistent mmap, if active. Safe to call when no
+    /// mapping exists (it's a no-op). Called automatically at the start of
+    /// `insert` so the mapping is invalidated before the file can grow.
+    pub fn disable_mmap(&mut self) {
+        if let Some((ptr, len)) = self.mmap_ptr.take() {
+            unsafe {
+                libc::munmap(ptr as *mut libc::c_void, len);
+            }
+        }
+    }
+
     /// Insert encoded row data. Returns RowId.
     ///
     /// Mission C Phase 1: uses the hot-page write-back cache. The common
@@ -288,6 +306,12 @@ impl HeapFile {
     /// disk syscalls; the page stays pinned until a different page is
     /// touched or an explicit flush runs.
     pub fn insert(&mut self, row_data: &[u8]) -> io::Result<RowId> {
+        // Invalidate the persistent mmap before any mutation that may
+        // extend the file. The mapping covers a snapshot of the file at
+        // enable_mmap() time; inserts that allocate new pages would grow
+        // the file beyond that snapshot.
+        self.disable_mmap();
+
         // Hot-path: the pinned page already has room. This is the bench's
         // insert_batch_1k / insert_single loop.
         if let Some(hot) = self.hot_page.as_mut() {
@@ -992,9 +1016,7 @@ impl Drop for HeapFile {
         // this, the final write-back of a bench's last batch (and of
         // any deferred-flush mutations) would be lost on close.
         let _ = self.flush_all_dirty();
-        if let Some((ptr, len)) = self.mmap_ptr.take() {
-            unsafe { libc::munmap(ptr as *mut libc::c_void, len); }
-        }
+        self.disable_mmap();
     }
 }
 
