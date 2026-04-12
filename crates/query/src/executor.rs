@@ -4543,8 +4543,8 @@ fn eval_scalar_func(func: ScalarFn, args: &[Value]) -> Value {
             _ => Value::Empty,
         },
         ScalarFn::Sqrt => match args.first() {
-            Some(Value::Float(f)) => Value::Float(f.sqrt()),
-            Some(Value::Int(n)) => Value::Float((*n as f64).sqrt()),
+            Some(Value::Float(f)) if *f >= 0.0 => Value::Float(f.sqrt()),
+            Some(Value::Int(n)) if *n >= 0 => Value::Float((*n as f64).sqrt()),
             _ => Value::Empty,
         },
         ScalarFn::Pow => {
@@ -4552,8 +4552,11 @@ fn eval_scalar_func(func: ScalarFn, args: &[Value]) -> Value {
                 (Some(Value::Float(base)), Some(Value::Float(exp))) => Value::Float(base.powf(*exp)),
                 (Some(Value::Float(base)), Some(Value::Int(exp))) => Value::Float(base.powi(*exp as i32)),
                 (Some(Value::Int(base)), Some(Value::Int(exp))) => {
-                    if *exp >= 0 {
-                        Value::Int(base.pow(*exp as u32))
+                    if *exp >= 0 && *exp <= u32::MAX as i64 {
+                        match base.checked_pow(*exp as u32) {
+                            Some(v) => Value::Int(v),
+                            None => Value::Float((*base as f64).powi(*exp as i32)),
+                        }
                     } else {
                         Value::Float((*base as f64).powi(*exp as i32))
                     }
