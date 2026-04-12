@@ -9,6 +9,15 @@ const MSG_RESULT_OK: u8   = 0x09;
 const MSG_ERROR: u8       = 0x0A;
 const MSG_DISCONNECT: u8  = 0x10;
 
+/// Maximum payload size accepted from the wire (64 MB).
+const MAX_PAYLOAD_SIZE: usize = 64 * 1024 * 1024;
+
+/// Maximum number of columns allowed in a result set.
+const MAX_COLUMNS: usize = 4096;
+
+/// Maximum number of rows allowed in a single result message.
+const MAX_ROWS: usize = 10_000_000;
+
 #[derive(Debug, Clone)]
 pub enum Message {
     Connect { db_name: String, password: Option<String> },
@@ -74,7 +83,13 @@ impl Message {
         }
         let msg_type = data[0];
         let _flags = data[1];
-        let payload_len = u32::from_le_bytes(data[2..6].try_into().unwrap()) as usize;
+        let len_bytes: [u8; 4] = data[2..6]
+            .try_into()
+            .map_err(|_| "invalid header length field".to_string())?;
+        let payload_len = u32::from_le_bytes(len_bytes) as usize;
+        if 6 + payload_len > data.len() {
+            return Err("payload length exceeds frame".into());
+        }
         let payload = &data[6..6 + payload_len];
 
         match msg_type {
@@ -101,14 +116,32 @@ impl Message {
             }
             MSG_RESULT_ROWS => {
                 let mut pos = 0;
-                let col_count = u16::from_le_bytes(payload[pos..pos+2].try_into().unwrap()) as usize;
+                if pos + 2 > payload.len() {
+                    return Err("truncated column count".into());
+                }
+                let col_bytes: [u8; 2] = payload[pos..pos+2]
+                    .try_into()
+                    .map_err(|_| "invalid column count bytes".to_string())?;
+                let col_count = u16::from_le_bytes(col_bytes) as usize;
                 pos += 2;
+                if col_count > MAX_COLUMNS {
+                    return Err("too many columns".into());
+                }
                 let mut columns = Vec::with_capacity(col_count);
                 for _ in 0..col_count {
                     columns.push(decode_string(payload, &mut pos)?);
                 }
-                let row_count = u32::from_le_bytes(payload[pos..pos+4].try_into().unwrap()) as usize;
+                if pos + 4 > payload.len() {
+                    return Err("truncated row count".into());
+                }
+                let row_bytes: [u8; 4] = payload[pos..pos+4]
+                    .try_into()
+                    .map_err(|_| "invalid row count bytes".to_string())?;
+                let row_count = u32::from_le_bytes(row_bytes) as usize;
                 pos += 4;
+                if row_count > MAX_ROWS {
+                    return Err("too many rows".into());
+                }
                 let mut rows = Vec::with_capacity(row_count);
                 for _ in 0..row_count {
                     let mut row = Vec::with_capacity(col_count);
@@ -124,7 +157,13 @@ impl Message {
                 Ok(Message::ResultScalar { value })
             }
             MSG_RESULT_OK => {
-                let affected = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+                if payload.len() < 8 {
+                    return Err("truncated result ok payload".into());
+                }
+                let aff_bytes: [u8; 8] = payload[0..8]
+                    .try_into()
+                    .map_err(|_| "invalid affected count bytes".to_string())?;
+                let affected = u64::from_le_bytes(aff_bytes);
                 Ok(Message::ResultOk { affected })
             }
             MSG_ERROR => {
@@ -150,7 +189,16 @@ impl Message {
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(e),
         }
-        let payload_len = u32::from_le_bytes(header[2..6].try_into().unwrap()) as usize;
+        let len_bytes: [u8; 4] = header[2..6]
+            .try_into()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid header length field"))?;
+        let payload_len = u32::from_le_bytes(len_bytes) as usize;
+        if payload_len > MAX_PAYLOAD_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("payload too large: {payload_len} bytes (max {MAX_PAYLOAD_SIZE})"),
+            ));
+        }
         let mut payload = vec![0u8; payload_len];
         if payload_len > 0 {
             reader.read_exact(&mut payload).await?;
@@ -177,7 +225,10 @@ fn decode_string(data: &[u8], pos: &mut usize) -> Result<String, String> {
     if *pos + 4 > data.len() {
         return Err("truncated string length".into());
     }
-    let len = u32::from_le_bytes(data[*pos..*pos+4].try_into().unwrap()) as usize;
+    let len_bytes: [u8; 4] = data[*pos..*pos+4]
+        .try_into()
+        .map_err(|_| "invalid string length bytes".to_string())?;
+    let len = u32::from_le_bytes(len_bytes) as usize;
     *pos += 4;
     if *pos + len > data.len() {
         return Err("truncated string data".into());

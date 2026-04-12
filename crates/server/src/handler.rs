@@ -8,6 +8,52 @@ use tokio::net::TcpStream;
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tracing::{info, debug, warn, error};
 
+/// Constant-time byte comparison to prevent timing side-channel attacks
+/// on password verification. Returns `true` iff `a` and `b` are identical.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Error messages that are safe to forward to the client verbatim.
+const SAFE_ERROR_PREFIXES: &[&str] = &[
+    "table not found",
+    "column not found",
+    "parse error",
+    "type mismatch",
+    "unknown table",
+    "unknown column",
+    "unknown function",
+    "syntax error",
+    "expected",
+    "unexpected",
+    "missing",
+    "duplicate",
+    "invalid",
+    "cannot",
+    "no such",
+    "already exists",
+];
+
+/// Sanitize an error message before sending it to the client.
+/// Known safe errors are passed through; everything else is replaced
+/// with a generic message to avoid leaking internal details.
+fn sanitize_error(e: &str) -> String {
+    let lower = e.to_lowercase();
+    for prefix in SAFE_ERROR_PREFIXES {
+        if lower.starts_with(prefix) {
+            return e.to_string();
+        }
+    }
+    "query execution error".into()
+}
+
 /// Execute a query against the engine under the RwLock. Read-only
 /// statements acquire `.read()` so concurrent SELECTs can scan in
 /// parallel; mutations acquire `.write()`. Parse failures, subquery
@@ -30,7 +76,7 @@ fn dispatch_query(engine: &Arc<RwLock<Engine>>, query: &str) -> Result<QueryResu
         // fallback — critical to avoid deadlock if the read fails with
         // READONLY_NEEDS_WRITE (dirty view or parser-vs-plan discrepancy).
         let res = {
-            let eng = engine.read().unwrap();
+            let eng = engine.read().map_err(|e| format!("lock poisoned: {e}"))?;
             eng.execute_powql_readonly(query)
         };
         match res {
@@ -45,7 +91,7 @@ fn dispatch_query(engine: &Arc<RwLock<Engine>>, query: &str) -> Result<QueryResu
     // Write path: either the statement is a mutation, it failed to parse
     // (let the authoritative planner report the error), or the read path
     // asked for escalation.
-    let mut eng = engine.write().unwrap();
+    let mut eng = engine.write().map_err(|e| format!("lock poisoned: {e}"))?;
     eng.execute_powql(query)
 }
 
@@ -60,7 +106,7 @@ pub async fn handle_connection(stream: TcpStream, engine: Arc<RwLock<Engine>>, e
         Ok(Some(Message::Connect { db_name, password })) => {
             // Check password if server requires one
             if let Some(expected) = &expected_password {
-                if password.as_deref() != Some(expected.as_str()) {
+                if !password.as_deref().map_or(false, |p| constant_time_eq(p.as_bytes(), expected.as_bytes())) {
                     warn!(peer = %peer, db = %db_name, "auth rejected: bad password");
                     let err = Message::Error { message: "authentication failed".into() };
                     err.write_to(&mut writer).await.ok();
@@ -106,7 +152,7 @@ pub async fn handle_connection(stream: TcpStream, engine: Arc<RwLock<Engine>>, e
                 debug!(peer = %peer, query = %query, "received query");
                 match dispatch_query(&engine, &query) {
                     Ok(result) => query_result_to_message(result),
-                    Err(e) => Message::Error { message: e },
+                    Err(e) => Message::Error { message: sanitize_error(&e) },
                 }
             }
             Message::Disconnect => {
