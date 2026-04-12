@@ -12,6 +12,7 @@ pub enum Statement {
     RefreshView(RefreshViewExpr),
     DropView(DropViewExpr),
     Union(UnionExpr),
+    Upsert(UpsertExpr),
     Explain(Box<Statement>),
 }
 
@@ -155,6 +156,17 @@ pub struct DeleteExpr {
 pub struct Assignment {
     pub field: String,
     pub value: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+/// `upsert User on .id { id := 1, name := "Alice" } [on conflict { name := "Alice" }]`
+pub struct UpsertExpr {
+    pub target: String,
+    pub key_column: String,
+    pub assignments: Vec<Assignment>,
+    /// Assignments to apply on conflict. If empty, all non-key assignments
+    /// from `assignments` are used as the update set.
+    pub on_conflict: Vec<Assignment>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

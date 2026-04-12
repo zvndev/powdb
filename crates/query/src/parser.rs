@@ -46,6 +46,7 @@ impl Parser {
         }
         let stmt = match self.peek() {
             Token::Insert => self.parse_insert(),
+            Token::Upsert => self.parse_upsert(),
             Token::Type => self.parse_create_type(),
             Token::Alter => self.parse_alter_table(),
             Token::Drop => self.parse_drop_or_drop_view(),
@@ -301,6 +302,34 @@ impl Parser {
         };
         let assignments = self.parse_assignments()?;
         Ok(Statement::Insert(InsertExpr { target, assignments }))
+    }
+
+    /// Parse: `upsert Table on .key_col { assignments } [on conflict { update_assignments }]`
+    fn parse_upsert(&mut self) -> Result<Statement, ParseError> {
+        self.expect(&Token::Upsert)?;
+        let target = match self.advance() {
+            Token::Ident(name) => name,
+            t => return Err(ParseError { message: format!("expected type name, got {t:?}") }),
+        };
+        self.expect(&Token::On)?;
+        let key_column = match self.advance() {
+            Token::DotIdent(name) => name,
+            t => return Err(ParseError { message: format!("expected .key_column, got {t:?}") }),
+        };
+        let assignments = self.parse_assignments()?;
+        let on_conflict = if *self.peek() == Token::On {
+            self.advance(); // consume `on`
+            self.expect(&Token::Conflict)?;
+            self.parse_assignments()?
+        } else {
+            Vec::new()
+        };
+        Ok(Statement::Upsert(UpsertExpr {
+            target,
+            key_column,
+            assignments,
+            on_conflict,
+        }))
     }
 
     fn parse_assignments(&mut self) -> Result<Vec<Assignment>, ParseError> {
@@ -1240,6 +1269,7 @@ fn tokens_to_text(tokens: &[Token]) -> String {
             Token::Update => out.push_str("update"),
             Token::Delete => out.push_str("delete"),
             Token::Upsert => out.push_str("upsert"),
+            Token::Conflict => out.push_str("conflict"),
             Token::Select => out.push_str("select"),
             Token::Required => out.push_str("required"),
             Token::Multi => out.push_str("multi"),

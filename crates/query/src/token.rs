@@ -25,6 +25,7 @@ pub enum Token {
     Link,       // link
     Index,      // index
     On,         // on
+    Conflict,   // conflict
     Asc,        // asc
     Desc,       // desc
     And,        // and

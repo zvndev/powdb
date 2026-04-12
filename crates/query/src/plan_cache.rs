@@ -134,6 +134,14 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
         PlanNode::IndexScan { key, .. } => {
             substitute_expr(key, literals, idx);
         }
+        PlanNode::RangeScan { start, end, .. } => {
+            if let Some((expr, _)) = start {
+                substitute_expr(expr, literals, idx);
+            }
+            if let Some((expr, _)) = end {
+                substitute_expr(expr, literals, idx);
+            }
+        }
         PlanNode::Filter { input, predicate } => {
             substitute_plan(input, literals, idx);
             substitute_expr(predicate, literals, idx);
@@ -197,6 +205,10 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
         PlanNode::Insert { assignments, .. } => {
             substitute_assignments(assignments, literals, idx);
         }
+        PlanNode::Upsert { assignments, on_conflict, .. } => {
+            substitute_assignments(assignments, literals, idx);
+            substitute_assignments(on_conflict, literals, idx);
+        }
         PlanNode::Update { input, assignments, .. } => {
             substitute_plan(input, literals, idx);
             substitute_assignments(assignments, literals, idx);
@@ -252,6 +264,14 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
         PlanNode::SeqScan { .. } => {}
         PlanNode::AliasScan { .. } => {}
         PlanNode::IndexScan { key, .. } => count_expr(key, n),
+        PlanNode::RangeScan { start, end, .. } => {
+            if let Some((expr, _)) = start {
+                count_expr(expr, n);
+            }
+            if let Some((expr, _)) = end {
+                count_expr(expr, n);
+            }
+        }
         PlanNode::Filter { input, predicate } => {
             count_plan(input, n);
             count_expr(predicate, n);
@@ -298,6 +318,14 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
         }
         PlanNode::Insert { assignments, .. } => {
             for a in assignments {
+                count_expr(&a.value, n);
+            }
+        }
+        PlanNode::Upsert { assignments, on_conflict, .. } => {
+            for a in assignments {
+                count_expr(&a.value, n);
+            }
+            for a in on_conflict {
                 count_expr(&a.value, n);
             }
         }
@@ -574,6 +602,14 @@ mod tests {
             PlanNode::SeqScan { .. } => {}
             PlanNode::AliasScan { .. } => {}
             PlanNode::IndexScan { key, .. } => collect_expr_literals(key, out),
+            PlanNode::RangeScan { start, end, .. } => {
+                if let Some((expr, _)) = start {
+                    collect_expr_literals(expr, out);
+                }
+                if let Some((expr, _)) = end {
+                    collect_expr_literals(expr, out);
+                }
+            }
             PlanNode::Filter { input, predicate } => {
                 collect_literals_for_test(input, out);
                 collect_expr_literals(predicate, out);
@@ -603,6 +639,14 @@ mod tests {
             }
             PlanNode::Insert { assignments, .. } => {
                 for a in assignments {
+                    collect_expr_literals(&a.value, out);
+                }
+            }
+            PlanNode::Upsert { assignments, on_conflict, .. } => {
+                for a in assignments {
+                    collect_expr_literals(&a.value, out);
+                }
+                for a in on_conflict {
                     collect_expr_literals(&a.value, out);
                 }
             }

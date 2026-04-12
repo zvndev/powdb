@@ -654,6 +654,70 @@ impl BTree {
         results.into_iter()
     }
 
+    /// Range scan from `start` to the end of the tree (start <= key).
+    pub fn range_from(&self, start: &Value) -> Vec<(Value, RowId)> {
+        let mut node_id = self.root;
+        loop {
+            match &self.nodes[node_id] {
+                Node::Internal { keys, children } => {
+                    let pos = keys.partition_point(|k| k <= start);
+                    node_id = children[pos];
+                }
+                Node::Leaf { .. } => break,
+            }
+        }
+        let start = start.clone();
+        let mut results = Vec::new();
+        let mut current = Some(node_id);
+        while let Some(nid) = current {
+            match &self.nodes[nid] {
+                Node::Leaf { keys, values, next_leaf } => {
+                    for (i, k) in keys.iter().enumerate() {
+                        if k >= &start {
+                            results.push((k.clone(), values[i]));
+                        }
+                    }
+                    current = *next_leaf;
+                }
+                _ => break,
+            }
+        }
+        results
+    }
+
+    /// Range scan from the beginning of the tree to `end` (key <= end).
+    pub fn range_to(&self, end: &Value) -> Vec<(Value, RowId)> {
+        // Find the leftmost leaf.
+        let mut node_id = self.root;
+        loop {
+            match &self.nodes[node_id] {
+                Node::Internal { children, .. } => { node_id = children[0]; }
+                Node::Leaf { .. } => break,
+            }
+        }
+        let end = end.clone();
+        let mut results = Vec::new();
+        let mut current = Some(node_id);
+        while let Some(nid) = current {
+            match &self.nodes[nid] {
+                Node::Leaf { keys, values, next_leaf } => {
+                    let mut done = false;
+                    for (i, k) in keys.iter().enumerate() {
+                        if k > &end {
+                            done = true;
+                            break;
+                        }
+                        results.push((k.clone(), values[i]));
+                    }
+                    if done { break; }
+                    current = *next_leaf;
+                }
+                _ => break,
+            }
+        }
+        results
+    }
+
     /// Number of entries in the tree.
     pub fn len(&self) -> usize {
         let mut count = 0;

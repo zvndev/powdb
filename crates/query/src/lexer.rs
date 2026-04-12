@@ -110,6 +110,7 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                 "update"       => Token::Update,
                 "delete"       => Token::Delete,
                 "upsert"       => Token::Upsert,
+                "conflict"     => Token::Conflict,
                 "select"       => Token::Select,
                 "required"     => Token::Required,
                 "multi"        => Token::Multi,

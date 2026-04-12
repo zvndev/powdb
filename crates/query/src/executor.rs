@@ -136,6 +136,7 @@ pub fn is_read_only_statement(stmt: &Statement) -> bool {
             is_read_only_statement(&u.left) && is_read_only_statement(&u.right)
         }
         Statement::Insert(_)
+        | Statement::Upsert(_)
         | Statement::UpdateQuery(_)
         | Statement::DeleteQuery(_)
         | Statement::CreateType(_)
@@ -539,6 +540,79 @@ impl Engine {
                     .filter_map(|(_, row)| {
                         if row[col_idx] == key_value { Some(row) } else { None }
                     })
+                    .collect();
+                Ok(QueryResult::Rows { columns, rows })
+            }
+
+            PlanNode::RangeScan { table, column, start, end } => {
+                let tbl = self.catalog.get_table(table)
+                    .ok_or_else(|| format!("table '{table}' not found"))?;
+                let columns: Vec<String> = tbl.schema.columns.iter().map(|c| c.name.clone()).collect();
+                let schema = tbl.schema.clone();
+
+                let start_val = match start {
+                    Some((expr, _)) => Some(literal_to_value(expr)?),
+                    None => None,
+                };
+                let end_val = match end {
+                    Some((expr, _)) => Some(literal_to_value(expr)?),
+                    None => None,
+                };
+                let start_inclusive = start.as_ref().map(|(_, inc)| *inc).unwrap_or(true);
+                let end_inclusive = end.as_ref().map(|(_, inc)| *inc).unwrap_or(true);
+
+                if let Some(btree) = tbl.index(column) {
+                    let hits: Vec<(Value, RowId)> = match (&start_val, &end_val) {
+                        (Some(s), Some(e)) => btree.range(s, e).collect(),
+                        (Some(s), None) => btree.range_from(s),
+                        (None, Some(e)) => btree.range_to(e),
+                        (None, None) => {
+                            // Unbounded both sides — equivalent to seq scan.
+                            let rows: Vec<Vec<Value>> = tbl.scan()
+                                .map(|(_, row)| row)
+                                .collect();
+                            return Ok(QueryResult::Rows { columns, rows });
+                        }
+                    };
+                    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(hits.len());
+                    for (key, rid) in hits {
+                        // Filter for exclusive bounds.
+                        if !start_inclusive {
+                            if let Some(ref s) = start_val {
+                                if &key == s { continue; }
+                            }
+                        }
+                        if !end_inclusive {
+                            if let Some(ref e) = end_val {
+                                if &key == e { continue; }
+                            }
+                        }
+                        if let Some(data) = tbl.heap.get(rid) {
+                            rows.push(decode_row(&schema, &data));
+                        }
+                    }
+                    return Ok(QueryResult::Rows { columns, rows });
+                }
+
+                // Fallback: no index — synthesize the range predicate and scan.
+                let fast = FastLayout::new(&schema);
+                let synth = synthesize_range_predicate(column, start, end);
+                if let Some(compiled) = compile_predicate(&synth, &columns, &fast, &schema) {
+                    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
+                    self.catalog.for_each_row_raw(table, |_rid, data| {
+                        if compiled(data) {
+                            rows.push(decode_row(&schema, data));
+                        }
+                    }).map_err(|e| e.to_string())?;
+                    return Ok(QueryResult::Rows { columns, rows });
+                }
+
+                // Last resort: decoded row eval.
+                let col_idx = schema.column_index(column)
+                    .ok_or_else(|| format!("column '{column}' not found"))?;
+                let rows: Vec<Vec<Value>> = tbl.scan()
+                    .filter(|(_, row)| range_matches(&row[col_idx], &start_val, start_inclusive, &end_val, end_inclusive))
+                    .map(|(_, row)| row)
                     .collect();
                 Ok(QueryResult::Rows { columns, rows })
             }
@@ -1140,6 +1214,7 @@ impl Engine {
             PlanNode::Insert { .. }
             | PlanNode::Update { .. }
             | PlanNode::Delete { .. }
+            | PlanNode::Upsert { .. }
             | PlanNode::CreateTable { .. }
             | PlanNode::AlterTable { .. }
             | PlanNode::DropTable { .. }
@@ -2337,6 +2412,84 @@ impl Engine {
                 Ok(QueryResult::Modified(1))
             }
 
+            PlanNode::Upsert { table, key_column, assignments, on_conflict } => {
+                // Build the insert values from assignments.
+                let (values, key_idx) = {
+                    let schema = self.catalog.schema(table)
+                        .ok_or_else(|| format!("table '{table}' not found"))?;
+                    let mut values = vec![Value::Empty; schema.columns.len()];
+                    for a in assignments {
+                        let idx = schema.column_index(&a.field)
+                            .ok_or_else(|| format!("column '{}' not found", a.field))?;
+                        values[idx] = literal_to_value(&a.value)?;
+                    }
+                    let key_idx = schema.column_index(key_column)
+                        .ok_or_else(|| format!("key column '{key_column}' not found"))?;
+                    (values, key_idx)
+                };
+
+                let key_value = values[key_idx].clone();
+
+                // Probe the index for a conflict.
+                let existing = {
+                    let tbl = self.catalog.get_table(table)
+                        .ok_or_else(|| format!("table '{table}' not found"))?;
+                    if let Some(btree) = tbl.index(key_column) {
+                        let hit = match &key_value {
+                            Value::Int(k) => btree.lookup_int(*k),
+                            other => btree.lookup(other),
+                        };
+                        hit.and_then(|rid| {
+                            tbl.heap.get(rid).map(|data| {
+                                (rid, decode_row(&tbl.schema, &data))
+                            })
+                        })
+                    } else {
+                        // No index — linear scan for the key.
+                        let mut found = None;
+                        for (rid, row) in tbl.scan() {
+                            if row[key_idx] == key_value {
+                                found = Some((rid, row));
+                                break;
+                            }
+                        }
+                        found
+                    }
+                };
+
+                if let Some((rid, mut existing_row)) = existing {
+                    // Conflict: apply on_conflict assignments (or all non-key if empty).
+                    let update_assignments = if on_conflict.is_empty() {
+                        assignments
+                    } else {
+                        on_conflict
+                    };
+                    let changed_cols: Vec<usize> = {
+                        let schema = self.catalog.schema(table)
+                            .ok_or_else(|| format!("table '{table}' not found"))?;
+                        let mut indices = Vec::new();
+                        for a in update_assignments {
+                            let idx = schema.column_index(&a.field)
+                                .ok_or_else(|| format!("column '{}' not found", a.field))?;
+                            if idx != key_idx {
+                                existing_row[idx] = literal_to_value(&a.value)?;
+                                indices.push(idx);
+                            }
+                        }
+                        indices
+                    };
+                    self.catalog.update_hinted(table, rid, &existing_row, Some(&changed_cols))
+                        .map_err(|e| e.to_string())?;
+                    self.view_registry.mark_dependents_dirty(table);
+                    Ok(QueryResult::Modified(1))
+                } else {
+                    // No conflict: insert.
+                    self.catalog.insert(table, &values).map_err(|e| e.to_string())?;
+                    self.view_registry.mark_dependents_dirty(table);
+                    Ok(QueryResult::Modified(1))
+                }
+            }
+
             PlanNode::Update { input, table, assignments } => {
                 // Mission C Phase 3: resolve assignments against a borrowed
                 // schema, then drop the borrow before the mutation loop.
@@ -3004,6 +3157,76 @@ impl Engine {
                     .filter_map(|(_, row)| {
                         if row[col_idx] == key_value { Some(row) } else { None }
                     })
+                    .collect();
+                Ok(QueryResult::Rows { columns, rows })
+            }
+
+            PlanNode::RangeScan { table, column, start, end } => {
+                let tbl = self.catalog.get_table(table)
+                    .ok_or_else(|| format!("table '{table}' not found"))?;
+                let columns: Vec<String> = tbl.schema.columns.iter().map(|c| c.name.clone()).collect();
+                let schema = &tbl.schema;
+
+                let start_val = match start {
+                    Some((expr, _)) => Some(literal_to_value(expr)?),
+                    None => None,
+                };
+                let end_val = match end {
+                    Some((expr, _)) => Some(literal_to_value(expr)?),
+                    None => None,
+                };
+                let start_inclusive = start.as_ref().map(|(_, inc)| *inc).unwrap_or(true);
+                let end_inclusive = end.as_ref().map(|(_, inc)| *inc).unwrap_or(true);
+
+                if let Some(btree) = tbl.index(column) {
+                    let hits: Vec<(Value, RowId)> = match (&start_val, &end_val) {
+                        (Some(s), Some(e)) => btree.range(s, e).collect(),
+                        (Some(s), None) => btree.range_from(s),
+                        (None, Some(e)) => btree.range_to(e),
+                        (None, None) => {
+                            let rows: Vec<Vec<Value>> = tbl.scan()
+                                .map(|(_, row)| row)
+                                .collect();
+                            return Ok(QueryResult::Rows { columns, rows });
+                        }
+                    };
+                    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(hits.len());
+                    for (key, rid) in hits {
+                        if !start_inclusive {
+                            if let Some(ref s) = start_val {
+                                if &key == s { continue; }
+                            }
+                        }
+                        if !end_inclusive {
+                            if let Some(ref e) = end_val {
+                                if &key == e { continue; }
+                            }
+                        }
+                        if let Some(data) = tbl.heap.get(rid) {
+                            rows.push(decode_row(schema, &data));
+                        }
+                    }
+                    return Ok(QueryResult::Rows { columns, rows });
+                }
+
+                // Fallback: no index — synthesize range predicate and scan.
+                let fast = FastLayout::new(schema);
+                let synth = synthesize_range_predicate(column, start, end);
+                if let Some(compiled) = compile_predicate(&synth, &columns, &fast, schema) {
+                    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
+                    self.catalog.for_each_row_raw(table, |_rid, data| {
+                        if compiled(data) {
+                            rows.push(decode_row(schema, data));
+                        }
+                    }).map_err(|e| e.to_string())?;
+                    return Ok(QueryResult::Rows { columns, rows });
+                }
+
+                let col_idx = schema.column_index(column)
+                    .ok_or_else(|| format!("column '{column}' not found"))?;
+                let rows: Vec<Vec<Value>> = tbl.scan()
+                    .filter(|(_, row)| range_matches(&row[col_idx], &start_val, start_inclusive, &end_val, end_inclusive))
+                    .map(|(_, row)| row)
                     .collect();
                 Ok(QueryResult::Rows { columns, rows })
             }
@@ -4716,6 +4939,45 @@ fn hash_join(
     QueryResult::Rows { columns, rows }
 }
 
+/// Synthesize a range predicate from RangeScan bounds for the fallback path.
+fn synthesize_range_predicate(column: &str, start: &Option<(Expr, bool)>, end: &Option<(Expr, bool)>) -> Expr {
+    let lower = start.as_ref().map(|(expr, inclusive)| {
+        let op = if *inclusive { BinOp::Gte } else { BinOp::Gt };
+        Expr::BinaryOp(
+            Box::new(Expr::Field(column.to_string())),
+            op,
+            Box::new(expr.clone()),
+        )
+    });
+    let upper = end.as_ref().map(|(expr, inclusive)| {
+        let op = if *inclusive { BinOp::Lte } else { BinOp::Lt };
+        Expr::BinaryOp(
+            Box::new(Expr::Field(column.to_string())),
+            op,
+            Box::new(expr.clone()),
+        )
+    });
+    match (lower, upper) {
+        (Some(l), Some(u)) => Expr::BinaryOp(Box::new(l), BinOp::And, Box::new(u)),
+        (Some(l), None) => l,
+        (None, Some(u)) => u,
+        (None, None) => Expr::Literal(Literal::Bool(true)),
+    }
+}
+
+/// Check if a value falls within a range (used in last-resort decoded-row eval).
+fn range_matches(val: &Value, start: &Option<Value>, start_inc: bool, end: &Option<Value>, end_inc: bool) -> bool {
+    if let Some(ref s) = start {
+        if start_inc { if val < s { return false; } }
+        else { if val <= s { return false; } }
+    }
+    if let Some(ref e) = end {
+        if end_inc { if val > e { return false; } }
+        else { if val >= e { return false; } }
+    }
+    true
+}
+
 /// Format a `PlanNode` tree as a human-readable, indented text
 /// representation. Used by the `EXPLAIN` command.
 fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
@@ -4727,6 +4989,23 @@ fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
         }
         PlanNode::IndexScan { table, column, key } => {
             format!("{indent}IndexScan table={table} column={column} key={key:?}")
+        }
+        PlanNode::RangeScan { table, column, start, end } => {
+            let s = match start {
+                Some((expr, inc)) => {
+                    let op = if *inc { ">=" } else { ">" };
+                    format!("{op}{expr:?}")
+                }
+                None => "unbounded".to_string(),
+            };
+            let e = match end {
+                Some((expr, inc)) => {
+                    let op = if *inc { "<=" } else { "<" };
+                    format!("{op}{expr:?}")
+                }
+                None => "unbounded".to_string(),
+            };
+            format!("{indent}RangeScan table={table} column={column} [{s}, {e}]")
         }
         PlanNode::Filter { input, predicate } => {
             let child = format_plan_tree(input, depth + 1);
@@ -4795,6 +5074,16 @@ fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
         PlanNode::Insert { table, assignments } => {
             let cols: Vec<&str> = assignments.iter().map(|a| a.field.as_str()).collect();
             format!("{indent}Insert table={table} cols=[{}]", cols.join(", "))
+        }
+        PlanNode::Upsert { table, key_column, assignments, on_conflict } => {
+            let cols: Vec<&str> = assignments.iter().map(|a| a.field.as_str()).collect();
+            let conflict_cols: Vec<&str> = on_conflict.iter().map(|a| a.field.as_str()).collect();
+            if conflict_cols.is_empty() {
+                format!("{indent}Upsert table={table} key={key_column} cols=[{}]", cols.join(", "))
+            } else {
+                format!("{indent}Upsert table={table} key={key_column} cols=[{}] on_conflict=[{}]",
+                    cols.join(", "), conflict_cols.join(", "))
+            }
         }
         PlanNode::Update { input, table, assignments } => {
             let cols: Vec<&str> = assignments.iter().map(|a| a.field.as_str()).collect();
@@ -8059,8 +8348,7 @@ mod tests {
                     .map(|r| match &r[0] { Value::Str(s) => s.as_str(), _ => "" })
                     .collect::<Vec<_>>()
                     .join("\n");
-                assert!(plan_text.contains("Filter"), "plan should show Filter node");
-                assert!(plan_text.contains("SeqScan"), "plan should show SeqScan node");
+                assert!(plan_text.contains("RangeScan"), "plan should show RangeScan node");
             }
             _ => panic!("expected rows"),
         }

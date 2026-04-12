@@ -63,8 +63,13 @@ async fn test_full_lifecycle() {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             let eng = engine.clone();
+            let (_, mut rx) = tokio::sync::watch::channel(false);
             tokio::spawn(async move {
-                powdb_server::handler::handle_connection(stream, eng, None).await;
+                powdb_server::handler::handle_connection(
+                    stream, eng, None, &mut rx,
+                    Duration::from_secs(300),
+                    Duration::from_secs(30),
+                ).await;
             });
         }
     });

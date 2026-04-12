@@ -4,8 +4,10 @@ use powdb_query::parser;
 use powdb_query::result::QueryResult;
 use powdb_storage::types::Value;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
+use tokio::sync::watch;
 use tracing::{info, debug, warn, error};
 
 /// Constant-time byte comparison to prevent timing side-channel attacks
@@ -56,25 +58,12 @@ fn sanitize_error(e: &str) -> String {
 
 /// Execute a query against the engine under the RwLock. Read-only
 /// statements acquire `.read()` so concurrent SELECTs can scan in
-/// parallel; mutations acquire `.write()`. Parse failures, subquery
-/// planning errors, and anything that needs the write lock due to dirty
-/// materialized views all fall through to the write path for a uniform
-/// error shape.
-///
-/// Mission infra-1: this is the entry point that replaces the old
-/// "every query locks the whole engine" behaviour.
+/// parallel; mutations acquire `.write()`.
 fn dispatch_query(engine: &Arc<RwLock<Engine>>, query: &str) -> Result<QueryResult, String> {
-    // Parse once at the handler level so we can classify the statement
-    // without touching the engine. This is the same lex+parse cost the
-    // engine would pay anyway; we just hoist it out of the lock critical
-    // section so concurrent readers don't serialise on lexing either.
     let stmt_result = parser::parse(query).map_err(|e| e.message);
 
     let can_try_read = matches!(&stmt_result, Ok(s) if is_read_only_statement(s));
     if can_try_read {
-        // Read lock is released before we drop into the write path on
-        // fallback — critical to avoid deadlock if the read fails with
-        // READONLY_NEEDS_WRITE (dirty view or parser-vs-plan discrepancy).
         let res = {
             let eng = engine.read().map_err(|e| format!("lock poisoned: {e}"))?;
             eng.execute_powql_readonly(query)
@@ -88,23 +77,42 @@ fn dispatch_query(engine: &Arc<RwLock<Engine>>, query: &str) -> Result<QueryResu
         }
     }
 
-    // Write path: either the statement is a mutation, it failed to parse
-    // (let the authoritative planner report the error), or the read path
-    // asked for escalation.
     let mut eng = engine.write().map_err(|e| format!("lock poisoned: {e}"))?;
     eng.execute_powql(query)
 }
 
-pub async fn handle_connection(stream: TcpStream, engine: Arc<RwLock<Engine>>, expected_password: Option<String>) {
+pub async fn handle_connection(
+    stream: TcpStream,
+    engine: Arc<RwLock<Engine>>,
+    expected_password: Option<String>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+    idle_timeout: Duration,
+    query_timeout: Duration,
+) {
     let peer = stream.peer_addr().ok().map(|a| a.to_string()).unwrap_or_else(|| "unknown".into());
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut writer = BufWriter::new(writer);
 
-    // Wait for Connect message
-    match Message::read_from(&mut reader).await {
-        Ok(Some(Message::Connect { db_name, password })) => {
-            // Check password if server requires one
+    // Wait for Connect message (with idle timeout).
+    let connect_msg = match tokio::time::timeout(idle_timeout, Message::read_from(&mut reader)).await {
+        Ok(Ok(Some(msg))) => msg,
+        Ok(Ok(None)) => {
+            debug!(peer = %peer, "client closed before CONNECT");
+            return;
+        }
+        Ok(Err(e)) => {
+            error!(peer = %peer, error = %e, "error reading CONNECT");
+            return;
+        }
+        Err(_) => {
+            warn!(peer = %peer, "idle timeout waiting for CONNECT");
+            return;
+        }
+    };
+
+    match connect_msg {
+        Message::Connect { db_name, password } => {
             if let Some(expected) = &expected_password {
                 if !password.as_deref().map_or(false, |p| constant_time_eq(p.as_bytes(), expected.as_bytes())) {
                     warn!(peer = %peer, db = %db_name, "auth rejected: bad password");
@@ -119,40 +127,66 @@ pub async fn handle_connection(stream: TcpStream, engine: Arc<RwLock<Engine>>, e
             if ok.write_to(&mut writer).await.is_err() { return; }
             if writer.flush().await.is_err() { return; }
         }
-        Ok(Some(_)) => {
+        _ => {
             warn!(peer = %peer, "first message was not CONNECT");
             let err = Message::Error { message: "expected CONNECT".into() };
             err.write_to(&mut writer).await.ok();
             writer.flush().await.ok();
             return;
         }
-        Ok(None) => {
-            debug!(peer = %peer, "client closed before CONNECT");
-            return;
-        }
-        Err(e) => {
-            error!(peer = %peer, error = %e, "error reading CONNECT");
-            return;
-        }
     }
 
-    // Main query loop
+    // Main query loop with idle timeout and shutdown awareness.
     loop {
-        let msg = match Message::read_from(&mut reader).await {
-            Ok(Some(msg)) => msg,
-            Ok(None) => break,
-            Err(e) => {
-                error!(peer = %peer, error = %e, "read error");
-                break;
+        let msg = tokio::select! {
+            // Read next message with idle timeout.
+            result = tokio::time::timeout(idle_timeout, Message::read_from(&mut reader)) => {
+                match result {
+                    Ok(Ok(Some(msg))) => msg,
+                    Ok(Ok(None)) => break,
+                    Ok(Err(e)) => {
+                        error!(peer = %peer, error = %e, "read error");
+                        break;
+                    }
+                    Err(_) => {
+                        info!(peer = %peer, "idle timeout, closing connection");
+                        let err = Message::Error { message: "idle timeout".into() };
+                        err.write_to(&mut writer).await.ok();
+                        writer.flush().await.ok();
+                        break;
+                    }
+                }
+            }
+            // If server is shutting down, notify client and close.
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    info!(peer = %peer, "server shutting down, closing connection");
+                    let err = Message::Error { message: "server shutting down".into() };
+                    err.write_to(&mut writer).await.ok();
+                    writer.flush().await.ok();
+                    break;
+                }
+                continue;
             }
         };
 
         let response = match msg {
             Message::Query { query } => {
                 debug!(peer = %peer, query = %query, "received query");
-                match dispatch_query(&engine, &query) {
-                    Ok(result) => query_result_to_message(result),
-                    Err(e) => Message::Error { message: sanitize_error(&e) },
+                // Run query with timeout.
+                let result = tokio::task::spawn_blocking({
+                    let engine = engine.clone();
+                    let query = query.clone();
+                    move || dispatch_query(&engine, &query)
+                });
+                match tokio::time::timeout(query_timeout, result).await {
+                    Ok(Ok(Ok(result))) => query_result_to_message(result),
+                    Ok(Ok(Err(e))) => Message::Error { message: sanitize_error(&e) },
+                    Ok(Err(e)) => Message::Error { message: format!("internal error: {e}") },
+                    Err(_) => {
+                        warn!(peer = %peer, query = %query, "query timeout exceeded");
+                        Message::Error { message: "query timeout exceeded".into() }
+                    }
                 }
             }
             Message::Disconnect => {

@@ -42,6 +42,7 @@ pub fn plan_statement(stmt: Statement) -> Result<PlanNode, PlanError> {
                 all: u.all,
             })
         }
+        Statement::Upsert(ups) => plan_upsert(ups),
         Statement::Explain(inner) => {
             let inner_plan = plan_statement(*inner)?;
             Ok(PlanNode::Explain { input: Box::new(inner_plan) })
@@ -69,7 +70,10 @@ fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
     let (source, filter) = match q.filter {
         Some(pred) => match try_extract_eq_index_key(&q.source, &pred) {
             Some(index_scan) => (index_scan, None),
-            None => (PlanNode::SeqScan { table: q.source.clone() }, Some(pred)),
+            None => match try_extract_range_index_keys(&q.source, &pred) {
+                Some(range_scan) => (range_scan, None),
+                None => (PlanNode::SeqScan { table: q.source.clone() }, Some(pred)),
+            },
         },
         None => (PlanNode::SeqScan { table: q.source.clone() }, None),
     };
@@ -308,9 +312,12 @@ fn plan_update(upd: UpdateExpr) -> Result<PlanNode, PlanError> {
     let source = match upd.filter {
         Some(pred) => match try_extract_eq_index_key(&upd.source, &pred) {
             Some(index_scan) => index_scan,
-            None => PlanNode::Filter {
-                input: Box::new(PlanNode::SeqScan { table: upd.source.clone() }),
-                predicate: pred,
+            None => match try_extract_range_index_keys(&upd.source, &pred) {
+                Some(range_scan) => range_scan,
+                None => PlanNode::Filter {
+                    input: Box::new(PlanNode::SeqScan { table: upd.source.clone() }),
+                    predicate: pred,
+                },
             },
         },
         None => PlanNode::SeqScan { table: upd.source.clone() },
@@ -326,9 +333,12 @@ fn plan_delete(del: DeleteExpr) -> Result<PlanNode, PlanError> {
     let source = match del.filter {
         Some(pred) => match try_extract_eq_index_key(&del.source, &pred) {
             Some(index_scan) => index_scan,
-            None => PlanNode::Filter {
-                input: Box::new(PlanNode::SeqScan { table: del.source.clone() }),
-                predicate: pred,
+            None => match try_extract_range_index_keys(&del.source, &pred) {
+                Some(range_scan) => range_scan,
+                None => PlanNode::Filter {
+                    input: Box::new(PlanNode::SeqScan { table: del.source.clone() }),
+                    predicate: pred,
+                },
             },
         },
         None => PlanNode::SeqScan { table: del.source.clone() },
@@ -336,6 +346,15 @@ fn plan_delete(del: DeleteExpr) -> Result<PlanNode, PlanError> {
     Ok(PlanNode::Delete {
         input: Box::new(source),
         table: del.source,
+    })
+}
+
+fn plan_upsert(ups: UpsertExpr) -> Result<PlanNode, PlanError> {
+    Ok(PlanNode::Upsert {
+        table: ups.target,
+        key_column: ups.key_column,
+        assignments: ups.assignments,
+        on_conflict: ups.on_conflict,
     })
 }
 
@@ -371,6 +390,97 @@ fn try_extract_eq_index_key(table: &str, pred: &Expr) -> Option<PlanNode> {
         column,
         key,
     })
+}
+
+/// Extract a single range bound from a simple inequality predicate.
+/// Returns `(column, lower_bound, upper_bound)` where at most one bound is set.
+fn extract_single_bound(pred: &Expr) -> Option<(String, Option<(Expr, bool)>, Option<(Expr, bool)>)> {
+    let (lhs, op, rhs) = match pred {
+        Expr::BinaryOp(lhs, op, rhs) => (lhs.as_ref(), *op, rhs.as_ref()),
+        _ => return None,
+    };
+    match op {
+        // .col > literal  →  lower=(literal, exclusive)
+        BinOp::Gt => match (lhs, rhs) {
+            (Expr::Field(name), Expr::Literal(_)) => {
+                Some((name.clone(), Some((rhs.clone(), false)), None))
+            }
+            (Expr::Literal(_), Expr::Field(name)) => {
+                // literal > .col  →  col < literal  →  upper=(literal, exclusive)
+                Some((name.clone(), None, Some((lhs.clone(), false))))
+            }
+            _ => None,
+        },
+        // .col >= literal  →  lower=(literal, inclusive)
+        BinOp::Gte => match (lhs, rhs) {
+            (Expr::Field(name), Expr::Literal(_)) => {
+                Some((name.clone(), Some((rhs.clone(), true)), None))
+            }
+            (Expr::Literal(_), Expr::Field(name)) => {
+                Some((name.clone(), None, Some((lhs.clone(), true))))
+            }
+            _ => None,
+        },
+        // .col < literal  →  upper=(literal, exclusive)
+        BinOp::Lt => match (lhs, rhs) {
+            (Expr::Field(name), Expr::Literal(_)) => {
+                Some((name.clone(), None, Some((rhs.clone(), false))))
+            }
+            (Expr::Literal(_), Expr::Field(name)) => {
+                Some((name.clone(), Some((lhs.clone(), false)), None))
+            }
+            _ => None,
+        },
+        // .col <= literal  →  upper=(literal, inclusive)
+        BinOp::Lte => match (lhs, rhs) {
+            (Expr::Field(name), Expr::Literal(_)) => {
+                Some((name.clone(), None, Some((rhs.clone(), true))))
+            }
+            (Expr::Literal(_), Expr::Field(name)) => {
+                Some((name.clone(), Some((lhs.clone(), true)), None))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// If the predicate is an inequality or a conjunction of two inequalities
+/// on the same indexed column, return a RangeScan plan node.
+/// Handles: `.col > lit`, `.col >= lit`, `.col < lit`, `.col <= lit`,
+/// and AND-conjunctions like `.col >= low AND .col <= high` (BETWEEN pattern).
+fn try_extract_range_index_keys(table: &str, pred: &Expr) -> Option<PlanNode> {
+    // Case 1: AND conjunction — try to merge two bounds on the same column.
+    if let Expr::BinaryOp(lhs, BinOp::And, rhs) = pred {
+        if let (Some((col1, s1, e1)), Some((col2, s2, e2))) =
+            (extract_single_bound(lhs), extract_single_bound(rhs))
+        {
+            if col1 == col2 {
+                let start = s1.or(s2);
+                let end = e1.or(e2);
+                if start.is_some() || end.is_some() {
+                    return Some(PlanNode::RangeScan {
+                        table: table.to_string(),
+                        column: col1,
+                        start,
+                        end,
+                    });
+                }
+            }
+        }
+    }
+
+    // Case 2: single inequality.
+    if let Some((col, start, end)) = extract_single_bound(pred) {
+        return Some(PlanNode::RangeScan {
+            table: table.to_string(),
+            column: col,
+            start,
+            end,
+        });
+    }
+
+    None
 }
 
 /// Walk projection fields, replacing every `Expr::Window { .. }` with
@@ -482,7 +592,7 @@ mod tests {
     #[test]
     fn test_plan_filter() {
         let plan = plan("User filter .age > 30").unwrap();
-        assert!(matches!(plan, PlanNode::Filter { .. }));
+        assert!(matches!(plan, PlanNode::RangeScan { .. }));
     }
 
     #[test]
@@ -538,13 +648,17 @@ mod tests {
 
     #[test]
     fn test_plan_non_eq_stays_filter() {
-        // `>` isn't index-eligible under this simple rewrite. Stays SeqScan+Filter.
+        // `>` now emits a RangeScan instead of SeqScan+Filter.
         let plan = plan("User filter .age > 30").unwrap();
         match plan {
-            PlanNode::Filter { input, .. } => {
-                assert!(matches!(*input, PlanNode::SeqScan { .. }));
+            PlanNode::RangeScan { column, start, end, .. } => {
+                assert_eq!(column, "age");
+                assert!(start.is_some(), "expected lower bound");
+                assert!(end.is_none(), "expected no upper bound");
+                let (_, inclusive) = start.unwrap();
+                assert!(!inclusive, "expected exclusive lower bound for >");
             }
-            other => panic!("expected Filter(SeqScan), got {other:?}"),
+            other => panic!("expected RangeScan, got {other:?}"),
         }
     }
 
@@ -575,13 +689,14 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_update_range_stays_filter() {
+    fn test_plan_update_range_stays_range_scan() {
         let plan = plan("User filter .age > 30 update { age := 31 }").unwrap();
         match plan {
             PlanNode::Update { input, .. } => {
-                assert!(matches!(*input, PlanNode::Filter { .. }));
+                assert!(matches!(*input, PlanNode::RangeScan { .. }),
+                    "expected Update(RangeScan), got {input:?}");
             }
-            other => panic!("expected Update(Filter), got {other:?}"),
+            other => panic!("expected Update, got {other:?}"),
         }
     }
 
@@ -783,8 +898,8 @@ mod tests {
         let plan = plan("explain User filter .age > 30").unwrap();
         match plan {
             PlanNode::Explain { input } => {
-                assert!(matches!(*input, PlanNode::Filter { .. }),
-                    "expected Explain(Filter), got {:?}", input);
+                assert!(matches!(*input, PlanNode::RangeScan { .. }),
+                    "expected Explain(RangeScan), got {:?}", input);
             }
             other => panic!("expected Explain, got {other:?}"),
         }
