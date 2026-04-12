@@ -66,7 +66,7 @@ pub trait BenchEngine {
     fn point_lookup_indexed(&self, id: i64) -> Option<String>;
 
     /// 2. `point_lookup_nonindexed` — single-row lookup on a non-indexed
-    /// int column (forces a sequential scan).
+    ///    int column (forces a sequential scan).
     fn point_lookup_nonindexed(&self, created_at: i64) -> Option<String>;
 
     /// 3. `scan_filter_count` — count rows matching an int-range predicate.
@@ -107,7 +107,7 @@ pub trait BenchEngine {
     );
 
     /// 12. `insert_batch` — insert a prebuilt batch of rows inside one
-    /// transaction (the harness supplies 1_000 rows per call).
+    ///     transaction (the harness supplies 1_000 rows per call).
     fn insert_batch(&mut self, rows: &[(i64, String, i64, String, String, i64)]);
 
     /// 13. `update_by_pk` — update a single row by primary key.

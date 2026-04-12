@@ -12,7 +12,7 @@
 
 use powdb_query::executor::Engine;
 use powdb_storage::types::*;
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::Instant;
 
 const N_ROWS: usize = 50_000;
@@ -41,7 +41,7 @@ fn main() {
 
 // ───── 1. Insert throughput (direct path, no PowQL parse) ──────────────────
 
-fn bench_insert(engine: &mut Engine, data_dir: &PathBuf) {
+fn bench_insert(engine: &mut Engine, data_dir: &Path) {
     // Create schema via the engine so the catalog persists it.
     engine
         .execute_powql(
@@ -88,7 +88,7 @@ fn bench_index_lookup(engine: &mut Engine) {
     // Warm-up. Not statistically rigorous — just gets caches into a
     // consistent-ish state.
     for i in 0..1_000 {
-        let _ = table.index_lookup("id", &Value::Int((i % N_ROWS as i64) as i64));
+        let _ = table.index_lookup("id", &Value::Int(i % N_ROWS as i64));
     }
 
     let start = Instant::now();

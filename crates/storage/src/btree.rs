@@ -306,9 +306,7 @@ impl BTree {
                 let child_id = children[pos];
                 // Borrow on self.nodes[node_id] ends here.
 
-                let Some((mid_key, new_child_id)) = self.insert_recursive(child_id, key, rid) else {
-                    return None;
-                };
+                let (mid_key, new_child_id) = self.insert_recursive(child_id, key, rid)?;
 
                 // Re-borrow to insert the promoted key; possibly split this
                 // internal node. All work that needs the borrow happens
@@ -505,13 +503,8 @@ impl BTree {
         // Walk to the leftmost leaf. From there we can follow `next_leaf`
         // to visit every leaf in order — matching the sorted-key cursor.
         let mut node_id = self.root;
-        loop {
-            match &self.nodes[node_id] {
-                Node::Internal { children, .. } => {
-                    node_id = children[0];
-                }
-                Node::Leaf { .. } => break,
-            }
+        while let Node::Internal { children, .. } = &self.nodes[node_id] {
+            node_id = children[0];
         }
 
         let mut total_removed = 0usize;
@@ -614,15 +607,10 @@ impl BTree {
     pub fn range<'a>(&'a self, start: &Value, end: &Value) -> impl Iterator<Item = (Value, RowId)> + 'a {
         // Find the leaf containing `start`
         let mut node_id = self.root;
-        loop {
-            match &self.nodes[node_id] {
-                Node::Internal { keys, children } => {
-                    // Mission D1: binary search for child descent.
-                    let pos = keys.partition_point(|k| k <= start);
-                    node_id = children[pos];
-                }
-                Node::Leaf { .. } => break,
-            }
+        while let Node::Internal { keys, children } = &self.nodes[node_id] {
+            // Mission D1: binary search for child descent.
+            let pos = keys.partition_point(|k| k <= start);
+            node_id = children[pos];
         }
 
         // Walk leaf chain collecting results
@@ -654,18 +642,69 @@ impl BTree {
         results.into_iter()
     }
 
+    /// Range scan from `start` to the end of the tree (start <= key).
+    pub fn range_from(&self, start: &Value) -> Vec<(Value, RowId)> {
+        let mut node_id = self.root;
+        while let Node::Internal { keys, children } = &self.nodes[node_id] {
+            let pos = keys.partition_point(|k| k <= start);
+            node_id = children[pos];
+        }
+        let start = start.clone();
+        let mut results = Vec::new();
+        let mut current = Some(node_id);
+        while let Some(nid) = current {
+            match &self.nodes[nid] {
+                Node::Leaf { keys, values, next_leaf } => {
+                    for (i, k) in keys.iter().enumerate() {
+                        if k >= &start {
+                            results.push((k.clone(), values[i]));
+                        }
+                    }
+                    current = *next_leaf;
+                }
+                _ => break,
+            }
+        }
+        results
+    }
+
+    /// Range scan from the beginning of the tree to `end` (key <= end).
+    pub fn range_to(&self, end: &Value) -> Vec<(Value, RowId)> {
+        // Find the leftmost leaf.
+        let mut node_id = self.root;
+        while let Node::Internal { children, .. } = &self.nodes[node_id] {
+            node_id = children[0];
+        }
+        let end = end.clone();
+        let mut results = Vec::new();
+        let mut current = Some(node_id);
+        while let Some(nid) = current {
+            match &self.nodes[nid] {
+                Node::Leaf { keys, values, next_leaf } => {
+                    let mut done = false;
+                    for (i, k) in keys.iter().enumerate() {
+                        if k > &end {
+                            done = true;
+                            break;
+                        }
+                        results.push((k.clone(), values[i]));
+                    }
+                    if done { break; }
+                    current = *next_leaf;
+                }
+                _ => break,
+            }
+        }
+        results
+    }
+
     /// Number of entries in the tree.
     pub fn len(&self) -> usize {
         let mut count = 0;
         let mut node_id = self.root;
         // Find leftmost leaf
-        loop {
-            match &self.nodes[node_id] {
-                Node::Leaf { .. } => break,
-                Node::Internal { children, .. } => {
-                    node_id = children[0];
-                }
-            }
+        while let Node::Internal { children, .. } = &self.nodes[node_id] {
+            node_id = children[0];
         }
         // Walk leaf chain
         let mut current = Some(node_id);

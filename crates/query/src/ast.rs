@@ -12,6 +12,8 @@ pub enum Statement {
     RefreshView(RefreshViewExpr),
     DropView(DropViewExpr),
     Union(UnionExpr),
+    Upsert(UpsertExpr),
+    Explain(Box<Statement>),
 }
 
 /// `alter User add column status: str` / `alter User drop column status`
@@ -157,6 +159,17 @@ pub struct Assignment {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `upsert User on .id { id := 1, name := "Alice" } [on conflict { name := "Alice" }]`
+pub struct UpsertExpr {
+    pub target: String,
+    pub key_column: String,
+    pub assignments: Vec<Assignment>,
+    /// Assignments to apply on conflict. If empty, all non-key assignments
+    /// from `assignments` are used as the update set.
+    pub on_conflict: Vec<Assignment>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct CreateTypeExpr {
     pub name: String,
     pub fields: Vec<FieldDef>,
@@ -185,6 +198,19 @@ pub enum AggFunc {
     Max,
 }
 
+/// Window function identifier.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WindowFunc {
+    RowNumber,
+    Rank,
+    DenseRank,
+    Sum,
+    Avg,
+    Count,
+    Min,
+    Max,
+}
+
 /// Scalar (non-aggregate) function — operates on single values.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScalarFn {
@@ -194,6 +220,28 @@ pub enum ScalarFn {
     Trim,
     Substring,  // substring(expr, start, len) — 1-indexed
     Concat,     // concat(expr, expr, ...) — variadic
+    // Math
+    Abs,
+    Round,      // round(expr) or round(expr, decimals)
+    Ceil,
+    Floor,
+    Sqrt,
+    Pow,        // pow(base, exponent)
+    // Date/time
+    Now,        // now() — returns current unix timestamp in microseconds
+    Extract,    // extract("year"|"month"|..., datetime_expr)
+    DateAdd,    // date_add(datetime_expr, amount, "unit")
+    DateDiff,   // date_diff(dt1, dt2, "unit")
+}
+
+/// Target type for CAST expressions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CastType {
+    Int,
+    Float,
+    Str,
+    Bool,
+    DateTime,
 }
 
 /// Expressions.
@@ -227,6 +275,15 @@ pub enum Expr {
         whens: Vec<(Box<Expr>, Box<Expr>)>,
         else_expr: Option<Box<Expr>>,
     },
+    /// Window function: `func(args) over (partition ... order ...)`
+    Window {
+        function: WindowFunc,
+        args: Vec<Expr>,
+        partition_by: Vec<String>,
+        order_by: Vec<OrderKey>,
+    },
+    /// Type cast: `cast(expr, "int")` or `cast(expr, "str")` etc.
+    Cast(Box<Expr>, CastType),
 }
 
 #[derive(Debug, Clone, PartialEq)]

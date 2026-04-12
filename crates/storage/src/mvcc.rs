@@ -16,6 +16,12 @@ pub struct UndoLog {
     entries: Vec<UndoEntry>,
 }
 
+impl Default for UndoLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UndoLog {
     pub fn new() -> Self {
         UndoLog { entries: Vec::new() }

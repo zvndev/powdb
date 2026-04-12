@@ -25,6 +25,7 @@ pub enum Token {
     Link,       // link
     Index,      // index
     On,         // on
+    Conflict,   // conflict
     Asc,        // asc
     Desc,       // desc
     And,        // and
@@ -67,6 +68,23 @@ pub enum Token {
     Substring,  // substring
     Concat,     // concat
 
+    // Math functions
+    Abs,        // abs
+    Round,      // round
+    Ceil,       // ceil
+    Floor,      // floor
+    Sqrt,       // sqrt
+    Pow,        // pow
+
+    // Date/time functions
+    Now,        // now
+    Extract,    // extract
+    DateAdd,    // date_add
+    DateDiff,   // date_diff
+
+    // Type conversion
+    Cast,       // cast
+
     // CASE WHEN
     Case,       // case
     When,       // when
@@ -74,11 +92,19 @@ pub enum Token {
     Else,       // else
     End,        // end
 
+    // Window functions
+    Over,       // over
+    Partition,  // partition
+    RowNumber,  // row_number
+    Rank,       // rank
+    DenseRank,  // dense_rank
+
     // DDL
     Alter,      // alter
     Drop,       // drop
     Add,        // add
     Column,     // column
+    Explain,    // explain
 
     // Operators
     Eq,         // =

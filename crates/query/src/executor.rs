@@ -5,7 +5,7 @@ use crate::plan_cache::PlanCache;
 use crate::planner;
 use crate::result::QueryResult;
 use powdb_storage::catalog::Catalog;
-use powdb_storage::row::{RowLayout, decode_column, decode_row};
+use powdb_storage::row::{RowLayout, decode_column, decode_row, patch_var_column_in_place};
 use powdb_storage::types::*;
 use powdb_storage::view::{ViewDef, ViewRegistry};
 use std::cmp::Reverse;
@@ -136,6 +136,7 @@ pub fn is_read_only_statement(stmt: &Statement) -> bool {
             is_read_only_statement(&u.left) && is_read_only_statement(&u.right)
         }
         Statement::Insert(_)
+        | Statement::Upsert(_)
         | Statement::UpdateQuery(_)
         | Statement::DeleteQuery(_)
         | Statement::CreateType(_)
@@ -144,6 +145,7 @@ pub fn is_read_only_statement(stmt: &Statement) -> bool {
         | Statement::CreateView(_)
         | Statement::RefreshView(_)
         | Statement::DropView(_) => false,
+        Statement::Explain(inner) => is_read_only_statement(inner),
     }
 }
 
@@ -542,8 +544,84 @@ impl Engine {
                 Ok(QueryResult::Rows { columns, rows })
             }
 
+            PlanNode::RangeScan { table, column, start, end } => {
+                let tbl = self.catalog.get_table(table)
+                    .ok_or_else(|| format!("table '{table}' not found"))?;
+                let columns: Vec<String> = tbl.schema.columns.iter().map(|c| c.name.clone()).collect();
+                let schema = tbl.schema.clone();
+
+                let start_val = match start {
+                    Some((expr, _)) => Some(literal_to_value(expr)?),
+                    None => None,
+                };
+                let end_val = match end {
+                    Some((expr, _)) => Some(literal_to_value(expr)?),
+                    None => None,
+                };
+                let start_inclusive = start.as_ref().map(|(_, inc)| *inc).unwrap_or(true);
+                let end_inclusive = end.as_ref().map(|(_, inc)| *inc).unwrap_or(true);
+
+                if let Some(btree) = tbl.index(column) {
+                    let hits: Vec<(Value, RowId)> = match (&start_val, &end_val) {
+                        (Some(s), Some(e)) => btree.range(s, e).collect(),
+                        (Some(s), None) => btree.range_from(s),
+                        (None, Some(e)) => btree.range_to(e),
+                        (None, None) => {
+                            // Unbounded both sides — equivalent to seq scan.
+                            let rows: Vec<Vec<Value>> = tbl.scan()
+                                .map(|(_, row)| row)
+                                .collect();
+                            return Ok(QueryResult::Rows { columns, rows });
+                        }
+                    };
+                    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(hits.len());
+                    for (key, rid) in hits {
+                        // Filter for exclusive bounds.
+                        if !start_inclusive {
+                            if let Some(ref s) = start_val {
+                                if &key == s { continue; }
+                            }
+                        }
+                        if !end_inclusive {
+                            if let Some(ref e) = end_val {
+                                if &key == e { continue; }
+                            }
+                        }
+                        if let Some(data) = tbl.heap.get(rid) {
+                            rows.push(decode_row(&schema, &data));
+                        }
+                    }
+                    return Ok(QueryResult::Rows { columns, rows });
+                }
+
+                // Fallback: no index — synthesize the range predicate and scan.
+                let fast = FastLayout::new(&schema);
+                let synth = synthesize_range_predicate(column, start, end);
+                if let Some(compiled) = compile_predicate(&synth, &columns, &fast, &schema) {
+                    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
+                    self.catalog.for_each_row_raw(table, |_rid, data| {
+                        if compiled(data) {
+                            rows.push(decode_row(&schema, data));
+                        }
+                    }).map_err(|e| e.to_string())?;
+                    return Ok(QueryResult::Rows { columns, rows });
+                }
+
+                // Last resort: decoded row eval.
+                let col_idx = schema.column_index(column)
+                    .ok_or_else(|| format!("column '{column}' not found"))?;
+                let rows: Vec<Vec<Value>> = tbl.scan()
+                    .filter(|(_, row)| range_matches(&row[col_idx], &start_val, start_inclusive, &end_val, end_inclusive))
+                    .map(|(_, row)| row)
+                    .collect();
+                Ok(QueryResult::Rows { columns, rows })
+            }
+
             PlanNode::Filter { input, predicate } => {
                 // Materialise subqueries using the `&self` variant.
+                // Uncorrelated subqueries are replaced with InList/Bool;
+                // correlated ones are left as InSubquery/ExistsSubquery
+                // for per-row materialisation below.
                 let materialized;
                 let predicate = if contains_subquery(predicate) {
                     materialized = self.materialize_subqueries_readonly(predicate)?;
@@ -551,6 +629,26 @@ impl Engine {
                 } else {
                     predicate
                 };
+
+                // Correlated subquery path: per-row materialisation.
+                if contains_subquery(predicate) {
+                    let result = self.execute_plan_readonly(input)?;
+                    return match result {
+                        QueryResult::Rows { columns, rows } => {
+                            let mut filtered = Vec::new();
+                            for row in rows {
+                                let row_pred = self.materialize_correlated_for_row_readonly(
+                                    predicate, &row, &columns,
+                                )?;
+                                if eval_predicate(&row_pred, &row, &columns) {
+                                    filtered.push(row);
+                                }
+                            }
+                            Ok(QueryResult::Rows { columns, rows: filtered })
+                        }
+                        _ => Err("filter requires row input".into()),
+                    };
+                }
 
                 // Fused Filter+SeqScan fast path.
                 if let PlanNode::SeqScan { table } = input.as_ref() {
@@ -598,15 +696,14 @@ impl Engine {
             }
 
             PlanNode::Project { input, fields } => {
-                // Fast path: Project over IndexScan.
+                // Fast path: Project over IndexScan. Avoids full-row decode
+                // by calling decode_column only for projected fields.
                 if let PlanNode::IndexScan { table, column, key } = input.as_ref() {
-                    let schema = self.catalog.schema(table)
-                        .ok_or_else(|| format!("table '{table}' not found"))?
-                        .clone();
-                    let all_columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
                     let key_value = literal_to_value(key)?;
                     let tbl = self.catalog.get_table(table)
                         .ok_or_else(|| format!("table '{table}' not found"))?;
+                    let schema = &tbl.schema;
+                    let layout = tbl.row_layout();
 
                     let proj_columns: Vec<String> = fields.iter().map(|f| {
                         f.alias.clone().unwrap_or_else(|| match &f.expr {
@@ -617,14 +714,13 @@ impl Engine {
 
                     let proj_indices: Vec<usize> = fields.iter().filter_map(|f| {
                         if let Expr::Field(name) = &f.expr {
-                            all_columns.iter().position(|c| c == name)
+                            schema.column_index(name)
                         } else {
                             None
                         }
                     }).collect();
 
                     if let Some(btree) = tbl.index(column) {
-                        let layout = RowLayout::new(&schema);
                         let lookup_result = match &key_value {
                             Value::Int(k) => btree.lookup_int(*k),
                             other => btree.lookup(other),
@@ -633,7 +729,7 @@ impl Engine {
                             Some(rid) => match tbl.heap.get(rid) {
                                 Some(data) => {
                                     let row: Vec<Value> = proj_indices.iter()
-                                        .map(|&ci| decode_column(&schema, &layout, &data, ci))
+                                        .map(|&ci| decode_column(schema, layout, &data, ci))
                                         .collect();
                                     vec![row]
                                 }
@@ -749,7 +845,7 @@ impl Engine {
                     QueryResult::Rows { columns, mut rows } => {
                         let key_indices: Vec<(usize, bool)> = keys.iter().map(|k| {
                             let idx = columns.iter().position(|c| c == &k.field)
-                                .expect(&format!("column '{}' not found", k.field));
+                                .unwrap_or_else(|| panic!("column '{}' not found", k.field));
                             (idx, k.descending)
                         }).collect();
                         rows.sort_by(|a, b| {
@@ -1071,6 +1167,11 @@ impl Engine {
                 Ok(QueryResult::Rows { columns, rows })
             }
 
+            PlanNode::Window { input, windows } => {
+                let result = self.execute_plan_readonly(input)?;
+                execute_window(result, windows)
+            }
+
             PlanNode::Union { left, right, all } => {
                 let left_result = self.execute_plan_readonly(left)?;
                 let right_result = self.execute_plan_readonly(right)?;
@@ -1099,10 +1200,21 @@ impl Engine {
                 Ok(QueryResult::Rows { columns: left_cols, rows: combined })
             }
 
+            PlanNode::Explain { input } => {
+                let text = format_plan_tree(input, 0);
+                Ok(QueryResult::Rows {
+                    columns: vec!["plan".to_string()],
+                    rows: text.lines()
+                        .map(|line| vec![Value::Str(line.to_string())])
+                        .collect(),
+                })
+            }
+
             // All write variants — caller must escalate to the write lock.
             PlanNode::Insert { .. }
             | PlanNode::Update { .. }
             | PlanNode::Delete { .. }
+            | PlanNode::Upsert { .. }
             | PlanNode::CreateTable { .. }
             | PlanNode::AlterTable { .. }
             | PlanNode::DropTable { .. }
@@ -1121,6 +1233,16 @@ impl Engine {
     fn materialize_subqueries_readonly(&self, expr: &Expr) -> Result<Expr, String> {
         match expr {
             Expr::InSubquery { expr: inner, subquery, negated } => {
+                if is_correlated_subquery(subquery, &self.catalog) {
+                    // Pass through — will be materialized per-row in the
+                    // Filter handler's correlated subquery path.
+                    let inner = self.materialize_subqueries_readonly(inner)?;
+                    return Ok(Expr::InSubquery {
+                        expr: Box::new(inner),
+                        subquery: subquery.clone(),
+                        negated: *negated,
+                    });
+                }
                 let inner = self.materialize_subqueries_readonly(inner)?;
                 let sub_plan = crate::planner::plan_statement(
                     Statement::Query(*subquery.clone()),
@@ -1144,6 +1266,9 @@ impl Engine {
                 })
             }
             Expr::ExistsSubquery { subquery, negated } => {
+                if is_correlated_subquery(subquery, &self.catalog) {
+                    return Ok(expr.clone());
+                }
                 let sub_plan = crate::planner::plan_statement(
                     Statement::Query(*subquery.clone()),
                 ).map_err(|e| e.message)?;
@@ -1175,6 +1300,79 @@ impl Engine {
                     None => None,
                 };
                 Ok(Expr::Case { whens, else_expr })
+            }
+            other => Ok(other.clone()),
+        }
+    }
+
+    /// Per-row materialisation of correlated subqueries. For each row in the
+    /// outer query, substitute outer column references in the subquery's
+    /// filter with the current row's literal values, execute the modified
+    /// subquery, and return the result as an InList or Bool literal.
+    fn materialize_correlated_for_row_readonly(
+        &self,
+        expr: &Expr,
+        outer_row: &[Value],
+        outer_columns: &[String],
+    ) -> Result<Expr, String> {
+        match expr {
+            Expr::InSubquery { expr: inner, subquery, negated } => {
+                let inner = self.materialize_correlated_for_row_readonly(
+                    inner, outer_row, outer_columns,
+                )?;
+                let mut sub = *subquery.clone();
+                if let Some(ref filter) = sub.filter {
+                    sub.filter = Some(substitute_outer_refs(
+                        filter, &sub.source, &self.catalog, outer_row, outer_columns,
+                    ));
+                }
+                let sub_plan = crate::planner::plan_statement(
+                    Statement::Query(sub),
+                ).map_err(|e| e.message)?;
+                let result = self.execute_plan_readonly(&sub_plan)?;
+                let values = match result {
+                    QueryResult::Rows { rows, .. } => {
+                        rows.into_iter()
+                            .filter_map(|mut row| {
+                                if row.is_empty() { None }
+                                else { Some(value_to_expr(row.swap_remove(0))) }
+                            })
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                };
+                Ok(Expr::InList {
+                    expr: Box::new(inner),
+                    list: values,
+                    negated: *negated,
+                })
+            }
+            Expr::ExistsSubquery { subquery, negated } => {
+                let mut sub = *subquery.clone();
+                if let Some(ref filter) = sub.filter {
+                    sub.filter = Some(substitute_outer_refs(
+                        filter, &sub.source, &self.catalog, outer_row, outer_columns,
+                    ));
+                }
+                let sub_plan = crate::planner::plan_statement(
+                    Statement::Query(sub),
+                ).map_err(|e| e.message)?;
+                let result = self.execute_plan_readonly(&sub_plan)?;
+                let has_rows = match result {
+                    QueryResult::Rows { rows, .. } => !rows.is_empty(),
+                    _ => false,
+                };
+                let truth = if *negated { !has_rows } else { has_rows };
+                Ok(Expr::Literal(Literal::Bool(truth)))
+            }
+            Expr::BinaryOp(l, op, r) => {
+                let l = self.materialize_correlated_for_row_readonly(l, outer_row, outer_columns)?;
+                let r = self.materialize_correlated_for_row_readonly(r, outer_row, outer_columns)?;
+                Ok(Expr::BinaryOp(Box::new(l), *op, Box::new(r)))
+            }
+            Expr::UnaryOp(op, inner) => {
+                let inner = self.materialize_correlated_for_row_readonly(inner, outer_row, outer_columns)?;
+                Ok(Expr::UnaryOp(*op, Box::new(inner)))
             }
             other => Ok(other.clone()),
         }
@@ -1572,6 +1770,14 @@ impl Engine {
     fn materialize_subqueries(&mut self, expr: &Expr) -> Result<Expr, String> {
         match expr {
             Expr::InSubquery { expr: inner, subquery, negated } => {
+                if is_correlated_subquery(subquery, &self.catalog) {
+                    let inner = self.materialize_subqueries(inner)?;
+                    return Ok(Expr::InSubquery {
+                        expr: Box::new(inner),
+                        subquery: subquery.clone(),
+                        negated: *negated,
+                    });
+                }
                 let inner = self.materialize_subqueries(inner)?;
                 // Plan and execute the subquery.
                 let sub_plan = crate::planner::plan_statement(
@@ -1596,11 +1802,11 @@ impl Engine {
                 })
             }
             Expr::ExistsSubquery { subquery, negated } => {
+                if is_correlated_subquery(subquery, &self.catalog) {
+                    return Ok(expr.clone());
+                }
                 // Uncorrelated EXISTS: run the subquery once and collapse
-                // into a Bool literal. Correlated subqueries (referencing
-                // outer columns) aren't supported yet — the planner would
-                // fail on the unknown field reference, surfacing a clear
-                // error rather than silently misbehaving.
+                // into a Bool literal.
                 let sub_plan = crate::planner::plan_statement(
                     Statement::Query(*subquery.clone()),
                 ).map_err(|e| e.message)?;
@@ -1638,6 +1844,76 @@ impl Engine {
         }
     }
 
+    /// Write-path per-row materialisation of correlated subqueries.
+    fn materialize_correlated_for_row(
+        &mut self,
+        expr: &Expr,
+        outer_row: &[Value],
+        outer_columns: &[String],
+    ) -> Result<Expr, String> {
+        match expr {
+            Expr::InSubquery { expr: inner, subquery, negated } => {
+                let inner = self.materialize_correlated_for_row(
+                    inner, outer_row, outer_columns,
+                )?;
+                let mut sub = *subquery.clone();
+                if let Some(ref filter) = sub.filter {
+                    sub.filter = Some(substitute_outer_refs(
+                        filter, &sub.source, &self.catalog, outer_row, outer_columns,
+                    ));
+                }
+                let sub_plan = crate::planner::plan_statement(
+                    Statement::Query(sub),
+                ).map_err(|e| e.message)?;
+                let result = self.execute_plan(&sub_plan)?;
+                let values = match result {
+                    QueryResult::Rows { rows, .. } => {
+                        rows.into_iter()
+                            .filter_map(|mut row| {
+                                if row.is_empty() { None }
+                                else { Some(value_to_expr(row.swap_remove(0))) }
+                            })
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                };
+                Ok(Expr::InList {
+                    expr: Box::new(inner),
+                    list: values,
+                    negated: *negated,
+                })
+            }
+            Expr::ExistsSubquery { subquery, negated } => {
+                let mut sub = *subquery.clone();
+                if let Some(ref filter) = sub.filter {
+                    sub.filter = Some(substitute_outer_refs(
+                        filter, &sub.source, &self.catalog, outer_row, outer_columns,
+                    ));
+                }
+                let sub_plan = crate::planner::plan_statement(
+                    Statement::Query(sub),
+                ).map_err(|e| e.message)?;
+                let result = self.execute_plan(&sub_plan)?;
+                let has_rows = match result {
+                    QueryResult::Rows { rows, .. } => !rows.is_empty(),
+                    _ => false,
+                };
+                let truth = if *negated { !has_rows } else { has_rows };
+                Ok(Expr::Literal(Literal::Bool(truth)))
+            }
+            Expr::BinaryOp(l, op, r) => {
+                let l = self.materialize_correlated_for_row(l, outer_row, outer_columns)?;
+                let r = self.materialize_correlated_for_row(r, outer_row, outer_columns)?;
+                Ok(Expr::BinaryOp(Box::new(l), *op, Box::new(r)))
+            }
+            Expr::UnaryOp(op, inner) => {
+                let inner = self.materialize_correlated_for_row(inner, outer_row, outer_columns)?;
+                Ok(Expr::UnaryOp(*op, Box::new(inner)))
+            }
+            other => Ok(other.clone()),
+        }
+    }
+
     pub fn execute_plan(&mut self, plan: &PlanNode) -> Result<QueryResult, String> {
         match plan {
             PlanNode::SeqScan { table } => {
@@ -1659,6 +1935,7 @@ impl Engine {
             PlanNode::Filter { input, predicate } => {
                 // Materialize any IN-subqueries in the predicate before the
                 // scan loop — the closure can't call back into the engine.
+                // Correlated subqueries are left in place for per-row eval.
                 let materialized;
                 let predicate = if contains_subquery(predicate) {
                     materialized = self.materialize_subqueries(predicate)?;
@@ -1666,6 +1943,26 @@ impl Engine {
                 } else {
                     predicate
                 };
+
+                // Correlated subquery path: per-row materialisation.
+                if contains_subquery(predicate) {
+                    let result = self.execute_plan(input)?;
+                    return match result {
+                        QueryResult::Rows { columns, rows } => {
+                            let mut filtered = Vec::new();
+                            for row in rows {
+                                let row_pred = self.materialize_correlated_for_row(
+                                    predicate, &row, &columns,
+                                )?;
+                                if eval_predicate(&row_pred, &row, &columns) {
+                                    filtered.push(row);
+                                }
+                            }
+                            Ok(QueryResult::Rows { columns, rows: filtered })
+                        }
+                        _ => Err("filter requires row input".into()),
+                    };
+                }
 
                 // Fast path: fuse Filter + SeqScan into a zero-copy streaming
                 // loop. Uses decode_column() to evaluate the predicate on only
@@ -1900,7 +2197,7 @@ impl Engine {
                     QueryResult::Rows { columns, mut rows } => {
                         let key_indices: Vec<(usize, bool)> = keys.iter().map(|k| {
                             let idx = columns.iter().position(|c| c == &k.field)
-                                .expect(&format!("column '{}' not found", k.field));
+                                .unwrap_or_else(|| panic!("column '{}' not found", k.field));
                             (idx, k.descending)
                         }).collect();
                         rows.sort_by(|a, b| {
@@ -2115,6 +2412,84 @@ impl Engine {
                 Ok(QueryResult::Modified(1))
             }
 
+            PlanNode::Upsert { table, key_column, assignments, on_conflict } => {
+                // Build the insert values from assignments.
+                let (values, key_idx) = {
+                    let schema = self.catalog.schema(table)
+                        .ok_or_else(|| format!("table '{table}' not found"))?;
+                    let mut values = vec![Value::Empty; schema.columns.len()];
+                    for a in assignments {
+                        let idx = schema.column_index(&a.field)
+                            .ok_or_else(|| format!("column '{}' not found", a.field))?;
+                        values[idx] = literal_to_value(&a.value)?;
+                    }
+                    let key_idx = schema.column_index(key_column)
+                        .ok_or_else(|| format!("key column '{key_column}' not found"))?;
+                    (values, key_idx)
+                };
+
+                let key_value = values[key_idx].clone();
+
+                // Probe the index for a conflict.
+                let existing = {
+                    let tbl = self.catalog.get_table(table)
+                        .ok_or_else(|| format!("table '{table}' not found"))?;
+                    if let Some(btree) = tbl.index(key_column) {
+                        let hit = match &key_value {
+                            Value::Int(k) => btree.lookup_int(*k),
+                            other => btree.lookup(other),
+                        };
+                        hit.and_then(|rid| {
+                            tbl.heap.get(rid).map(|data| {
+                                (rid, decode_row(&tbl.schema, &data))
+                            })
+                        })
+                    } else {
+                        // No index — linear scan for the key.
+                        let mut found = None;
+                        for (rid, row) in tbl.scan() {
+                            if row[key_idx] == key_value {
+                                found = Some((rid, row));
+                                break;
+                            }
+                        }
+                        found
+                    }
+                };
+
+                if let Some((rid, mut existing_row)) = existing {
+                    // Conflict: apply on_conflict assignments (or all non-key if empty).
+                    let update_assignments = if on_conflict.is_empty() {
+                        assignments
+                    } else {
+                        on_conflict
+                    };
+                    let changed_cols: Vec<usize> = {
+                        let schema = self.catalog.schema(table)
+                            .ok_or_else(|| format!("table '{table}' not found"))?;
+                        let mut indices = Vec::new();
+                        for a in update_assignments {
+                            let idx = schema.column_index(&a.field)
+                                .ok_or_else(|| format!("column '{}' not found", a.field))?;
+                            if idx != key_idx {
+                                existing_row[idx] = literal_to_value(&a.value)?;
+                                indices.push(idx);
+                            }
+                        }
+                        indices
+                    };
+                    self.catalog.update_hinted(table, rid, &existing_row, Some(&changed_cols))
+                        .map_err(|e| e.to_string())?;
+                    self.view_registry.mark_dependents_dirty(table);
+                    Ok(QueryResult::Modified(1))
+                } else {
+                    // No conflict: insert.
+                    self.catalog.insert(table, &values).map_err(|e| e.to_string())?;
+                    self.view_registry.mark_dependents_dirty(table);
+                    Ok(QueryResult::Modified(1))
+                }
+            }
+
             PlanNode::Update { input, table, assignments } => {
                 // Mission C Phase 3: resolve assignments against a borrowed
                 // schema, then drop the borrow before the mutation loop.
@@ -2140,6 +2515,27 @@ impl Engine {
                 // Mission C Phase 2: the hint Table::update_hinted needs to
                 // decide whether to read the old row for index diff.
                 let changed_cols: Vec<usize> = col_indices.clone();
+
+                // ── Fused scan+update for Update(Filter(SeqScan)) ────────
+                // Perf sprint: instead of the two-pass collect-RIDs-then-loop
+                // pattern (which pays one ensure_hot per matched row on the
+                // second pass), fuse the predicate evaluation and in-place
+                // byte-level mutation into a single heap walk. Same idea as
+                // the fused scan_delete_matching path for deletes.
+                if let Some(ref resolved_assignments) = resolved_assignments {
+                    if let PlanNode::Filter { input: inner, predicate } = input.as_ref() {
+                        if let PlanNode::SeqScan { table: t } = inner.as_ref() {
+                            if t == table {
+                                let fused_result = self.try_fused_scan_update(
+                                    table, predicate, resolved_assignments, &changed_cols,
+                                );
+                                if let Some(result) = fused_result {
+                                    return result;
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Collect matching RowIds in a single pass.
                 let matching_rids = self.collect_rids_for_mutation(input, table)?;
@@ -2497,7 +2893,7 @@ impl Engine {
             }
 
             PlanNode::Distinct { input } => {
-                let result = self.execute_plan(&input)?;
+                let result = self.execute_plan(input)?;
                 match result {
                     QueryResult::Rows { columns, rows } => {
                         let mut seen = std::collections::HashSet::new();
@@ -2653,6 +3049,11 @@ impl Engine {
                 })
             }
 
+            PlanNode::Window { input, windows } => {
+                let result = self.execute_plan(input)?;
+                execute_window(result, windows)
+            }
+
             PlanNode::Union { left, right, all } => {
                 let left_result = self.execute_plan(left)?;
                 let right_result = self.execute_plan(right)?;
@@ -2684,15 +3085,21 @@ impl Engine {
                 Ok(QueryResult::Rows { columns: left_cols, rows: combined })
             }
 
-            PlanNode::IndexScan { table, column, key } => {
-                let schema = self.catalog.schema(table)
-                    .ok_or_else(|| format!("table '{table}' not found"))?
-                    .clone();
-                let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-                let key_value = literal_to_value(key)?;
+            PlanNode::Explain { input } => {
+                let text = format_plan_tree(input, 0);
+                Ok(QueryResult::Rows {
+                    columns: vec!["plan".to_string()],
+                    rows: text.lines()
+                        .map(|line| vec![Value::Str(line.to_string())])
+                        .collect(),
+                })
+            }
 
+            PlanNode::IndexScan { table, column, key } => {
+                let key_value = literal_to_value(key)?;
                 let tbl = self.catalog.get_table(table)
                     .ok_or_else(|| format!("table '{table}' not found"))?;
+                let columns: Vec<String> = tbl.schema.columns.iter().map(|c| c.name.clone()).collect();
 
                 // Fast path: the table has a B-tree on this column. A single
                 // point lookup returns 0 or 1 rows — this is the whole reason
@@ -2725,18 +3132,19 @@ impl Engine {
                 // first one. A non-indexed column isn't necessarily unique.
                 // We compile the eq predicate once and stream without any
                 // per-row decode for non-matching rows.
-                let fast = FastLayout::new(&schema);
+                let schema = &tbl.schema;
+                let fast = FastLayout::new(schema);
                 let synth_pred = Expr::BinaryOp(
                     Box::new(Expr::Field(column.clone())),
                     BinOp::Eq,
                     Box::new(key.clone()),
                 );
-                if let Some(compiled) = compile_predicate(&synth_pred, &columns, &fast, &schema) {
+                if let Some(compiled) = compile_predicate(&synth_pred, &columns, &fast, schema) {
                     // Mission F: skip the first 4 Vec doublings.
                     let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
                     self.catalog.for_each_row_raw(table, |_rid, data| {
                         if compiled(data) {
-                            rows.push(decode_row(&schema, data));
+                            rows.push(decode_row(schema, data));
                         }
                     }).map_err(|e| e.to_string())?;
                     return Ok(QueryResult::Rows { columns, rows });
@@ -2749,6 +3157,76 @@ impl Engine {
                     .filter_map(|(_, row)| {
                         if row[col_idx] == key_value { Some(row) } else { None }
                     })
+                    .collect();
+                Ok(QueryResult::Rows { columns, rows })
+            }
+
+            PlanNode::RangeScan { table, column, start, end } => {
+                let tbl = self.catalog.get_table(table)
+                    .ok_or_else(|| format!("table '{table}' not found"))?;
+                let columns: Vec<String> = tbl.schema.columns.iter().map(|c| c.name.clone()).collect();
+                let schema = &tbl.schema;
+
+                let start_val = match start {
+                    Some((expr, _)) => Some(literal_to_value(expr)?),
+                    None => None,
+                };
+                let end_val = match end {
+                    Some((expr, _)) => Some(literal_to_value(expr)?),
+                    None => None,
+                };
+                let start_inclusive = start.as_ref().map(|(_, inc)| *inc).unwrap_or(true);
+                let end_inclusive = end.as_ref().map(|(_, inc)| *inc).unwrap_or(true);
+
+                if let Some(btree) = tbl.index(column) {
+                    let hits: Vec<(Value, RowId)> = match (&start_val, &end_val) {
+                        (Some(s), Some(e)) => btree.range(s, e).collect(),
+                        (Some(s), None) => btree.range_from(s),
+                        (None, Some(e)) => btree.range_to(e),
+                        (None, None) => {
+                            let rows: Vec<Vec<Value>> = tbl.scan()
+                                .map(|(_, row)| row)
+                                .collect();
+                            return Ok(QueryResult::Rows { columns, rows });
+                        }
+                    };
+                    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(hits.len());
+                    for (key, rid) in hits {
+                        if !start_inclusive {
+                            if let Some(ref s) = start_val {
+                                if &key == s { continue; }
+                            }
+                        }
+                        if !end_inclusive {
+                            if let Some(ref e) = end_val {
+                                if &key == e { continue; }
+                            }
+                        }
+                        if let Some(data) = tbl.heap.get(rid) {
+                            rows.push(decode_row(schema, &data));
+                        }
+                    }
+                    return Ok(QueryResult::Rows { columns, rows });
+                }
+
+                // Fallback: no index — synthesize range predicate and scan.
+                let fast = FastLayout::new(schema);
+                let synth = synthesize_range_predicate(column, start, end);
+                if let Some(compiled) = compile_predicate(&synth, &columns, &fast, schema) {
+                    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
+                    self.catalog.for_each_row_raw(table, |_rid, data| {
+                        if compiled(data) {
+                            rows.push(decode_row(schema, data));
+                        }
+                    }).map_err(|e| e.to_string())?;
+                    return Ok(QueryResult::Rows { columns, rows });
+                }
+
+                let col_idx = schema.column_index(column)
+                    .ok_or_else(|| format!("column '{column}' not found"))?;
+                let rows: Vec<Vec<Value>> = tbl.scan()
+                    .filter(|(_, row)| range_matches(&row[col_idx], &start_val, start_inclusive, &end_val, end_inclusive))
+                    .map(|(_, row)| row)
                     .collect();
                 Ok(QueryResult::Rows { columns, rows })
             }
@@ -3362,6 +3840,150 @@ impl Engine {
     /// for update/delete: SeqScan, IndexScan, and Filter(SeqScan). Other
     /// shapes fall back to `generic_rid_match`.
     ///
+    /// Perf sprint: try to fuse the predicate evaluation and in-place
+    /// byte-level mutation into a single heap walk. Returns `Some(result)`
+    /// if the fused path fired, `None` to fall through to the generic
+    /// two-pass code.
+    ///
+    /// Covers two shapes:
+    /// 1. Fixed-width non-null literal assignments on non-indexed columns
+    ///    → byte-patch every matched row in place (row length unchanged).
+    /// 2. Single var-col literal assignment on a non-indexed column
+    ///    → `patch_var_column_in_place` on every matched row (may shrink);
+    ///    rows that can't be patched in place are collected for fallback.
+    fn try_fused_scan_update(
+        &mut self,
+        table: &str,
+        predicate: &Expr,
+        resolved: &[(usize, Value)],
+        changed_cols: &[usize],
+    ) -> Option<Result<QueryResult, String>> {
+        // Build compiled predicate. Requires a schema borrow that must be
+        // dropped before we call scan_patch_matching_logged.
+        let compiled = {
+            let schema = self.catalog.schema(table)?;
+            let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+            let fast = FastLayout::new(schema);
+            compile_predicate(predicate, &columns, &fast, schema)?
+        };
+
+        // ── Path 1: fixed-width fast patch ──────────────────────────
+        let fixed_patches: Option<Vec<FastPatch>> = {
+            let tbl = self.catalog.get_table(table)?;
+            let schema = &tbl.schema;
+            let all_fixed_nonnull = resolved.iter().all(|(idx, val)| {
+                is_fixed_size(schema.columns[*idx].type_id) && !val.is_empty()
+            });
+            let no_indexed = !resolved.iter().any(|(idx, _)| tbl.has_indexed_col(*idx));
+            if all_fixed_nonnull && no_indexed {
+                let layout = RowLayout::new(schema);
+                let bitmap_size = layout.bitmap_size();
+                Some(resolved.iter().map(|(idx, val)| {
+                    let fixed_off = layout.fixed_offset(*idx)
+                        .expect("is_fixed_size already checked");
+                    let field_off = 2 + bitmap_size + fixed_off;
+                    let bytes: FixedBytes = match val {
+                        Value::Int(v)      => FixedBytes::I64(v.to_le_bytes()),
+                        Value::Float(v)    => FixedBytes::F64(v.to_le_bytes()),
+                        Value::Bool(v)     => FixedBytes::Bool(if *v { 1 } else { 0 }),
+                        Value::DateTime(v) => FixedBytes::I64(v.to_le_bytes()),
+                        Value::Uuid(v)     => FixedBytes::Uuid(*v),
+                        _ => unreachable!("all_fixed_nonnull guard"),
+                    };
+                    FastPatch {
+                        field_off,
+                        bitmap_byte_off: 2 + idx / 8,
+                        bit_mask: 1u8 << (idx % 8),
+                        bytes,
+                    }
+                }).collect())
+            } else {
+                None
+            }
+        };
+        if let Some(patches) = fixed_patches {
+            let result = self.catalog.scan_patch_matching_logged(
+                table,
+                compiled,
+                |row| {
+                    for p in &patches {
+                        row[p.bitmap_byte_off] &= !p.bit_mask;
+                        let field_bytes = p.bytes.as_slice();
+                        row[p.field_off..p.field_off + field_bytes.len()]
+                            .copy_from_slice(field_bytes);
+                    }
+                    Some(row.len() as u16)
+                },
+            ).map_err(|e| e.to_string());
+            match result {
+                Ok((count, _)) => {
+                    self.view_registry.mark_dependents_dirty(table);
+                    return Some(Ok(QueryResult::Modified(count)));
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+
+        // ── Path 2: single var-col shrink fast patch ────────────────
+        let var_patch: Option<(usize, Option<Vec<u8>>)> = {
+            let tbl = self.catalog.get_table(table)?;
+            let schema = &tbl.schema;
+            let is_single = resolved.len() == 1;
+            let is_var = is_single
+                && !is_fixed_size(schema.columns[resolved[0].0].type_id);
+            let no_indexed = !resolved.iter().any(|(idx, _)| tbl.has_indexed_col(*idx));
+            if is_single && is_var && no_indexed {
+                let (idx, val) = &resolved[0];
+                let bytes_opt = match val {
+                    Value::Str(s)   => Some(s.as_bytes().to_vec()),
+                    Value::Bytes(b) => Some(b.clone()),
+                    Value::Empty    => None,
+                    _               => return None, // type mismatch, fall through
+                };
+                Some((*idx, bytes_opt))
+            } else {
+                None
+            }
+        };
+        if let Some((col_idx, ref new_bytes_opt)) = var_patch {
+            // Build a fresh RowLayout before the mutable borrow.
+            let layout = {
+                let schema = self.catalog.schema(table)?;
+                RowLayout::new(schema)
+            };
+            let new_bytes_ref: Option<&[u8]> = new_bytes_opt.as_deref();
+            let result = self.catalog.scan_patch_matching_logged(
+                table,
+                compiled,
+                |row| patch_var_column_in_place(row, &layout, col_idx, new_bytes_ref),
+            ).map_err(|e| e.to_string());
+            match result {
+                Ok((mut count, fallback_rids)) => {
+                    // Handle rows where in-place patch failed (new > old).
+                    for rid in fallback_rids {
+                        let mut row = match self.catalog.get(table, rid) {
+                            Some(r) => r,
+                            None => continue,
+                        };
+                        for (idx, val) in resolved.iter() {
+                            row[*idx] = val.clone();
+                        }
+                        self.catalog
+                            .update_hinted(table, rid, &row, Some(changed_cols))
+                            .map_err(|e| e.to_string())
+                            .ok();
+                        count += 1;
+                    }
+                    self.view_registry.mark_dependents_dirty(table);
+                    return Some(Ok(QueryResult::Modified(count)));
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+
+        None // no fused path applicable — fall through
+    }
+
     /// Mission C Phase 3: schema is looked up via `self.catalog.schema(table)`
     /// inside the branches that actually need it. Previously the caller had
     /// to clone the full Schema (6+ String allocs) before every mutation just
@@ -3565,6 +4187,118 @@ fn type_name_to_id(name: &str) -> TypeId {
 /// materialization. Non-literal-representable values become `Literal::Int(0)`
 /// (shouldn't happen in practice — subqueries return primitive columns).
 /// Check if an expression tree contains any `InSubquery` nodes.
+/// Collect all `Expr::Field` names referenced by an expression tree.
+fn collect_field_refs(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Field(name) => out.push(name.clone()),
+        Expr::QualifiedField { qualifier, field } => {
+            out.push(format!("{qualifier}.{field}"));
+        }
+        Expr::BinaryOp(l, _, r) => { collect_field_refs(l, out); collect_field_refs(r, out); }
+        Expr::UnaryOp(_, inner) => collect_field_refs(inner, out),
+        Expr::FunctionCall(_, inner) => collect_field_refs(inner, out),
+        Expr::Coalesce(l, r) => { collect_field_refs(l, out); collect_field_refs(r, out); }
+        Expr::InList { expr, list, .. } => {
+            collect_field_refs(expr, out);
+            for item in list { collect_field_refs(item, out); }
+        }
+        Expr::ScalarFunc(_, args) => { for a in args { collect_field_refs(a, out); } }
+        Expr::Cast(inner, _) => { collect_field_refs(inner, out); }
+        Expr::Case { whens, else_expr } => {
+            for (c, r) in whens { collect_field_refs(c, out); collect_field_refs(r, out); }
+            if let Some(e) = else_expr { collect_field_refs(e, out); }
+        }
+        _ => {}
+    }
+}
+
+/// Detect whether a subquery is correlated: any `Expr::Field` reference in
+/// the subquery's filter that doesn't match a column in the subquery's
+/// source table indicates a reference to an outer scope.
+/// Replace outer-scope field references in a correlated subquery's filter
+/// with literal values from the current outer row. Fields that belong to
+/// the subquery's own source table are left unchanged.
+fn substitute_outer_refs(
+    expr: &Expr,
+    subquery_source: &str,
+    catalog: &Catalog,
+    outer_row: &[Value],
+    outer_columns: &[String],
+) -> Expr {
+    let sub_cols: Vec<String> = catalog.schema(subquery_source)
+        .map(|s| s.columns.iter().map(|c| c.name.clone()).collect())
+        .unwrap_or_default();
+    substitute_outer_refs_inner(expr, &sub_cols, outer_row, outer_columns)
+}
+
+fn substitute_outer_refs_inner(
+    expr: &Expr,
+    sub_cols: &[String],
+    outer_row: &[Value],
+    outer_columns: &[String],
+) -> Expr {
+    match expr {
+        Expr::Field(name) => {
+            if sub_cols.iter().any(|c| c == name) {
+                expr.clone()
+            } else if let Some(i) = outer_columns.iter().position(|c| c == name) {
+                value_to_expr(outer_row[i].clone())
+            } else {
+                expr.clone()
+            }
+        }
+        Expr::BinaryOp(l, op, r) => {
+            let l = substitute_outer_refs_inner(l, sub_cols, outer_row, outer_columns);
+            let r = substitute_outer_refs_inner(r, sub_cols, outer_row, outer_columns);
+            Expr::BinaryOp(Box::new(l), *op, Box::new(r))
+        }
+        Expr::UnaryOp(op, inner) => {
+            let inner = substitute_outer_refs_inner(inner, sub_cols, outer_row, outer_columns);
+            Expr::UnaryOp(*op, Box::new(inner))
+        }
+        Expr::InList { expr: e, list, negated } => {
+            let e = substitute_outer_refs_inner(e, sub_cols, outer_row, outer_columns);
+            let list = list.iter()
+                .map(|item| substitute_outer_refs_inner(item, sub_cols, outer_row, outer_columns))
+                .collect();
+            Expr::InList { expr: Box::new(e), list, negated: *negated }
+        }
+        Expr::Coalesce(l, r) => {
+            let l = substitute_outer_refs_inner(l, sub_cols, outer_row, outer_columns);
+            let r = substitute_outer_refs_inner(r, sub_cols, outer_row, outer_columns);
+            Expr::Coalesce(Box::new(l), Box::new(r))
+        }
+        other => other.clone(),
+    }
+}
+
+fn is_correlated_subquery(subquery: &QueryExpr, catalog: &Catalog) -> bool {
+    let filter = match &subquery.filter {
+        Some(f) => f,
+        None => return false,
+    };
+    let schema = match catalog.schema(&subquery.source) {
+        Some(s) => s,
+        None => return false, // table not found — not correlation, just an error
+    };
+    let table_cols: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+    let mut refs = Vec::new();
+    collect_field_refs(filter, &mut refs);
+    // If any referenced field doesn't exist in the subquery's source table,
+    // it's (probably) a reference to an outer scope — i.e., correlated.
+    refs.iter().any(|r| {
+        // Skip qualified references (alias.field) — they unambiguously
+        // target a specific source and will only match the subquery's own
+        // source if they share the alias.
+        if r.contains('.') {
+            let alias = subquery.alias.as_deref().unwrap_or(&subquery.source);
+            !r.starts_with(alias)
+        } else {
+            !table_cols.iter().any(|c| c == r)
+        }
+    })
+}
+
 fn contains_subquery(expr: &Expr) -> bool {
     match expr {
         Expr::InSubquery { .. } => true,
@@ -3576,9 +4310,10 @@ fn contains_subquery(expr: &Expr) -> bool {
         }
         Expr::Case { whens, else_expr } => {
             whens.iter().any(|(c, r)| contains_subquery(c) || contains_subquery(r))
-                || else_expr.as_ref().map_or(false, |e| contains_subquery(e))
+                || else_expr.as_ref().is_some_and(|e| contains_subquery(e))
         }
         Expr::ScalarFunc(_, args) => args.iter().any(contains_subquery),
+        Expr::Cast(inner, _) => contains_subquery(inner),
         Expr::FunctionCall(_, inner) => contains_subquery(inner),
         Expr::Coalesce(l, r) => contains_subquery(l) || contains_subquery(r),
         _ => false,
@@ -3719,7 +4454,11 @@ fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value {
                 None => Value::Empty,
             }
         }
-        Expr::FunctionCall(_, _) | Expr::Param(_) => Value::Empty,
+        Expr::Cast(inner, cast_type) => {
+            let val = eval_expr(inner, row, columns);
+            eval_cast(val, *cast_type)
+        }
+        Expr::FunctionCall(_, _) | Expr::Param(_) | Expr::Window { .. } => Value::Empty,
     }
 }
 
@@ -3773,7 +4512,437 @@ fn eval_scalar_func(func: ScalarFn, args: &[Value]) -> Value {
             }
             Value::Str(result)
         }
+        // Math functions
+        ScalarFn::Abs => match args.first() {
+            Some(Value::Int(n)) => Value::Int(n.abs()),
+            Some(Value::Float(f)) => Value::Float(f.abs()),
+            _ => Value::Empty,
+        },
+        ScalarFn::Round => {
+            let decimals = match args.get(1) {
+                Some(Value::Int(d)) => *d as i32,
+                _ => 0,
+            };
+            match args.first() {
+                Some(Value::Float(f)) => {
+                    let factor = 10_f64.powi(decimals);
+                    Value::Float((f * factor).round() / factor)
+                }
+                Some(Value::Int(n)) => Value::Int(*n),
+                _ => Value::Empty,
+            }
+        }
+        ScalarFn::Ceil => match args.first() {
+            Some(Value::Float(f)) => Value::Float(f.ceil()),
+            Some(Value::Int(n)) => Value::Int(*n),
+            _ => Value::Empty,
+        },
+        ScalarFn::Floor => match args.first() {
+            Some(Value::Float(f)) => Value::Float(f.floor()),
+            Some(Value::Int(n)) => Value::Int(*n),
+            _ => Value::Empty,
+        },
+        ScalarFn::Sqrt => match args.first() {
+            Some(Value::Float(f)) if *f >= 0.0 => Value::Float(f.sqrt()),
+            Some(Value::Int(n)) if *n >= 0 => Value::Float((*n as f64).sqrt()),
+            _ => Value::Empty,
+        },
+        ScalarFn::Pow => {
+            match (args.first(), args.get(1)) {
+                (Some(Value::Float(base)), Some(Value::Float(exp))) => Value::Float(base.powf(*exp)),
+                (Some(Value::Float(base)), Some(Value::Int(exp))) => Value::Float(base.powi(*exp as i32)),
+                (Some(Value::Int(base)), Some(Value::Int(exp))) => {
+                    if *exp >= 0 && *exp <= u32::MAX as i64 {
+                        match base.checked_pow(*exp as u32) {
+                            Some(v) => Value::Int(v),
+                            None => Value::Float((*base as f64).powi(*exp as i32)),
+                        }
+                    } else {
+                        Value::Float((*base as f64).powi(*exp as i32))
+                    }
+                }
+                (Some(Value::Int(base)), Some(Value::Float(exp))) => Value::Float((*base as f64).powf(*exp)),
+                _ => Value::Empty,
+            }
+        }
+        // Date/time functions
+        ScalarFn::Now => {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let micros = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as i64;
+            Value::DateTime(micros)
+        }
+        ScalarFn::Extract => {
+            // extract("part", datetime_expr)
+            let part = match args.first() {
+                Some(Value::Str(s)) => s.as_str(),
+                _ => return Value::Empty,
+            };
+            let micros = match args.get(1) {
+                Some(Value::DateTime(m)) => *m,
+                Some(Value::Int(m)) => *m, // treat raw int as micros
+                _ => return Value::Empty,
+            };
+            datetime_extract(part, micros)
+        }
+        ScalarFn::DateAdd => {
+            // date_add(datetime_expr, amount, "unit")
+            let micros = match args.first() {
+                Some(Value::DateTime(m)) => *m,
+                Some(Value::Int(m)) => *m,
+                _ => return Value::Empty,
+            };
+            let amount = match args.get(1) {
+                Some(Value::Int(n)) => *n,
+                _ => return Value::Empty,
+            };
+            let unit = match args.get(2) {
+                Some(Value::Str(s)) => s.as_str(),
+                _ => return Value::Empty,
+            };
+            let delta_micros = match unit {
+                "microsecond" | "microseconds" | "us" => amount,
+                "millisecond" | "milliseconds" | "ms" => amount * 1_000,
+                "second" | "seconds" | "s" => amount * 1_000_000,
+                "minute" | "minutes" | "m" => amount * 60_000_000,
+                "hour" | "hours" | "h" => amount * 3_600_000_000,
+                "day" | "days" | "d" => amount * 86_400_000_000,
+                _ => return Value::Empty,
+            };
+            Value::DateTime(micros + delta_micros)
+        }
+        ScalarFn::DateDiff => {
+            // date_diff(dt1, dt2, "unit")
+            let m1 = match args.first() {
+                Some(Value::DateTime(m)) => *m,
+                Some(Value::Int(m)) => *m,
+                _ => return Value::Empty,
+            };
+            let m2 = match args.get(1) {
+                Some(Value::DateTime(m)) => *m,
+                Some(Value::Int(m)) => *m,
+                _ => return Value::Empty,
+            };
+            let unit = match args.get(2) {
+                Some(Value::Str(s)) => s.as_str(),
+                _ => return Value::Empty,
+            };
+            let diff = m1 - m2;
+            let result = match unit {
+                "microsecond" | "microseconds" | "us" => diff,
+                "millisecond" | "milliseconds" | "ms" => diff / 1_000,
+                "second" | "seconds" | "s" => diff / 1_000_000,
+                "minute" | "minutes" | "m" => diff / 60_000_000,
+                "hour" | "hours" | "h" => diff / 3_600_000_000,
+                "day" | "days" | "d" => diff / 86_400_000_000,
+                _ => return Value::Empty,
+            };
+            Value::Int(result)
+        }
     }
+}
+
+/// Extract a component from a DateTime value (microseconds since epoch).
+fn datetime_extract(part: &str, micros: i64) -> Value {
+    // Convert micros to seconds + remainder for calendar calculations
+    let total_secs = micros / 1_000_000;
+    let micro_rem = micros % 1_000_000;
+
+    // Simple civil calendar from Unix timestamp (no TZ — UTC assumed)
+    let days_since_epoch = if total_secs >= 0 {
+        total_secs / 86400
+    } else {
+        (total_secs - 86399) / 86400
+    };
+    let secs_of_day = total_secs - days_since_epoch * 86400;
+
+    match part {
+        "hour" => Value::Int(secs_of_day / 3600),
+        "minute" => Value::Int((secs_of_day % 3600) / 60),
+        "second" => Value::Int(secs_of_day % 60),
+        "millisecond" => Value::Int(micro_rem / 1000),
+        "microsecond" => Value::Int(micro_rem),
+        "epoch" => Value::Int(total_secs),
+        "year" | "month" | "day" => {
+            // Civil date from days since 1970-01-01 (algorithm from Howard Hinnant)
+            let z = days_since_epoch + 719468;
+            let era = if z >= 0 { z } else { z - 146096 } / 146097;
+            let doe = (z - era * 146097) as u32;
+            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+            let y = (yoe as i64) + era * 400;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let d = doy - (153 * mp + 2) / 5 + 1;
+            let m = if mp < 10 { mp + 3 } else { mp - 9 };
+            let y = if m <= 2 { y + 1 } else { y };
+            match part {
+                "year" => Value::Int(y),
+                "month" => Value::Int(m as i64),
+                "day" => Value::Int(d as i64),
+                _ => unreachable!(),
+            }
+        }
+        _ => Value::Empty,
+    }
+}
+
+/// Evaluate a CAST expression.
+fn eval_cast(val: Value, target: CastType) -> Value {
+    match target {
+        CastType::Int => match val {
+            Value::Int(n) => Value::Int(n),
+            Value::Float(f) => Value::Int(f as i64),
+            Value::Bool(b) => Value::Int(if b { 1 } else { 0 }),
+            Value::Str(s) => s.parse::<i64>().map(Value::Int).unwrap_or(Value::Empty),
+            Value::DateTime(m) => Value::Int(m),
+            _ => Value::Empty,
+        },
+        CastType::Float => match val {
+            Value::Float(f) => Value::Float(f),
+            Value::Int(n) => Value::Float(n as f64),
+            Value::Str(s) => s.parse::<f64>().map(Value::Float).unwrap_or(Value::Empty),
+            Value::Bool(b) => Value::Float(if b { 1.0 } else { 0.0 }),
+            _ => Value::Empty,
+        },
+        CastType::Str => match val {
+            Value::Str(s) => Value::Str(s),
+            Value::Int(n) => Value::Str(n.to_string()),
+            Value::Float(f) => Value::Str(f.to_string()),
+            Value::Bool(b) => Value::Str(b.to_string()),
+            Value::DateTime(m) => Value::Str(m.to_string()),
+            _ => Value::Empty,
+        },
+        CastType::Bool => match val {
+            Value::Bool(b) => Value::Bool(b),
+            Value::Int(n) => Value::Bool(n != 0),
+            Value::Str(s) => match s.as_str() {
+                "true" | "1" | "yes" => Value::Bool(true),
+                "false" | "0" | "no" => Value::Bool(false),
+                _ => Value::Empty,
+            },
+            _ => Value::Empty,
+        },
+        CastType::DateTime => match val {
+            Value::DateTime(m) => Value::DateTime(m),
+            Value::Int(m) => Value::DateTime(m),
+            _ => Value::Empty,
+        },
+    }
+}
+
+/// Execute window function computations. Shared by both read and write paths.
+///
+/// For each `WindowDef`:
+///   1. Sort rows by (partition_by keys, order_by keys).
+///   2. Walk sorted rows, detecting partition boundaries.
+///   3. Compute the window value per row (running aggregates reset at
+///      partition boundaries).
+///   4. Append the computed column to each row and register the column name.
+///
+/// All computed columns are appended to the original row data; the
+/// downstream `Project` node plucks the ones the user asked for.
+fn execute_window(result: QueryResult, windows: &[WindowDef]) -> Result<QueryResult, String> {
+    let (mut columns, mut rows) = match result {
+        QueryResult::Rows { columns, rows } => (columns, rows),
+        _ => return Err("window function requires row input".into()),
+    };
+
+    for wdef in windows {
+        // Resolve partition/order column indices against current columns.
+        let part_indices: Vec<usize> = wdef.partition_by.iter().map(|name| {
+            columns.iter().position(|c| c == name)
+                .ok_or_else(|| format!("window partition column '{name}' not found"))
+        }).collect::<Result<Vec<_>, _>>()?;
+
+        let ord_indices: Vec<(usize, bool)> = wdef.order_by.iter().map(|sk| {
+            columns.iter().position(|c| c == &sk.field)
+                .map(|i| (i, sk.descending))
+                .ok_or_else(|| format!("window order column '{}' not found", sk.field))
+        }).collect::<Result<Vec<_>, _>>()?;
+
+        // Resolve the argument column index (for aggregate windows).
+        let arg_col_idx: Option<usize> = if let Some(arg) = wdef.args.first() {
+            match arg {
+                Expr::Field(name) => {
+                    if name == "*" {
+                        None // count(*) style — no specific column
+                    } else {
+                        Some(columns.iter().position(|c| c == name)
+                            .ok_or_else(|| format!("window arg column '{name}' not found"))?)
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        // Build a sort-index to sort rows by partition_by then order_by
+        // without actually reordering the original Vec (we need original
+        // order to write results back).
+        let n = rows.len();
+        let mut indices: Vec<usize> = (0..n).collect();
+        indices.sort_by(|&a, &b| {
+            // Compare partition keys first.
+            for &pi in &part_indices {
+                let cmp = rows[a][pi].cmp(&rows[b][pi]);
+                if cmp != std::cmp::Ordering::Equal {
+                    return cmp;
+                }
+            }
+            // Then order keys.
+            for &(oi, desc) in &ord_indices {
+                let cmp = rows[a][oi].cmp(&rows[b][oi]);
+                if cmp != std::cmp::Ordering::Equal {
+                    return if desc { cmp.reverse() } else { cmp };
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+
+        // Compute window values in sorted order, tracking partition boundaries.
+        let mut win_values: Vec<Value> = vec![Value::Empty; n];
+        let mut partition_start = 0usize;
+        // Running state for aggregate windows:
+        let mut running_count: i64 = 0;
+        let mut running_int_sum: i64 = 0;
+        let mut running_float_sum: f64 = 0.0;
+        let mut running_saw_float = false;
+        let mut running_min: Option<Value> = None;
+        let mut running_max: Option<Value> = None;
+        let mut rank_counter: i64 = 0;
+        let mut dense_rank_counter: i64 = 0;
+        let mut prev_order_key: Option<Vec<Value>> = None;
+        let mut same_rank_count: i64 = 0;
+
+        for sorted_pos in 0..n {
+            let row_idx = indices[sorted_pos];
+
+            // Detect partition boundary.
+            let new_partition = if sorted_pos == 0 {
+                true
+            } else {
+                let prev_row_idx = indices[sorted_pos - 1];
+                part_indices.iter().any(|&pi| rows[row_idx][pi] != rows[prev_row_idx][pi])
+            };
+
+            if new_partition {
+                partition_start = sorted_pos;
+                running_count = 0;
+                running_int_sum = 0;
+                running_float_sum = 0.0;
+                running_saw_float = false;
+                running_min = None;
+                running_max = None;
+                rank_counter = 0;
+                dense_rank_counter = 0;
+                prev_order_key = None;
+                same_rank_count = 0;
+            }
+
+            // Extract current order key for rank tracking.
+            let current_order_key: Vec<Value> = ord_indices.iter()
+                .map(|&(oi, _)| rows[row_idx][oi].clone())
+                .collect();
+            let same_as_prev = prev_order_key.as_ref() == Some(&current_order_key);
+
+            let value = match wdef.function {
+                WindowFunc::RowNumber => {
+                    Value::Int((sorted_pos - partition_start + 1) as i64)
+                }
+                WindowFunc::Rank => {
+                    if same_as_prev {
+                        same_rank_count += 1;
+                    } else {
+                        rank_counter += same_rank_count + 1;
+                        same_rank_count = 0;
+                        if rank_counter == 0 { rank_counter = 1; }
+                    }
+                    Value::Int(rank_counter)
+                }
+                WindowFunc::DenseRank => {
+                    if !same_as_prev {
+                        dense_rank_counter += 1;
+                    }
+                    Value::Int(dense_rank_counter)
+                }
+                WindowFunc::Sum => {
+                    if let Some(ci) = arg_col_idx {
+                        match &rows[row_idx][ci] {
+                            Value::Int(v) => running_int_sum += v,
+                            Value::Float(v) => { running_float_sum += v; running_saw_float = true; }
+                            _ => {}
+                        }
+                    }
+                    if running_saw_float {
+                        Value::Float(running_float_sum + running_int_sum as f64)
+                    } else {
+                        Value::Int(running_int_sum)
+                    }
+                }
+                WindowFunc::Avg => {
+                    if let Some(ci) = arg_col_idx {
+                        match &rows[row_idx][ci] {
+                            Value::Int(v) => { running_float_sum += *v as f64; running_count += 1; }
+                            Value::Float(v) => { running_float_sum += v; running_count += 1; }
+                            _ => {}
+                        }
+                    }
+                    if running_count == 0 { Value::Empty } else {
+                        Value::Float(running_float_sum / running_count as f64)
+                    }
+                }
+                WindowFunc::Count => {
+                    if let Some(ci) = arg_col_idx {
+                        if !rows[row_idx][ci].is_empty() {
+                            running_count += 1;
+                        }
+                    } else {
+                        // count(*) — count all rows
+                        running_count += 1;
+                    }
+                    Value::Int(running_count)
+                }
+                WindowFunc::Min => {
+                    if let Some(ci) = arg_col_idx {
+                        let v = &rows[row_idx][ci];
+                        if !v.is_empty() {
+                            running_min = Some(match &running_min {
+                                None => v.clone(),
+                                Some(cur) => if v < cur { v.clone() } else { cur.clone() },
+                            });
+                        }
+                    }
+                    running_min.clone().unwrap_or(Value::Empty)
+                }
+                WindowFunc::Max => {
+                    if let Some(ci) = arg_col_idx {
+                        let v = &rows[row_idx][ci];
+                        if !v.is_empty() {
+                            running_max = Some(match &running_max {
+                                None => v.clone(),
+                                Some(cur) => if v > cur { v.clone() } else { cur.clone() },
+                            });
+                        }
+                    }
+                    running_max.clone().unwrap_or(Value::Empty)
+                }
+            };
+
+            prev_order_key = Some(current_order_key);
+            win_values[row_idx] = value;
+        }
+
+        // Append the computed window column to each row.
+        for (ri, row) in rows.iter_mut().enumerate() {
+            row.push(win_values[ri].clone());
+        }
+        columns.push(wdef.output_name.clone());
+    }
+
+    Ok(QueryResult::Rows { columns, rows })
 }
 
 /// Mission E2b: compute one aggregate over a set of rows in a group.
@@ -3861,6 +5030,7 @@ fn compute_group_aggregate(
 /// This is deliberately narrow. We only recognise the two shapes:
 ///   * `QualifiedField = QualifiedField`  (`u.id = o.user_id`)
 ///   * `Field = Field`                    (`.id = .user_id`, unqualified)
+///
 /// Anything else — conjunctions, constants, function calls, or predicates
 /// that touch the same side on both halves — falls through to the
 /// nested-loop path unchanged.
@@ -3991,6 +5161,194 @@ fn hash_join(
     }
 
     QueryResult::Rows { columns, rows }
+}
+
+/// Synthesize a range predicate from RangeScan bounds for the fallback path.
+fn synthesize_range_predicate(column: &str, start: &Option<(Expr, bool)>, end: &Option<(Expr, bool)>) -> Expr {
+    let lower = start.as_ref().map(|(expr, inclusive)| {
+        let op = if *inclusive { BinOp::Gte } else { BinOp::Gt };
+        Expr::BinaryOp(
+            Box::new(Expr::Field(column.to_string())),
+            op,
+            Box::new(expr.clone()),
+        )
+    });
+    let upper = end.as_ref().map(|(expr, inclusive)| {
+        let op = if *inclusive { BinOp::Lte } else { BinOp::Lt };
+        Expr::BinaryOp(
+            Box::new(Expr::Field(column.to_string())),
+            op,
+            Box::new(expr.clone()),
+        )
+    });
+    match (lower, upper) {
+        (Some(l), Some(u)) => Expr::BinaryOp(Box::new(l), BinOp::And, Box::new(u)),
+        (Some(l), None) => l,
+        (None, Some(u)) => u,
+        (None, None) => Expr::Literal(Literal::Bool(true)),
+    }
+}
+
+/// Check if a value falls within a range (used in last-resort decoded-row eval).
+fn range_matches(val: &Value, start: &Option<Value>, start_inc: bool, end: &Option<Value>, end_inc: bool) -> bool {
+    if let Some(ref s) = start {
+        if start_inc { if val < s { return false; } }
+        else if val <= s { return false; }
+    }
+    if let Some(ref e) = end {
+        if end_inc { if val > e { return false; } }
+        else if val >= e { return false; }
+    }
+    true
+}
+
+/// Format a `PlanNode` tree as a human-readable, indented text
+/// representation. Used by the `EXPLAIN` command.
+fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
+    let indent = "  ".repeat(depth);
+    match plan {
+        PlanNode::SeqScan { table } => format!("{indent}SeqScan table={table}"),
+        PlanNode::AliasScan { table, alias } => {
+            format!("{indent}AliasScan table={table} alias={alias}")
+        }
+        PlanNode::IndexScan { table, column, key } => {
+            format!("{indent}IndexScan table={table} column={column} key={key:?}")
+        }
+        PlanNode::RangeScan { table, column, start, end } => {
+            let s = match start {
+                Some((expr, inc)) => {
+                    let op = if *inc { ">=" } else { ">" };
+                    format!("{op}{expr:?}")
+                }
+                None => "unbounded".to_string(),
+            };
+            let e = match end {
+                Some((expr, inc)) => {
+                    let op = if *inc { "<=" } else { "<" };
+                    format!("{op}{expr:?}")
+                }
+                None => "unbounded".to_string(),
+            };
+            format!("{indent}RangeScan table={table} column={column} [{s}, {e}]")
+        }
+        PlanNode::Filter { input, predicate } => {
+            let child = format_plan_tree(input, depth + 1);
+            format!("{indent}Filter predicate={predicate:?}\n{child}")
+        }
+        PlanNode::Project { input, fields } => {
+            let names: Vec<String> = fields.iter().map(|f| {
+                match &f.alias {
+                    Some(a) => format!("{a}: {:?}", f.expr),
+                    None => format!("{:?}", f.expr),
+                }
+            }).collect();
+            let child = format_plan_tree(input, depth + 1);
+            format!("{indent}Project fields=[{}]\n{child}", names.join(", "))
+        }
+        PlanNode::Sort { input, keys } => {
+            let ks: Vec<String> = keys.iter().map(|k| {
+                if k.descending { format!("{} desc", k.field) } else { k.field.clone() }
+            }).collect();
+            let child = format_plan_tree(input, depth + 1);
+            format!("{indent}Sort keys=[{}]\n{child}", ks.join(", "))
+        }
+        PlanNode::Limit { input, count } => {
+            let child = format_plan_tree(input, depth + 1);
+            format!("{indent}Limit count={count:?}\n{child}")
+        }
+        PlanNode::Offset { input, count } => {
+            let child = format_plan_tree(input, depth + 1);
+            format!("{indent}Offset count={count:?}\n{child}")
+        }
+        PlanNode::Aggregate { input, function, field } => {
+            let f = field.as_deref().unwrap_or("*");
+            let child = format_plan_tree(input, depth + 1);
+            format!("{indent}Aggregate fn={function:?} field={f}\n{child}")
+        }
+        PlanNode::NestedLoopJoin { left, right, on, kind } => {
+            let left_child = format_plan_tree(left, depth + 1);
+            let right_child = format_plan_tree(right, depth + 1);
+            let on_str = match on {
+                Some(pred) => format!("{pred:?}"),
+                None => "none".to_string(),
+            };
+            format!(
+                "{indent}NestedLoopJoin kind={kind:?} on={on_str}\n{left_child}\n{right_child}"
+            )
+        }
+        PlanNode::Distinct { input } => {
+            let child = format_plan_tree(input, depth + 1);
+            format!("{indent}Distinct\n{child}")
+        }
+        PlanNode::GroupBy { input, keys, aggregates, having } => {
+            let agg_strs: Vec<String> = aggregates.iter().map(|a| {
+                format!("{:?}({}) as {}", a.function, a.field, a.output_name)
+            }).collect();
+            let having_str = match having {
+                Some(h) => format!(" having={h:?}"),
+                None => String::new(),
+            };
+            let child = format_plan_tree(input, depth + 1);
+            format!(
+                "{indent}GroupBy keys=[{}] aggs=[{}]{having_str}\n{child}",
+                keys.join(", "),
+                agg_strs.join(", "),
+            )
+        }
+        PlanNode::Insert { table, assignments } => {
+            let cols: Vec<&str> = assignments.iter().map(|a| a.field.as_str()).collect();
+            format!("{indent}Insert table={table} cols=[{}]", cols.join(", "))
+        }
+        PlanNode::Upsert { table, key_column, assignments, on_conflict } => {
+            let cols: Vec<&str> = assignments.iter().map(|a| a.field.as_str()).collect();
+            let conflict_cols: Vec<&str> = on_conflict.iter().map(|a| a.field.as_str()).collect();
+            if conflict_cols.is_empty() {
+                format!("{indent}Upsert table={table} key={key_column} cols=[{}]", cols.join(", "))
+            } else {
+                format!("{indent}Upsert table={table} key={key_column} cols=[{}] on_conflict=[{}]",
+                    cols.join(", "), conflict_cols.join(", "))
+            }
+        }
+        PlanNode::Update { input, table, assignments } => {
+            let cols: Vec<&str> = assignments.iter().map(|a| a.field.as_str()).collect();
+            let child = format_plan_tree(input, depth + 1);
+            format!("{indent}Update table={table} set=[{}]\n{child}", cols.join(", "))
+        }
+        PlanNode::Delete { input, table } => {
+            let child = format_plan_tree(input, depth + 1);
+            format!("{indent}Delete table={table}\n{child}")
+        }
+        PlanNode::CreateTable { name, fields } => {
+            let fs: Vec<String> = fields.iter().map(|(n, t, r)| {
+                if *r { format!("{n}: {t} required") } else { format!("{n}: {t}") }
+            }).collect();
+            format!("{indent}CreateTable name={name} fields=[{}]", fs.join(", "))
+        }
+        PlanNode::AlterTable { table, action } => {
+            format!("{indent}AlterTable table={table} action={action:?}")
+        }
+        PlanNode::DropTable { name } => format!("{indent}DropTable name={name}"),
+        PlanNode::CreateView { name, .. } => format!("{indent}CreateView name={name}"),
+        PlanNode::RefreshView { name } => format!("{indent}RefreshView name={name}"),
+        PlanNode::DropView { name } => format!("{indent}DropView name={name}"),
+        PlanNode::Window { input, windows } => {
+            let ws: Vec<String> = windows.iter().map(|w| {
+                format!("{:?} as {}", w.function, w.output_name)
+            }).collect();
+            let child = format_plan_tree(input, depth + 1);
+            format!("{indent}Window fns=[{}]\n{child}", ws.join(", "))
+        }
+        PlanNode::Union { left, right, all } => {
+            let kind = if *all { "UNION ALL" } else { "UNION" };
+            let left_child = format_plan_tree(left, depth + 1);
+            let right_child = format_plan_tree(right, depth + 1);
+            format!("{indent}{kind}\n{left_child}\n{right_child}")
+        }
+        PlanNode::Explain { input } => {
+            let child = format_plan_tree(input, depth + 1);
+            format!("{indent}Explain\n{child}")
+        }
+    }
 }
 
 /// Executor-local row layout — computes the layout facts the compiled
@@ -4491,6 +5849,9 @@ fn collect_field_indices(expr: &Expr, columns: &[String], out: &mut Vec<usize>) 
             for arg in args {
                 collect_field_indices(arg, columns, out);
             }
+        }
+        Expr::Cast(inner, _) => {
+            collect_field_indices(inner, columns, out);
         }
         Expr::Case { whens, else_expr } => {
             for (cond, result) in whens {
@@ -7185,6 +8546,347 @@ mod tests {
         for pair in as_sortable.windows(2) {
             assert!(pair[0] < pair[1],
                 "sortable u64 not monotonic: {:#x} >= {:#x}", pair[0], pair[1]);
+        }
+    }
+
+    // ─── EXPLAIN tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_explain_simple_scan() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql("explain User").unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["plan"]);
+                assert!(!rows.is_empty());
+                assert!(matches!(&rows[0][0], Value::Str(s) if s.contains("SeqScan")));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_explain_filter() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql("explain User filter .age > 30").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                let plan_text: String = rows.iter()
+                    .map(|r| match &r[0] { Value::Str(s) => s.as_str(), _ => "" })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(plan_text.contains("RangeScan"), "plan should show RangeScan node");
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_explain_does_not_execute() {
+        let mut engine = test_engine();
+        // EXPLAIN should NOT actually insert a row.
+        let result = engine.execute_powql(r#"explain insert User { name := "Zara", age := 99 }"#).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                let plan_text: String = rows.iter()
+                    .map(|r| match &r[0] { Value::Str(s) => s.as_str(), _ => "" })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(plan_text.contains("Insert"));
+            }
+            _ => panic!("expected rows"),
+        }
+        // Verify no row was actually inserted.
+        let result = engine.execute_powql("User { .name }").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3, "should still have original 3 users");
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    // ─── Correlated subquery tests ──────────────────────────────────────
+
+    #[test]
+    fn test_correlated_in_subquery() {
+        let mut engine = test_engine();
+        // Create an orders table with user_name to correlate on.
+        engine.execute_powql("type UserOrder { required user_name: str, required total: int }").unwrap();
+        engine.execute_powql(r#"insert UserOrder { user_name := "Alice", total := 100 }"#).unwrap();
+        engine.execute_powql(r#"insert UserOrder { user_name := "Alice", total := 200 }"#).unwrap();
+        engine.execute_powql(r#"insert UserOrder { user_name := "Bob", total := 50 }"#).unwrap();
+
+        // Correlated: for each User row, find orders where user_name = outer .name
+        // The subquery references .name which is a User column, not a UserOrder column.
+        let result = engine.execute_powql(
+            "User filter .name in (UserOrder filter .user_name = .name { .user_name }) { .name }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2, "Alice and Bob have orders");
+                let names: Vec<_> = rows.iter().map(|r| &r[0]).collect();
+                assert!(names.contains(&&Value::Str("Alice".into())));
+                assert!(names.contains(&&Value::Str("Bob".into())));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_correlated_exists_subquery() {
+        let mut engine = test_engine();
+        engine.execute_powql("type UserOrder { required user_name: str, required total: int }").unwrap();
+        engine.execute_powql(r#"insert UserOrder { user_name := "Alice", total := 100 }"#).unwrap();
+        engine.execute_powql(r#"insert UserOrder { user_name := "Bob", total := 50 }"#).unwrap();
+
+        // Correlated EXISTS: only Users who have at least one order.
+        // .name in the subquery filter refers to the outer User's name column.
+        let result = engine.execute_powql(
+            "User filter exists (UserOrder filter .user_name = .name) { .name }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2, "Alice and Bob have orders");
+                let names: Vec<_> = rows.iter().map(|r| &r[0]).collect();
+                assert!(names.contains(&&Value::Str("Alice".into())));
+                assert!(names.contains(&&Value::Str("Bob".into())));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_correlated_not_exists_subquery() {
+        let mut engine = test_engine();
+        engine.execute_powql("type UserOrder { required user_name: str, required total: int }").unwrap();
+        engine.execute_powql(r#"insert UserOrder { user_name := "Alice", total := 100 }"#).unwrap();
+
+        // NOT EXISTS: Users without orders (Bob and Charlie).
+        let result = engine.execute_powql(
+            "User filter not exists (UserOrder filter .user_name = .name) { .name }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2, "Bob and Charlie have no orders");
+                let names: Vec<_> = rows.iter().map(|r| &r[0]).collect();
+                assert!(names.contains(&&Value::Str("Bob".into())));
+                assert!(names.contains(&&Value::Str("Charlie".into())));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    // ─── CAST tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_cast_int_to_str() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql(r#"User { s: cast(.age, "str") }"#).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Str("30".into()));
+                assert_eq!(rows[1][0], Value::Str("25".into()));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_cast_str_to_int() {
+        let mut engine = test_engine();
+        engine.execute_powql(r#"type Numbers { required val: str }"#).unwrap();
+        engine.execute_powql(r#"insert Numbers { val := "42" }"#).unwrap();
+        let result = engine.execute_powql(r#"Numbers { n: cast(.val, "int") }"#).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Int(42));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_cast_float_to_int() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Floats { required val: float }").unwrap();
+        engine.execute_powql("insert Floats { val := 3.7 }").unwrap();
+        let result = engine.execute_powql(r#"Floats { n: cast(.val, "int") }"#).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Int(3));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_cast_int_to_float() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql(r#"User { f: cast(.age, "float") }"#).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Float(30.0));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_cast_int_to_bool() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql(r#"User { b: cast(.age, "bool") }"#).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                // age=30 -> true (non-zero)
+                assert_eq!(rows[0][0], Value::Bool(true));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    // ─── Math function tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_abs() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Nums { required val: int }").unwrap();
+        engine.execute_powql("insert Nums { val := -42 }").unwrap();
+        let result = engine.execute_powql("Nums { a: abs(.val) }").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Int(42));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_round() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Floats { required val: float }").unwrap();
+        engine.execute_powql("insert Floats { val := 3.14159 }").unwrap();
+        let result = engine.execute_powql("Floats { r: round(.val, 2) }").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Float(3.14));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_ceil_floor() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Floats { required val: float }").unwrap();
+        engine.execute_powql("insert Floats { val := 3.2 }").unwrap();
+        let c = engine.execute_powql("Floats { c: ceil(.val) }").unwrap();
+        let f = engine.execute_powql("Floats { f: floor(.val) }").unwrap();
+        match (c, f) {
+            (QueryResult::Rows { rows: cr, .. }, QueryResult::Rows { rows: fr, .. }) => {
+                assert_eq!(cr[0][0], Value::Float(4.0));
+                assert_eq!(fr[0][0], Value::Float(3.0));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_sqrt() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Nums { required val: int }").unwrap();
+        engine.execute_powql("insert Nums { val := 144 }").unwrap();
+        let result = engine.execute_powql("Nums { s: sqrt(.val) }").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Float(12.0));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_pow() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Nums { required val: int }").unwrap();
+        engine.execute_powql("insert Nums { val := 3 }").unwrap();
+        let result = engine.execute_powql("Nums { p: pow(.val, 4) }").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Int(81));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    // ─── Date/time function tests ─────────────────────────────────────
+
+    #[test]
+    fn test_now_returns_datetime() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Events { required name: str }").unwrap();
+        engine.execute_powql(r#"insert Events { name := "test" }"#).unwrap();
+        let result = engine.execute_powql("Events { ts: now() }").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                match &rows[0][0] {
+                    Value::DateTime(m) => assert!(*m > 0, "now() should return positive timestamp"),
+                    other => panic!("expected DateTime, got {other:?}"),
+                }
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_extract_from_datetime() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Events { required ts: datetime }").unwrap();
+        // 2024-01-15 12:30:45 UTC in microseconds
+        // 2024-01-15 = 19737 days since epoch
+        // 19737 * 86400 = 1705276800 seconds + 12*3600 + 30*60 + 45 = 1705321845
+        // * 1_000_000 = 1705321845000000
+        engine.execute_powql("insert Events { ts := 1705321845000000 }").unwrap();
+        let result = engine.execute_powql(r#"Events { y: extract("year", .ts), m: extract("month", .ts), d: extract("day", .ts), h: extract("hour", .ts) }"#).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Int(2024));
+                assert_eq!(rows[0][1], Value::Int(1));
+                assert_eq!(rows[0][2], Value::Int(15));
+                assert_eq!(rows[0][3], Value::Int(12));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_date_add() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Events { required ts: datetime }").unwrap();
+        let base = 1705321845000000_i64; // 2024-01-15 12:30:45 UTC
+        engine.execute_powql(&format!("insert Events {{ ts := {base} }}")).unwrap();
+        let result = engine.execute_powql(r#"Events { later: date_add(.ts, 2, "hours") }"#).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::DateTime(base + 2 * 3_600_000_000));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_date_diff() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Events { required start_ts: datetime, required end_ts: datetime }").unwrap();
+        let t1 = 1705321845000000_i64; // 2024-01-15 12:30:45 UTC
+        let t2 = t1 + 3 * 86_400_000_000; // +3 days
+        engine.execute_powql(&format!("insert Events {{ start_ts := {t1}, end_ts := {t2} }}")).unwrap();
+        let result = engine.execute_powql(r#"Events { diff: date_diff(.end_ts, .start_ts, "days") }"#).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Int(3));
+            }
+            _ => panic!("expected rows"),
         }
     }
 }

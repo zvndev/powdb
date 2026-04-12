@@ -134,6 +134,14 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
         PlanNode::IndexScan { key, .. } => {
             substitute_expr(key, literals, idx);
         }
+        PlanNode::RangeScan { start, end, .. } => {
+            if let Some((expr, _)) = start {
+                substitute_expr(expr, literals, idx);
+            }
+            if let Some((expr, _)) = end {
+                substitute_expr(expr, literals, idx);
+            }
+        }
         PlanNode::Filter { input, predicate } => {
             substitute_plan(input, literals, idx);
             substitute_expr(predicate, literals, idx);
@@ -197,6 +205,10 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
         PlanNode::Insert { assignments, .. } => {
             substitute_assignments(assignments, literals, idx);
         }
+        PlanNode::Upsert { assignments, on_conflict, .. } => {
+            substitute_assignments(assignments, literals, idx);
+            substitute_assignments(on_conflict, literals, idx);
+        }
         PlanNode::Update { input, assignments, .. } => {
             substitute_plan(input, literals, idx);
             substitute_assignments(assignments, literals, idx);
@@ -208,9 +220,20 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
         PlanNode::CreateView { .. } => {}
         PlanNode::RefreshView { .. } => {}
         PlanNode::DropView { .. } => {}
+        PlanNode::Window { input, windows } => {
+            substitute_plan(input, literals, idx);
+            for w in windows {
+                for arg in &mut w.args {
+                    substitute_expr(arg, literals, idx);
+                }
+            }
+        }
         PlanNode::Union { left, right, .. } => {
             substitute_plan(left, literals, idx);
             substitute_plan(right, literals, idx);
+        }
+        PlanNode::Explain { input } => {
+            substitute_plan(input, literals, idx);
         }
     }
 }
@@ -241,6 +264,14 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
         PlanNode::SeqScan { .. } => {}
         PlanNode::AliasScan { .. } => {}
         PlanNode::IndexScan { key, .. } => count_expr(key, n),
+        PlanNode::RangeScan { start, end, .. } => {
+            if let Some((expr, _)) = start {
+                count_expr(expr, n);
+            }
+            if let Some((expr, _)) = end {
+                count_expr(expr, n);
+            }
+        }
         PlanNode::Filter { input, predicate } => {
             count_plan(input, n);
             count_expr(predicate, n);
@@ -290,6 +321,14 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
                 count_expr(&a.value, n);
             }
         }
+        PlanNode::Upsert { assignments, on_conflict, .. } => {
+            for a in assignments {
+                count_expr(&a.value, n);
+            }
+            for a in on_conflict {
+                count_expr(&a.value, n);
+            }
+        }
         PlanNode::Update { input, assignments, .. } => {
             count_plan(input, n);
             for a in assignments {
@@ -303,9 +342,20 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
         PlanNode::CreateView { .. } => {}
         PlanNode::RefreshView { .. } => {}
         PlanNode::DropView { .. } => {}
+        PlanNode::Window { input, windows } => {
+            count_plan(input, n);
+            for w in windows {
+                for arg in &w.args {
+                    count_expr(arg, n);
+                }
+            }
+        }
         PlanNode::Union { left, right, .. } => {
             count_plan(left, n);
             count_plan(right, n);
+        }
+        PlanNode::Explain { input } => {
+            count_plan(input, n);
         }
     }
 }
@@ -335,6 +385,7 @@ fn count_expr(expr: &Expr, n: &mut usize) {
                 count_expr(a, n);
             }
         }
+        Expr::Cast(inner, _) => count_expr(inner, n),
         Expr::Case { whens, else_expr } => {
             for (cond, result) in whens {
                 count_expr(cond, n);
@@ -352,6 +403,11 @@ fn count_expr(expr: &Expr, n: &mut usize) {
         Expr::ExistsSubquery { .. } => {
             // Subquery literals are not counted — the subquery is
             // re-planned/executed separately.
+        }
+        Expr::Window { args, .. } => {
+            for a in args {
+                count_expr(a, n);
+            }
         }
     }
 }
@@ -391,6 +447,7 @@ fn substitute_expr(expr: &mut Expr, literals: &[Literal], idx: &mut usize) {
                 substitute_expr(a, literals, idx);
             }
         }
+        Expr::Cast(inner, _) => substitute_expr(inner, literals, idx),
         Expr::Case { whens, else_expr } => {
             for (cond, result) in whens {
                 substitute_expr(cond, literals, idx);
@@ -406,6 +463,11 @@ fn substitute_expr(expr: &mut Expr, literals: &[Literal], idx: &mut usize) {
         Expr::ExistsSubquery { .. } => {
             // Subquery has its own literal list; nothing to substitute
             // at this level.
+        }
+        Expr::Window { args, .. } => {
+            for a in args {
+                substitute_expr(a, literals, idx);
+            }
         }
     }
 }
@@ -542,6 +604,14 @@ mod tests {
             PlanNode::SeqScan { .. } => {}
             PlanNode::AliasScan { .. } => {}
             PlanNode::IndexScan { key, .. } => collect_expr_literals(key, out),
+            PlanNode::RangeScan { start, end, .. } => {
+                if let Some((expr, _)) = start {
+                    collect_expr_literals(expr, out);
+                }
+                if let Some((expr, _)) = end {
+                    collect_expr_literals(expr, out);
+                }
+            }
             PlanNode::Filter { input, predicate } => {
                 collect_literals_for_test(input, out);
                 collect_expr_literals(predicate, out);
@@ -574,6 +644,14 @@ mod tests {
                     collect_expr_literals(&a.value, out);
                 }
             }
+            PlanNode::Upsert { assignments, on_conflict, .. } => {
+                for a in assignments {
+                    collect_expr_literals(&a.value, out);
+                }
+                for a in on_conflict {
+                    collect_expr_literals(&a.value, out);
+                }
+            }
             PlanNode::Update { input, assignments, .. } => {
                 collect_literals_for_test(input, out);
                 for a in assignments {
@@ -594,9 +672,20 @@ mod tests {
             PlanNode::CreateView { .. } => {}
             PlanNode::RefreshView { .. } => {}
             PlanNode::DropView { .. } => {}
+            PlanNode::Window { input, windows } => {
+                collect_literals_for_test(input, out);
+                for w in windows {
+                    for arg in &w.args {
+                        collect_expr_literals(arg, out);
+                    }
+                }
+            }
             PlanNode::Union { left, right, .. } => {
                 collect_literals_for_test(left, out);
                 collect_literals_for_test(right, out);
+            }
+            PlanNode::Explain { input } => {
+                collect_literals_for_test(input, out);
             }
         }
     }
@@ -626,6 +715,7 @@ mod tests {
                     collect_expr_literals(a, out);
                 }
             }
+            Expr::Cast(inner, _) => collect_expr_literals(inner, out),
             Expr::Case { whens, else_expr } => {
                 for (cond, result) in whens {
                     collect_expr_literals(cond, out);
@@ -639,6 +729,11 @@ mod tests {
                 collect_expr_literals(expr, out);
             }
             Expr::ExistsSubquery { .. } => {}
+            Expr::Window { args, .. } => {
+                for a in args {
+                    collect_expr_literals(a, out);
+                }
+            }
         }
     }
 }

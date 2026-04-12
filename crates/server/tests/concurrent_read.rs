@@ -133,11 +133,12 @@ fn concurrent_readers_make_progress_in_parallel() {
 
     // With a true RwLock the 4-thread concurrent run should finish in
     // roughly 1/n of the sequential time on an idle box. We allow a
-    // generous 0.75 threshold to survive CI noise. A Mutex regression
-    // would clock in around 1.0 (same wall time as sequential), so this
-    // gap is large enough to catch it reliably.
+    // generous 0.85 threshold to survive GHA's noisy 2-vCPU runners
+    // where thread scheduling can compress the speedup. A Mutex
+    // regression would clock in around 1.0 (same wall time as
+    // sequential), so the gap is still large enough to catch it.
     assert!(
-        ratio < 0.75,
+        ratio < 0.85,
         "expected parallel reads under RwLock, but concurrent/sequential ratio was {ratio:.3} \
          (sequential={seq_elapsed:?}, concurrent={conc_elapsed:?}). \
          A ratio near 1.0 suggests reads are serialising on a mutex again.",

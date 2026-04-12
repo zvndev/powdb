@@ -707,6 +707,34 @@ impl Table {
         Ok(count)
     }
 
+    /// Single-pass fused scan + in-place patch. Evaluates `pred` on raw
+    /// row bytes and applies `try_mutate` to each match on the same hot
+    /// page — no second pass. Returns `(patched_count, fallback_rids)`.
+    ///
+    /// The `hook` closure fires after each successful patch with the
+    /// post-mutation bytes, used for WAL logging.
+    ///
+    /// Perf sprint: this is the update analogue of
+    /// `scan_delete_matching_with_hook`. Eliminates the two-pass
+    /// collect-then-patch pattern that doubled `ensure_hot` calls for
+    /// `update_by_filter`.
+    pub fn scan_patch_matching_with_hook<P, M, H>(
+        &mut self,
+        pred: P,
+        try_mutate: M,
+        hook: H,
+    ) -> io::Result<(u64, Vec<RowId>)>
+    where
+        P: FnMut(&[u8]) -> bool,
+        M: FnMut(&mut [u8]) -> Option<u16>,
+        H: FnMut(RowId, &[u8]),
+    {
+        // No index maintenance needed — callers guarantee the patched
+        // columns are not indexed (same constraint as the per-rid
+        // `with_row_bytes_mut` / `patch_var_col_in_place` fast paths).
+        self.heap.scan_patch_matching(pred, try_mutate, hook)
+    }
+
     /// Update a row in place when possible. Falls back to delete+insert only
     /// if the new encoding doesn't fit in the current slot.
     ///
@@ -716,6 +744,7 @@ impl Table {
     ///      again — usually on a different page),
     ///   2. did an O(N) scan over `pages_with_space` for every insert,
     ///   3. mutated every index even when the indexed column hadn't changed.
+    ///
     /// On `update_by_filter` (50K matching rows, status-only update, no
     /// index on status) that turned ~1ms of work into 30 seconds — a
     /// catastrophic O(N²)-ish gap vs SQLite (6.7ms total). The fix is to

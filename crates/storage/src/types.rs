@@ -170,7 +170,7 @@ impl Schema {
 
     /// Size of the null bitmap in bytes for this schema.
     pub fn null_bitmap_size(&self) -> usize {
-        (self.columns.len() + 7) / 8
+        self.columns.len().div_ceil(8)
     }
 }
 

@@ -126,11 +126,11 @@ pub fn encode_row_into_with_layout(
     let mut var_cursor: u16 = 0;
     let mut off_slot: usize = 0;
 
-    for i in 0..n_cols {
+    for (i, val) in values.iter().enumerate().take(n_cols) {
         if let Some(off) = layout.fixed_offsets[i] {
             // Nulls already zero from the up-front resize.
             let pos = fixed_start + off;
-            match &values[i] {
+            match val {
                 Value::Empty => {}
                 Value::Int(v) => {
                     out[pos..pos + 8].copy_from_slice(&v.to_le_bytes());
@@ -155,7 +155,7 @@ pub fn encode_row_into_with_layout(
             out[off_pos..off_pos + 2].copy_from_slice(&var_cursor.to_le_bytes());
             off_slot += 1;
 
-            match &values[i] {
+            match val {
                 Value::Empty => {} // zero-length, nothing to append
                 Value::Str(s) => {
                     let len = s.len();
@@ -219,7 +219,7 @@ impl RowLayout {
     /// not once per row.
     pub fn new(schema: &Schema) -> Self {
         let n_cols = schema.columns.len();
-        let bitmap_size = (n_cols + 7) / 8;
+        let bitmap_size = n_cols.div_ceil(8);
 
         let mut fixed_offsets = vec![None; n_cols];
         let mut var_index = vec![None; n_cols];
@@ -419,7 +419,7 @@ pub fn patch_var_column_in_place(
 #[inline]
 pub fn decode_row(schema: &Schema, data: &[u8]) -> Row {
     let n_cols = schema.columns.len();
-    let bitmap_size = (n_cols + 7) / 8;
+    let bitmap_size = n_cols.div_ceil(8);
 
     let mut pos = 2; // skip length prefix
 

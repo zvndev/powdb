@@ -30,6 +30,12 @@ pub struct TxManager {
     aborted_txs: HashSet<u64>,
 }
 
+impl Default for TxManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TxManager {
     pub fn new() -> Self {
         TxManager {

@@ -38,6 +38,13 @@ pub struct HeapFile {
     /// `delete_by_filter`.
     in_free_list: Vec<bool>,
     /// Optional mmap for zero-syscall reads. Activated by `enable_mmap()`.
+    ///
+    /// # Safety invariant
+    ///
+    /// Valid only while the file size is stable. `disable_mmap()` must be
+    /// called before any mutation that extends the file (e.g., `insert`
+    /// allocating a new page). Without invalidation the pointer covers
+    /// stale/incomplete data beyond the original mapped length.
     mmap_ptr: Option<(*const u8, usize)>,
     /// Mission C Phase 1: write-back cache for the most recently touched
     /// page. All insert/update/delete operations land here first and only
@@ -281,6 +288,17 @@ impl HeapFile {
         }
     }
 
+    /// Tear down the persistent mmap, if active. Safe to call when no
+    /// mapping exists (it's a no-op). Called automatically at the start of
+    /// `insert` so the mapping is invalidated before the file can grow.
+    pub fn disable_mmap(&mut self) {
+        if let Some((ptr, len)) = self.mmap_ptr.take() {
+            unsafe {
+                libc::munmap(ptr as *mut libc::c_void, len);
+            }
+        }
+    }
+
     /// Insert encoded row data. Returns RowId.
     ///
     /// Mission C Phase 1: uses the hot-page write-back cache. The common
@@ -288,6 +306,12 @@ impl HeapFile {
     /// disk syscalls; the page stays pinned until a different page is
     /// touched or an explicit flush runs.
     pub fn insert(&mut self, row_data: &[u8]) -> io::Result<RowId> {
+        // Invalidate the persistent mmap before any mutation that may
+        // extend the file. The mapping covers a snapshot of the file at
+        // enable_mmap() time; inserts that allocate new pages would grow
+        // the file beyond that snapshot.
+        self.disable_mmap();
+
         // Hot-path: the pinned page already has room. This is the bench's
         // insert_batch_1k / insert_single loop.
         if let Some(hot) = self.hot_page.as_mut() {
@@ -620,6 +644,78 @@ impl HeapFile {
             }
         }
         Ok(count)
+    }
+
+    /// Single-pass scan that evaluates a predicate and applies an in-place
+    /// mutation to every matching row. Returns `(patched_count, fallback_rids)`
+    /// where `fallback_rids` contains rows that matched the predicate but
+    /// where `try_mutate` returned `None` (e.g. a var-col patch that
+    /// couldn't shrink in place).
+    ///
+    /// `try_mutate` receives the row's raw `&mut [u8]` and returns
+    /// `Some(new_len)` on success (the slot is shrunk if `new_len < old_len`)
+    /// or `None` to signal a fallback. For fixed-width patches that don't
+    /// change row length, return `Some(bytes.len() as u16)`.
+    ///
+    /// The `hook` closure fires after every successful patch with the
+    /// post-mutation bytes — used by the catalog layer for WAL logging.
+    ///
+    /// Perf sprint: mirrors `scan_delete_matching` but mutates instead of
+    /// deleting. Eliminates the two-pass collect-RIDs-then-loop pattern
+    /// that caused `update_by_filter` to pay one `ensure_hot` per matched
+    /// row on the second pass.
+    pub fn scan_patch_matching<P, M, H>(
+        &mut self,
+        mut pred: P,
+        mut try_mutate: M,
+        mut hook: H,
+    ) -> io::Result<(u64, Vec<RowId>)>
+    where
+        P: FnMut(&[u8]) -> bool,
+        M: FnMut(&mut [u8]) -> Option<u16>,
+        H: FnMut(RowId, &[u8]),
+    {
+        let num_pages = self.disk.num_pages();
+        if num_pages == 0 {
+            return Ok((0, Vec::new()));
+        }
+        let mut count = 0u64;
+        let mut fallback: Vec<RowId> = Vec::new();
+        for page_id in 0..num_pages {
+            self.ensure_hot(page_id)?;
+            let hot = self.hot_page.as_mut().unwrap();
+            let slot_count = hot.page.slot_count();
+            let mut any_mutated = false;
+            for slot in 0..slot_count {
+                let matches = match hot.page.get(slot) {
+                    Some(bytes) => pred(bytes),
+                    None => false,
+                };
+                if matches {
+                    let rid = RowId { page_id, slot_index: slot };
+                    if let Some(bytes) = hot.page.slot_bytes_mut(slot) {
+                        let old_len = bytes.len() as u16;
+                        if let Some(new_len) = try_mutate(bytes) {
+                            if new_len < old_len {
+                                hot.page.shrink_slot(slot, new_len);
+                            }
+                            // Re-read the (possibly shrunk) bytes for the hook.
+                            if let Some(final_bytes) = hot.page.get(slot) {
+                                hook(rid, final_bytes);
+                            }
+                            any_mutated = true;
+                            count += 1;
+                        } else {
+                            fallback.push(rid);
+                        }
+                    }
+                }
+            }
+            if any_mutated {
+                hot.dirty = true;
+            }
+        }
+        Ok((count, fallback))
     }
 
     /// Update a row. Returns new RowId (may change if row moves).
@@ -992,9 +1088,7 @@ impl Drop for HeapFile {
         // this, the final write-back of a bench's last batch (and of
         // any deferred-flush mutations) would be lost on close.
         let _ = self.flush_all_dirty();
-        if let Some((ptr, len)) = self.mmap_ptr.take() {
-            unsafe { libc::munmap(ptr as *mut libc::c_void, len); }
-        }
+        self.disable_mmap();
     }
 }
 

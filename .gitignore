@@ -12,3 +12,8 @@ clients/ts/dist/
 
 # Bench artifacts
 crates/compare/results.csv
+
+# Fuzz build artifacts + corpus
+**/fuzz/target/
+**/fuzz/corpus/
+**/fuzz/artifacts/
