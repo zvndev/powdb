@@ -42,6 +42,10 @@ pub fn plan_statement(stmt: Statement) -> Result<PlanNode, PlanError> {
                 all: u.all,
             })
         }
+        Statement::Explain(inner) => {
+            let inner_plan = plan_statement(*inner)?;
+            Ok(PlanNode::Explain { input: Box::new(inner_plan) })
+        }
     }
 }
 
@@ -771,6 +775,40 @@ mod tests {
                     "expected GroupBy under Project, got {:?}", input);
             }
             other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_plan_explain_wraps_inner() {
+        let plan = plan("explain User filter .age > 30").unwrap();
+        match plan {
+            PlanNode::Explain { input } => {
+                assert!(matches!(*input, PlanNode::Filter { .. }),
+                    "expected Explain(Filter), got {:?}", input);
+            }
+            other => panic!("expected Explain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_plan_explain_simple_scan() {
+        let plan = plan("explain User").unwrap();
+        match plan {
+            PlanNode::Explain { input } => {
+                assert!(matches!(*input, PlanNode::SeqScan { .. }));
+            }
+            other => panic!("expected Explain(SeqScan), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_plan_explain_join() {
+        let plan = plan("explain User as u join Order as o on u.id = o.user_id").unwrap();
+        match plan {
+            PlanNode::Explain { input } => {
+                assert!(matches!(*input, PlanNode::NestedLoopJoin { .. }));
+            }
+            other => panic!("expected Explain(NestedLoopJoin), got {other:?}"),
         }
     }
 }

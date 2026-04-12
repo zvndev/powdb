@@ -86,6 +86,7 @@ pub enum Token {
     Drop,       // drop
     Add,        // add
     Column,     // column
+    Explain,    // explain
 
     // Operators
     Eq,         // =

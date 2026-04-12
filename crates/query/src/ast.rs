@@ -12,6 +12,7 @@ pub enum Statement {
     RefreshView(RefreshViewExpr),
     DropView(DropViewExpr),
     Union(UnionExpr),
+    Explain(Box<Statement>),
 }
 
 /// `alter User add column status: str` / `alter User drop column status`

@@ -253,6 +253,7 @@ fn hash_token(h: u64, tok: &Token, literals: &mut Vec<Literal>) -> u64 {
         Token::RowNumber    => hash_byte(h, 0x6A),
         Token::Rank         => hash_byte(h, 0x6B),
         Token::DenseRank    => hash_byte(h, 0x6C),
+        Token::Explain      => hash_byte(h, 0x6D),
 
         // Operators.
         Token::Eq       => hash_byte(h, 0x40),

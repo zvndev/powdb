@@ -62,6 +62,8 @@ pub enum PlanNode {
     },
     /// UNION [ALL]: execute both sides, concatenate (ALL) or deduplicate.
     Union { left: Box<PlanNode>, right: Box<PlanNode>, all: bool },
+    /// EXPLAIN: format the inner plan tree as a text result without executing.
+    Explain { input: Box<PlanNode> },
 }
 
 #[derive(Debug, Clone)]

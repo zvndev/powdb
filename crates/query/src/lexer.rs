@@ -170,6 +170,7 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                 "drop"         => Token::Drop,
                 "add"          => Token::Add,
                 "column"       => Token::Column,
+                "explain"      => Token::Explain,
                 "true"         => Token::BoolLit(true),
                 "false"        => Token::BoolLit(false),
                 _              => Token::Ident(word),

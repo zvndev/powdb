@@ -220,6 +220,9 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
             substitute_plan(left, literals, idx);
             substitute_plan(right, literals, idx);
         }
+        PlanNode::Explain { input } => {
+            substitute_plan(input, literals, idx);
+        }
     }
 }
 
@@ -322,6 +325,9 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
         PlanNode::Union { left, right, .. } => {
             count_plan(left, n);
             count_plan(right, n);
+        }
+        PlanNode::Explain { input } => {
+            count_plan(input, n);
         }
     }
 }
@@ -631,6 +637,9 @@ mod tests {
             PlanNode::Union { left, right, .. } => {
                 collect_literals_for_test(left, out);
                 collect_literals_for_test(right, out);
+            }
+            PlanNode::Explain { input } => {
+                collect_literals_for_test(input, out);
             }
         }
     }

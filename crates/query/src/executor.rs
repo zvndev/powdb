@@ -144,6 +144,7 @@ pub fn is_read_only_statement(stmt: &Statement) -> bool {
         | Statement::CreateView(_)
         | Statement::RefreshView(_)
         | Statement::DropView(_) => false,
+        Statement::Explain(inner) => is_read_only_statement(inner),
     }
 }
 
@@ -544,6 +545,9 @@ impl Engine {
 
             PlanNode::Filter { input, predicate } => {
                 // Materialise subqueries using the `&self` variant.
+                // Uncorrelated subqueries are replaced with InList/Bool;
+                // correlated ones are left as InSubquery/ExistsSubquery
+                // for per-row materialisation below.
                 let materialized;
                 let predicate = if contains_subquery(predicate) {
                     materialized = self.materialize_subqueries_readonly(predicate)?;
@@ -551,6 +555,26 @@ impl Engine {
                 } else {
                     predicate
                 };
+
+                // Correlated subquery path: per-row materialisation.
+                if contains_subquery(predicate) {
+                    let result = self.execute_plan_readonly(input)?;
+                    return match result {
+                        QueryResult::Rows { columns, rows } => {
+                            let mut filtered = Vec::new();
+                            for row in rows {
+                                let row_pred = self.materialize_correlated_for_row_readonly(
+                                    predicate, &row, &columns,
+                                )?;
+                                if eval_predicate(&row_pred, &row, &columns) {
+                                    filtered.push(row);
+                                }
+                            }
+                            Ok(QueryResult::Rows { columns, rows: filtered })
+                        }
+                        _ => Err("filter requires row input".into()),
+                    };
+                }
 
                 // Fused Filter+SeqScan fast path.
                 if let PlanNode::SeqScan { table } = input.as_ref() {
@@ -1104,6 +1128,16 @@ impl Engine {
                 Ok(QueryResult::Rows { columns: left_cols, rows: combined })
             }
 
+            PlanNode::Explain { input } => {
+                let text = format_plan_tree(input, 0);
+                Ok(QueryResult::Rows {
+                    columns: vec!["plan".to_string()],
+                    rows: text.lines()
+                        .map(|line| vec![Value::Str(line.to_string())])
+                        .collect(),
+                })
+            }
+
             // All write variants — caller must escalate to the write lock.
             PlanNode::Insert { .. }
             | PlanNode::Update { .. }
@@ -1127,9 +1161,14 @@ impl Engine {
         match expr {
             Expr::InSubquery { expr: inner, subquery, negated } => {
                 if is_correlated_subquery(subquery, &self.catalog) {
-                    return Err(
-                        "correlated subqueries are not yet supported \u{2014} use a join instead".into()
-                    );
+                    // Pass through — will be materialized per-row in the
+                    // Filter handler's correlated subquery path.
+                    let inner = self.materialize_subqueries_readonly(inner)?;
+                    return Ok(Expr::InSubquery {
+                        expr: Box::new(inner),
+                        subquery: subquery.clone(),
+                        negated: *negated,
+                    });
                 }
                 let inner = self.materialize_subqueries_readonly(inner)?;
                 let sub_plan = crate::planner::plan_statement(
@@ -1155,9 +1194,7 @@ impl Engine {
             }
             Expr::ExistsSubquery { subquery, negated } => {
                 if is_correlated_subquery(subquery, &self.catalog) {
-                    return Err(
-                        "correlated subqueries are not yet supported \u{2014} use a join instead".into()
-                    );
+                    return Ok(expr.clone());
                 }
                 let sub_plan = crate::planner::plan_statement(
                     Statement::Query(*subquery.clone()),
@@ -1190,6 +1227,79 @@ impl Engine {
                     None => None,
                 };
                 Ok(Expr::Case { whens, else_expr })
+            }
+            other => Ok(other.clone()),
+        }
+    }
+
+    /// Per-row materialisation of correlated subqueries. For each row in the
+    /// outer query, substitute outer column references in the subquery's
+    /// filter with the current row's literal values, execute the modified
+    /// subquery, and return the result as an InList or Bool literal.
+    fn materialize_correlated_for_row_readonly(
+        &self,
+        expr: &Expr,
+        outer_row: &[Value],
+        outer_columns: &[String],
+    ) -> Result<Expr, String> {
+        match expr {
+            Expr::InSubquery { expr: inner, subquery, negated } => {
+                let inner = self.materialize_correlated_for_row_readonly(
+                    inner, outer_row, outer_columns,
+                )?;
+                let mut sub = *subquery.clone();
+                if let Some(ref filter) = sub.filter {
+                    sub.filter = Some(substitute_outer_refs(
+                        filter, &sub.source, &self.catalog, outer_row, outer_columns,
+                    ));
+                }
+                let sub_plan = crate::planner::plan_statement(
+                    Statement::Query(sub),
+                ).map_err(|e| e.message)?;
+                let result = self.execute_plan_readonly(&sub_plan)?;
+                let values = match result {
+                    QueryResult::Rows { rows, .. } => {
+                        rows.into_iter()
+                            .filter_map(|mut row| {
+                                if row.is_empty() { None }
+                                else { Some(value_to_expr(row.swap_remove(0))) }
+                            })
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                };
+                Ok(Expr::InList {
+                    expr: Box::new(inner),
+                    list: values,
+                    negated: *negated,
+                })
+            }
+            Expr::ExistsSubquery { subquery, negated } => {
+                let mut sub = *subquery.clone();
+                if let Some(ref filter) = sub.filter {
+                    sub.filter = Some(substitute_outer_refs(
+                        filter, &sub.source, &self.catalog, outer_row, outer_columns,
+                    ));
+                }
+                let sub_plan = crate::planner::plan_statement(
+                    Statement::Query(sub),
+                ).map_err(|e| e.message)?;
+                let result = self.execute_plan_readonly(&sub_plan)?;
+                let has_rows = match result {
+                    QueryResult::Rows { rows, .. } => !rows.is_empty(),
+                    _ => false,
+                };
+                let truth = if *negated { !has_rows } else { has_rows };
+                Ok(Expr::Literal(Literal::Bool(truth)))
+            }
+            Expr::BinaryOp(l, op, r) => {
+                let l = self.materialize_correlated_for_row_readonly(l, outer_row, outer_columns)?;
+                let r = self.materialize_correlated_for_row_readonly(r, outer_row, outer_columns)?;
+                Ok(Expr::BinaryOp(Box::new(l), *op, Box::new(r)))
+            }
+            Expr::UnaryOp(op, inner) => {
+                let inner = self.materialize_correlated_for_row_readonly(inner, outer_row, outer_columns)?;
+                Ok(Expr::UnaryOp(*op, Box::new(inner)))
             }
             other => Ok(other.clone()),
         }
@@ -1588,9 +1698,12 @@ impl Engine {
         match expr {
             Expr::InSubquery { expr: inner, subquery, negated } => {
                 if is_correlated_subquery(subquery, &self.catalog) {
-                    return Err(
-                        "correlated subqueries are not yet supported \u{2014} use a join instead".into()
-                    );
+                    let inner = self.materialize_subqueries(inner)?;
+                    return Ok(Expr::InSubquery {
+                        expr: Box::new(inner),
+                        subquery: subquery.clone(),
+                        negated: *negated,
+                    });
                 }
                 let inner = self.materialize_subqueries(inner)?;
                 // Plan and execute the subquery.
@@ -1617,9 +1730,7 @@ impl Engine {
             }
             Expr::ExistsSubquery { subquery, negated } => {
                 if is_correlated_subquery(subquery, &self.catalog) {
-                    return Err(
-                        "correlated subqueries are not yet supported \u{2014} use a join instead".into()
-                    );
+                    return Ok(expr.clone());
                 }
                 // Uncorrelated EXISTS: run the subquery once and collapse
                 // into a Bool literal.
@@ -1660,6 +1771,76 @@ impl Engine {
         }
     }
 
+    /// Write-path per-row materialisation of correlated subqueries.
+    fn materialize_correlated_for_row(
+        &mut self,
+        expr: &Expr,
+        outer_row: &[Value],
+        outer_columns: &[String],
+    ) -> Result<Expr, String> {
+        match expr {
+            Expr::InSubquery { expr: inner, subquery, negated } => {
+                let inner = self.materialize_correlated_for_row(
+                    inner, outer_row, outer_columns,
+                )?;
+                let mut sub = *subquery.clone();
+                if let Some(ref filter) = sub.filter {
+                    sub.filter = Some(substitute_outer_refs(
+                        filter, &sub.source, &self.catalog, outer_row, outer_columns,
+                    ));
+                }
+                let sub_plan = crate::planner::plan_statement(
+                    Statement::Query(sub),
+                ).map_err(|e| e.message)?;
+                let result = self.execute_plan(&sub_plan)?;
+                let values = match result {
+                    QueryResult::Rows { rows, .. } => {
+                        rows.into_iter()
+                            .filter_map(|mut row| {
+                                if row.is_empty() { None }
+                                else { Some(value_to_expr(row.swap_remove(0))) }
+                            })
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                };
+                Ok(Expr::InList {
+                    expr: Box::new(inner),
+                    list: values,
+                    negated: *negated,
+                })
+            }
+            Expr::ExistsSubquery { subquery, negated } => {
+                let mut sub = *subquery.clone();
+                if let Some(ref filter) = sub.filter {
+                    sub.filter = Some(substitute_outer_refs(
+                        filter, &sub.source, &self.catalog, outer_row, outer_columns,
+                    ));
+                }
+                let sub_plan = crate::planner::plan_statement(
+                    Statement::Query(sub),
+                ).map_err(|e| e.message)?;
+                let result = self.execute_plan(&sub_plan)?;
+                let has_rows = match result {
+                    QueryResult::Rows { rows, .. } => !rows.is_empty(),
+                    _ => false,
+                };
+                let truth = if *negated { !has_rows } else { has_rows };
+                Ok(Expr::Literal(Literal::Bool(truth)))
+            }
+            Expr::BinaryOp(l, op, r) => {
+                let l = self.materialize_correlated_for_row(l, outer_row, outer_columns)?;
+                let r = self.materialize_correlated_for_row(r, outer_row, outer_columns)?;
+                Ok(Expr::BinaryOp(Box::new(l), *op, Box::new(r)))
+            }
+            Expr::UnaryOp(op, inner) => {
+                let inner = self.materialize_correlated_for_row(inner, outer_row, outer_columns)?;
+                Ok(Expr::UnaryOp(*op, Box::new(inner)))
+            }
+            other => Ok(other.clone()),
+        }
+    }
+
     pub fn execute_plan(&mut self, plan: &PlanNode) -> Result<QueryResult, String> {
         match plan {
             PlanNode::SeqScan { table } => {
@@ -1681,6 +1862,7 @@ impl Engine {
             PlanNode::Filter { input, predicate } => {
                 // Materialize any IN-subqueries in the predicate before the
                 // scan loop — the closure can't call back into the engine.
+                // Correlated subqueries are left in place for per-row eval.
                 let materialized;
                 let predicate = if contains_subquery(predicate) {
                     materialized = self.materialize_subqueries(predicate)?;
@@ -1688,6 +1870,26 @@ impl Engine {
                 } else {
                     predicate
                 };
+
+                // Correlated subquery path: per-row materialisation.
+                if contains_subquery(predicate) {
+                    let result = self.execute_plan(input)?;
+                    return match result {
+                        QueryResult::Rows { columns, rows } => {
+                            let mut filtered = Vec::new();
+                            for row in rows {
+                                let row_pred = self.materialize_correlated_for_row(
+                                    predicate, &row, &columns,
+                                )?;
+                                if eval_predicate(&row_pred, &row, &columns) {
+                                    filtered.push(row);
+                                }
+                            }
+                            Ok(QueryResult::Rows { columns, rows: filtered })
+                        }
+                        _ => Err("filter requires row input".into()),
+                    };
+                }
 
                 // Fast path: fuse Filter + SeqScan into a zero-copy streaming
                 // loop. Uses decode_column() to evaluate the predicate on only
@@ -2711,6 +2913,16 @@ impl Engine {
                 Ok(QueryResult::Rows { columns: left_cols, rows: combined })
             }
 
+            PlanNode::Explain { input } => {
+                let text = format_plan_tree(input, 0);
+                Ok(QueryResult::Rows {
+                    columns: vec!["plan".to_string()],
+                    rows: text.lines()
+                        .map(|line| vec![Value::Str(line.to_string())])
+                        .collect(),
+                })
+            }
+
             PlanNode::IndexScan { table, column, key } => {
                 let schema = self.catalog.schema(table)
                     .ok_or_else(|| format!("table '{table}' not found"))?
@@ -3619,6 +3831,63 @@ fn collect_field_refs(expr: &Expr, out: &mut Vec<String>) {
 /// Detect whether a subquery is correlated: any `Expr::Field` reference in
 /// the subquery's filter that doesn't match a column in the subquery's
 /// source table indicates a reference to an outer scope.
+/// Replace outer-scope field references in a correlated subquery's filter
+/// with literal values from the current outer row. Fields that belong to
+/// the subquery's own source table are left unchanged.
+fn substitute_outer_refs(
+    expr: &Expr,
+    subquery_source: &str,
+    catalog: &Catalog,
+    outer_row: &[Value],
+    outer_columns: &[String],
+) -> Expr {
+    let sub_cols: Vec<String> = catalog.schema(subquery_source)
+        .map(|s| s.columns.iter().map(|c| c.name.clone()).collect())
+        .unwrap_or_default();
+    substitute_outer_refs_inner(expr, &sub_cols, outer_row, outer_columns)
+}
+
+fn substitute_outer_refs_inner(
+    expr: &Expr,
+    sub_cols: &[String],
+    outer_row: &[Value],
+    outer_columns: &[String],
+) -> Expr {
+    match expr {
+        Expr::Field(name) => {
+            if sub_cols.iter().any(|c| c == name) {
+                expr.clone()
+            } else if let Some(i) = outer_columns.iter().position(|c| c == name) {
+                value_to_expr(outer_row[i].clone())
+            } else {
+                expr.clone()
+            }
+        }
+        Expr::BinaryOp(l, op, r) => {
+            let l = substitute_outer_refs_inner(l, sub_cols, outer_row, outer_columns);
+            let r = substitute_outer_refs_inner(r, sub_cols, outer_row, outer_columns);
+            Expr::BinaryOp(Box::new(l), *op, Box::new(r))
+        }
+        Expr::UnaryOp(op, inner) => {
+            let inner = substitute_outer_refs_inner(inner, sub_cols, outer_row, outer_columns);
+            Expr::UnaryOp(*op, Box::new(inner))
+        }
+        Expr::InList { expr: e, list, negated } => {
+            let e = substitute_outer_refs_inner(e, sub_cols, outer_row, outer_columns);
+            let list = list.iter()
+                .map(|item| substitute_outer_refs_inner(item, sub_cols, outer_row, outer_columns))
+                .collect();
+            Expr::InList { expr: Box::new(e), list, negated: *negated }
+        }
+        Expr::Coalesce(l, r) => {
+            let l = substitute_outer_refs_inner(l, sub_cols, outer_row, outer_columns);
+            let r = substitute_outer_refs_inner(r, sub_cols, outer_row, outer_columns);
+            Expr::Coalesce(Box::new(l), Box::new(r))
+        }
+        other => other.clone(),
+    }
+}
+
 fn is_correlated_subquery(subquery: &QueryExpr, catalog: &Catalog) -> bool {
     let filter = match &subquery.filter {
         Some(f) => f,
@@ -4285,6 +4554,128 @@ fn hash_join(
     }
 
     QueryResult::Rows { columns, rows }
+}
+
+/// Format a `PlanNode` tree as a human-readable, indented text
+/// representation. Used by the `EXPLAIN` command.
+fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
+    let indent = "  ".repeat(depth);
+    match plan {
+        PlanNode::SeqScan { table } => format!("{indent}SeqScan table={table}"),
+        PlanNode::AliasScan { table, alias } => {
+            format!("{indent}AliasScan table={table} alias={alias}")
+        }
+        PlanNode::IndexScan { table, column, key } => {
+            format!("{indent}IndexScan table={table} column={column} key={key:?}")
+        }
+        PlanNode::Filter { input, predicate } => {
+            let child = format_plan_tree(input, depth + 1);
+            format!("{indent}Filter predicate={predicate:?}\n{child}")
+        }
+        PlanNode::Project { input, fields } => {
+            let names: Vec<String> = fields.iter().map(|f| {
+                match &f.alias {
+                    Some(a) => format!("{a}: {:?}", f.expr),
+                    None => format!("{:?}", f.expr),
+                }
+            }).collect();
+            let child = format_plan_tree(input, depth + 1);
+            format!("{indent}Project fields=[{}]\n{child}", names.join(", "))
+        }
+        PlanNode::Sort { input, keys } => {
+            let ks: Vec<String> = keys.iter().map(|k| {
+                if k.descending { format!("{} desc", k.field) } else { k.field.clone() }
+            }).collect();
+            let child = format_plan_tree(input, depth + 1);
+            format!("{indent}Sort keys=[{}]\n{child}", ks.join(", "))
+        }
+        PlanNode::Limit { input, count } => {
+            let child = format_plan_tree(input, depth + 1);
+            format!("{indent}Limit count={count:?}\n{child}")
+        }
+        PlanNode::Offset { input, count } => {
+            let child = format_plan_tree(input, depth + 1);
+            format!("{indent}Offset count={count:?}\n{child}")
+        }
+        PlanNode::Aggregate { input, function, field } => {
+            let f = field.as_deref().unwrap_or("*");
+            let child = format_plan_tree(input, depth + 1);
+            format!("{indent}Aggregate fn={function:?} field={f}\n{child}")
+        }
+        PlanNode::NestedLoopJoin { left, right, on, kind } => {
+            let left_child = format_plan_tree(left, depth + 1);
+            let right_child = format_plan_tree(right, depth + 1);
+            let on_str = match on {
+                Some(pred) => format!("{pred:?}"),
+                None => "none".to_string(),
+            };
+            format!(
+                "{indent}NestedLoopJoin kind={kind:?} on={on_str}\n{left_child}\n{right_child}"
+            )
+        }
+        PlanNode::Distinct { input } => {
+            let child = format_plan_tree(input, depth + 1);
+            format!("{indent}Distinct\n{child}")
+        }
+        PlanNode::GroupBy { input, keys, aggregates, having } => {
+            let agg_strs: Vec<String> = aggregates.iter().map(|a| {
+                format!("{:?}({}) as {}", a.function, a.field, a.output_name)
+            }).collect();
+            let having_str = match having {
+                Some(h) => format!(" having={h:?}"),
+                None => String::new(),
+            };
+            let child = format_plan_tree(input, depth + 1);
+            format!(
+                "{indent}GroupBy keys=[{}] aggs=[{}]{having_str}\n{child}",
+                keys.join(", "),
+                agg_strs.join(", "),
+            )
+        }
+        PlanNode::Insert { table, assignments } => {
+            let cols: Vec<&str> = assignments.iter().map(|a| a.field.as_str()).collect();
+            format!("{indent}Insert table={table} cols=[{}]", cols.join(", "))
+        }
+        PlanNode::Update { input, table, assignments } => {
+            let cols: Vec<&str> = assignments.iter().map(|a| a.field.as_str()).collect();
+            let child = format_plan_tree(input, depth + 1);
+            format!("{indent}Update table={table} set=[{}]\n{child}", cols.join(", "))
+        }
+        PlanNode::Delete { input, table } => {
+            let child = format_plan_tree(input, depth + 1);
+            format!("{indent}Delete table={table}\n{child}")
+        }
+        PlanNode::CreateTable { name, fields } => {
+            let fs: Vec<String> = fields.iter().map(|(n, t, r)| {
+                if *r { format!("{n}: {t} required") } else { format!("{n}: {t}") }
+            }).collect();
+            format!("{indent}CreateTable name={name} fields=[{}]", fs.join(", "))
+        }
+        PlanNode::AlterTable { table, action } => {
+            format!("{indent}AlterTable table={table} action={action:?}")
+        }
+        PlanNode::DropTable { name } => format!("{indent}DropTable name={name}"),
+        PlanNode::CreateView { name, .. } => format!("{indent}CreateView name={name}"),
+        PlanNode::RefreshView { name } => format!("{indent}RefreshView name={name}"),
+        PlanNode::DropView { name } => format!("{indent}DropView name={name}"),
+        PlanNode::Window { input, windows } => {
+            let ws: Vec<String> = windows.iter().map(|w| {
+                format!("{:?} as {}", w.function, w.output_name)
+            }).collect();
+            let child = format_plan_tree(input, depth + 1);
+            format!("{indent}Window fns=[{}]\n{child}", ws.join(", "))
+        }
+        PlanNode::Union { left, right, all } => {
+            let kind = if *all { "UNION ALL" } else { "UNION" };
+            let left_child = format_plan_tree(left, depth + 1);
+            let right_child = format_plan_tree(right, depth + 1);
+            format!("{indent}{kind}\n{left_child}\n{right_child}")
+        }
+        PlanNode::Explain { input } => {
+            let child = format_plan_tree(input, depth + 1);
+            format!("{indent}Explain\n{child}")
+        }
+    }
 }
 
 /// Executor-local row layout — computes the layout facts the compiled
@@ -7479,6 +7870,135 @@ mod tests {
         for pair in as_sortable.windows(2) {
             assert!(pair[0] < pair[1],
                 "sortable u64 not monotonic: {:#x} >= {:#x}", pair[0], pair[1]);
+        }
+    }
+
+    // ─── EXPLAIN tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_explain_simple_scan() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql("explain User").unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["plan"]);
+                assert!(!rows.is_empty());
+                assert!(matches!(&rows[0][0], Value::Str(s) if s.contains("SeqScan")));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_explain_filter() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql("explain User filter .age > 30").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                let plan_text: String = rows.iter()
+                    .map(|r| match &r[0] { Value::Str(s) => s.as_str(), _ => "" })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(plan_text.contains("Filter"), "plan should show Filter node");
+                assert!(plan_text.contains("SeqScan"), "plan should show SeqScan node");
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_explain_does_not_execute() {
+        let mut engine = test_engine();
+        // EXPLAIN should NOT actually insert a row.
+        let result = engine.execute_powql(r#"explain insert User { name := "Zara", age := 99 }"#).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                let plan_text: String = rows.iter()
+                    .map(|r| match &r[0] { Value::Str(s) => s.as_str(), _ => "" })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(plan_text.contains("Insert"));
+            }
+            _ => panic!("expected rows"),
+        }
+        // Verify no row was actually inserted.
+        let result = engine.execute_powql("User { .name }").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3, "should still have original 3 users");
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    // ─── Correlated subquery tests ──────────────────────────────────────
+
+    #[test]
+    fn test_correlated_in_subquery() {
+        let mut engine = test_engine();
+        // Create an orders table with user_name to correlate on.
+        engine.execute_powql("type UserOrder { required user_name: str, required total: int }").unwrap();
+        engine.execute_powql(r#"insert UserOrder { user_name := "Alice", total := 100 }"#).unwrap();
+        engine.execute_powql(r#"insert UserOrder { user_name := "Alice", total := 200 }"#).unwrap();
+        engine.execute_powql(r#"insert UserOrder { user_name := "Bob", total := 50 }"#).unwrap();
+
+        // Correlated: for each User row, find orders where user_name = outer .name
+        // The subquery references .name which is a User column, not a UserOrder column.
+        let result = engine.execute_powql(
+            "User filter .name in (UserOrder filter .user_name = .name { .user_name }) { .name }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2, "Alice and Bob have orders");
+                let names: Vec<_> = rows.iter().map(|r| &r[0]).collect();
+                assert!(names.contains(&&Value::Str("Alice".into())));
+                assert!(names.contains(&&Value::Str("Bob".into())));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_correlated_exists_subquery() {
+        let mut engine = test_engine();
+        engine.execute_powql("type UserOrder { required user_name: str, required total: int }").unwrap();
+        engine.execute_powql(r#"insert UserOrder { user_name := "Alice", total := 100 }"#).unwrap();
+        engine.execute_powql(r#"insert UserOrder { user_name := "Bob", total := 50 }"#).unwrap();
+
+        // Correlated EXISTS: only Users who have at least one order.
+        // .name in the subquery filter refers to the outer User's name column.
+        let result = engine.execute_powql(
+            "User filter exists (UserOrder filter .user_name = .name) { .name }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2, "Alice and Bob have orders");
+                let names: Vec<_> = rows.iter().map(|r| &r[0]).collect();
+                assert!(names.contains(&&Value::Str("Alice".into())));
+                assert!(names.contains(&&Value::Str("Bob".into())));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_correlated_not_exists_subquery() {
+        let mut engine = test_engine();
+        engine.execute_powql("type UserOrder { required user_name: str, required total: int }").unwrap();
+        engine.execute_powql(r#"insert UserOrder { user_name := "Alice", total := 100 }"#).unwrap();
+
+        // NOT EXISTS: Users without orders (Bob and Charlie).
+        let result = engine.execute_powql(
+            "User filter not exists (UserOrder filter .user_name = .name) { .name }"
+        ).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2, "Bob and Charlie have no orders");
+                let names: Vec<_> = rows.iter().map(|r| &r[0]).collect();
+                assert!(names.contains(&&Value::Str("Bob".into())));
+                assert!(names.contains(&&Value::Str("Charlie".into())));
+            }
+            _ => panic!("expected rows"),
         }
     }
 }

@@ -39,6 +39,11 @@ impl Parser {
     }
 
     fn parse_statement(&mut self) -> Result<Statement, ParseError> {
+        if matches!(self.peek(), Token::Explain) {
+            self.advance();
+            let inner = self.parse_statement()?;
+            return Ok(Statement::Explain(Box::new(inner)));
+        }
         let stmt = match self.peek() {
             Token::Insert => self.parse_insert(),
             Token::Type => self.parse_create_type(),
@@ -1315,6 +1320,7 @@ fn tokens_to_text(tokens: &[Token]) -> String {
             Token::Comma => out.push(','),
             Token::Colon => out.push(':'),
             Token::Dot => out.push('.'),
+            Token::Explain => out.push_str("explain"),
             Token::Eof => {}
         }
     }
