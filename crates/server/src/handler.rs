@@ -114,7 +114,7 @@ pub async fn handle_connection(
     match connect_msg {
         Message::Connect { db_name, password } => {
             if let Some(expected) = &expected_password {
-                if !password.as_deref().map_or(false, |p| constant_time_eq(p.as_bytes(), expected.as_bytes())) {
+                if !password.as_deref().is_some_and(|p| constant_time_eq(p.as_bytes(), expected.as_bytes())) {
                     warn!(peer = %peer, db = %db_name, "auth rejected: bad password");
                     let err = Message::Error { message: "authentication failed".into() };
                     err.write_to(&mut writer).await.ok();

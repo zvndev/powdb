@@ -139,7 +139,7 @@ impl BufferPool {
                 if frame.pin_count > 0 {
                     attempts += 1;
                     if attempts > self.capacity * 2 {
-                        return Err(io::Error::new(io::ErrorKind::Other, "buffer pool full — all pages pinned"));
+                        return Err(io::Error::other("buffer pool full — all pages pinned"));
                     }
                     continue;
                 }
@@ -159,7 +159,7 @@ impl BufferPool {
             }
             attempts += 1;
             if attempts > self.capacity * 2 {
-                return Err(io::Error::new(io::ErrorKind::Other, "buffer pool full"));
+                return Err(io::Error::other("buffer pool full"));
             }
         }
     }

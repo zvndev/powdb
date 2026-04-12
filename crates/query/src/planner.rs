@@ -2,6 +2,9 @@ use crate::ast::*;
 use crate::parser::{parse, ParseError};
 use crate::plan::*;
 
+/// (column_name, lower_bound, upper_bound) — used by range-index extraction.
+type RangeBound = (String, Option<(Expr, bool)>, Option<(Expr, bool)>);
+
 #[derive(Debug)]
 pub struct PlanError {
     pub message: String,
@@ -394,7 +397,7 @@ fn try_extract_eq_index_key(table: &str, pred: &Expr) -> Option<PlanNode> {
 
 /// Extract a single range bound from a simple inequality predicate.
 /// Returns `(column, lower_bound, upper_bound)` where at most one bound is set.
-fn extract_single_bound(pred: &Expr) -> Option<(String, Option<(Expr, bool)>, Option<(Expr, bool)>)> {
+fn extract_single_bound(pred: &Expr) -> Option<RangeBound> {
     let (lhs, op, rhs) = match pred {
         Expr::BinaryOp(lhs, op, rhs) => (lhs.as_ref(), *op, rhs.as_ref()),
         _ => return None,

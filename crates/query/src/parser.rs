@@ -528,15 +528,10 @@ impl Parser {
         let mut order_by = Vec::new();
         if *self.peek() == Token::Partition {
             self.advance();
-            loop {
-                match self.peek() {
-                    Token::DotIdent(name) => {
-                        let name = name.clone();
-                        self.advance();
-                        partition_by.push(name);
-                    }
-                    _ => break,
-                }
+            while let Token::DotIdent(name) = self.peek() {
+                let name = name.clone();
+                self.advance();
+                partition_by.push(name);
                 if *self.peek() == Token::Comma {
                     // Only consume comma if the next token is another DotIdent
                     // (i.e. still in the partition list). If the next meaningful
@@ -553,15 +548,9 @@ impl Parser {
         }
         if *self.peek() == Token::Order {
             self.advance();
-            loop {
-                let field = match self.peek() {
-                    Token::DotIdent(name) => {
-                        let name = name.clone();
-                        self.advance();
-                        name
-                    }
-                    _ => break,
-                };
+            while let Token::DotIdent(name) = self.peek() {
+                let field = name.clone();
+                self.advance();
                 let descending = match self.peek() {
                     Token::Desc => { self.advance(); true }
                     Token::Asc => { self.advance(); false }
@@ -855,15 +844,10 @@ impl Parser {
     /// Parse `group .field1, .field2 [having <expr>]`.
     fn parse_group_by(&mut self) -> Result<GroupByClause, ParseError> {
         let mut keys = Vec::new();
-        loop {
-            match self.peek() {
-                Token::DotIdent(name) => {
-                    let name = name.clone();
-                    self.advance();
-                    keys.push(name);
-                }
-                _ => break,
-            }
+        while let Token::DotIdent(name) = self.peek() {
+            let name = name.clone();
+            self.advance();
+            keys.push(name);
             if *self.peek() == Token::Comma {
                 self.advance();
             } else {

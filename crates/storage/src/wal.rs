@@ -86,7 +86,7 @@ impl Wal {
 
     pub fn open(path: &Path, batch_size: usize) -> io::Result<Self> {
         let file = OpenOptions::new()
-            .create(true).write(true).read(true).append(true)
+            .create(true).read(true).append(true)
             .open(path)?;
         Ok(Wal {
             path: path.to_path_buf(),

@@ -744,6 +744,7 @@ impl Table {
     ///      again — usually on a different page),
     ///   2. did an O(N) scan over `pages_with_space` for every insert,
     ///   3. mutated every index even when the indexed column hadn't changed.
+    ///
     /// On `update_by_filter` (50K matching rows, status-only update, no
     /// index on status) that turned ~1ms of work into 30 seconds — a
     /// catastrophic O(N²)-ish gap vs SQLite (6.7ms total). The fix is to

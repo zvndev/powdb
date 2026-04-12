@@ -113,7 +113,7 @@ impl ViewRegistry {
     /// Check whether a view needs refresh.
     #[inline]
     pub fn is_dirty(&self, view_name: &str) -> bool {
-        self.views.get(view_name).map_or(false, |d| d.dirty)
+        self.views.get(view_name).is_some_and(|d| d.dirty)
     }
 
     /// Mark all views that depend on `table` as dirty. Called by the
@@ -127,7 +127,7 @@ impl ViewRegistry {
         // Borrow the view names list first, then mutate views.
         // We need to collect to avoid double-borrow.
         let names: Option<Vec<String>> = self.deps.get(table)
-            .map(|v| v.clone());
+            .cloned();
         if let Some(names) = names {
             for name in &names {
                 if let Some(def) = self.views.get_mut(name.as_str()) {

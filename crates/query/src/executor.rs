@@ -845,7 +845,7 @@ impl Engine {
                     QueryResult::Rows { columns, mut rows } => {
                         let key_indices: Vec<(usize, bool)> = keys.iter().map(|k| {
                             let idx = columns.iter().position(|c| c == &k.field)
-                                .expect(&format!("column '{}' not found", k.field));
+                                .unwrap_or_else(|| panic!("column '{}' not found", k.field));
                             (idx, k.descending)
                         }).collect();
                         rows.sort_by(|a, b| {
@@ -2197,7 +2197,7 @@ impl Engine {
                     QueryResult::Rows { columns, mut rows } => {
                         let key_indices: Vec<(usize, bool)> = keys.iter().map(|k| {
                             let idx = columns.iter().position(|c| c == &k.field)
-                                .expect(&format!("column '{}' not found", k.field));
+                                .unwrap_or_else(|| panic!("column '{}' not found", k.field));
                             (idx, k.descending)
                         }).collect();
                         rows.sort_by(|a, b| {
@@ -2893,7 +2893,7 @@ impl Engine {
             }
 
             PlanNode::Distinct { input } => {
-                let result = self.execute_plan(&input)?;
+                let result = self.execute_plan(input)?;
                 match result {
                     QueryResult::Rows { columns, rows } => {
                         let mut seen = std::collections::HashSet::new();
@@ -4310,7 +4310,7 @@ fn contains_subquery(expr: &Expr) -> bool {
         }
         Expr::Case { whens, else_expr } => {
             whens.iter().any(|(c, r)| contains_subquery(c) || contains_subquery(r))
-                || else_expr.as_ref().map_or(false, |e| contains_subquery(e))
+                || else_expr.as_ref().is_some_and(|e| contains_subquery(e))
         }
         Expr::ScalarFunc(_, args) => args.iter().any(contains_subquery),
         Expr::Cast(inner, _) => contains_subquery(inner),
@@ -4648,7 +4648,7 @@ fn eval_scalar_func(func: ScalarFn, args: &[Value]) -> Value {
 fn datetime_extract(part: &str, micros: i64) -> Value {
     // Convert micros to seconds + remainder for calendar calculations
     let total_secs = micros / 1_000_000;
-    let micro_rem = (micros % 1_000_000) as i64;
+    let micro_rem = micros % 1_000_000;
 
     // Simple civil calendar from Unix timestamp (no TZ — UTC assumed)
     let days_since_epoch = if total_secs >= 0 {
@@ -4656,7 +4656,7 @@ fn datetime_extract(part: &str, micros: i64) -> Value {
     } else {
         (total_secs - 86399) / 86400
     };
-    let secs_of_day = (total_secs - days_since_epoch * 86400) as i64;
+    let secs_of_day = total_secs - days_since_epoch * 86400;
 
     match part {
         "hour" => Value::Int(secs_of_day / 3600),
@@ -5030,6 +5030,7 @@ fn compute_group_aggregate(
 /// This is deliberately narrow. We only recognise the two shapes:
 ///   * `QualifiedField = QualifiedField`  (`u.id = o.user_id`)
 ///   * `Field = Field`                    (`.id = .user_id`, unqualified)
+///
 /// Anything else — conjunctions, constants, function calls, or predicates
 /// that touch the same side on both halves — falls through to the
 /// nested-loop path unchanged.
@@ -5192,11 +5193,11 @@ fn synthesize_range_predicate(column: &str, start: &Option<(Expr, bool)>, end: &
 fn range_matches(val: &Value, start: &Option<Value>, start_inc: bool, end: &Option<Value>, end_inc: bool) -> bool {
     if let Some(ref s) = start {
         if start_inc { if val < s { return false; } }
-        else { if val <= s { return false; } }
+        else if val <= s { return false; }
     }
     if let Some(ref e) = end {
         if end_inc { if val > e { return false; } }
-        else { if val >= e { return false; } }
+        else if val >= e { return false; }
     }
     true
 }
