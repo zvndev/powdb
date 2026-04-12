@@ -29,6 +29,12 @@ impl WalRecordType {
 /// WAL record header: len(4) + crc32(4) + tx_id(8) + type(1) = 17 bytes
 const WAL_HEADER_SIZE: usize = 17;
 
+/// Maximum allowed size for a single WAL record's data payload.
+/// Records claiming more than 256 MB are treated as corruption and
+/// stop replay — this prevents a crafted WAL from causing a
+/// multi-gigabyte allocation before the CRC check can reject it.
+const MAX_WAL_RECORD_SIZE: usize = 256 * 1024 * 1024;
+
 #[derive(Debug)]
 pub struct WalRecord {
     pub tx_id: u64,
@@ -183,15 +189,49 @@ impl Wal {
                 break;
             }
 
-            let total_len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
-            let stored_crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
-            let tx_id = u64::from_le_bytes(header[8..16].try_into().unwrap());
+            // These slice-to-array conversions are infallible (fixed-size
+            // sub-slices of a 17-byte array) but we avoid `unwrap` to
+            // satisfy the project-wide zero-panic policy.
+            let total_len_bytes: [u8; 4] = match header[0..4].try_into() {
+                Ok(b) => b,
+                Err(_) => break,
+            };
+            let total_len = u32::from_le_bytes(total_len_bytes) as usize;
+            let stored_crc_bytes: [u8; 4] = match header[4..8].try_into() {
+                Ok(b) => b,
+                Err(_) => break,
+            };
+            let stored_crc = u32::from_le_bytes(stored_crc_bytes);
+            let tx_id_bytes: [u8; 8] = match header[8..16].try_into() {
+                Ok(b) => b,
+                Err(_) => break,
+            };
+            let tx_id = u64::from_le_bytes(tx_id_bytes);
             let record_type = match WalRecordType::from_u8(header[16]) {
                 Some(rt) => rt,
                 None => break,
             };
 
-            let data_len = total_len - WAL_HEADER_SIZE;
+            // TASK-11: Verify the record fits within the file before
+            // allocating. Catches truncated writes without any allocation.
+            if pos + total_len as u64 > file_len {
+                break; // Record extends beyond file — truncated write
+            }
+
+            // TASK-09: Use checked_sub to prevent integer underflow when
+            // a corrupted WAL has total_len < WAL_HEADER_SIZE.
+            let data_len = match total_len.checked_sub(WAL_HEADER_SIZE) {
+                Some(len) => len,
+                None => break, // Corrupted record — stop replay
+            };
+
+            // TASK-10: Cap allocation size before reading data. A crafted
+            // WAL claiming a huge total_len would otherwise allocate
+            // gigabytes before the CRC check rejects the record.
+            if data_len > MAX_WAL_RECORD_SIZE {
+                break; // Unreasonably large record — treat as corruption
+            }
+
             let mut data = vec![0u8; data_len];
             if data_len > 0 {
                 file.read_exact(&mut data)?;
