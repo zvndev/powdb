@@ -255,6 +255,17 @@ fn hash_token(h: u64, tok: &Token, literals: &mut Vec<Literal>) -> u64 {
         Token::DenseRank    => hash_byte(h, 0x6C),
         Token::Explain      => hash_byte(h, 0x6D),
         Token::Conflict     => hash_byte(h, 0x6E),
+        Token::Abs          => hash_byte(h, 0x70),
+        Token::Round        => hash_byte(h, 0x71),
+        Token::Ceil         => hash_byte(h, 0x72),
+        Token::Floor        => hash_byte(h, 0x73),
+        Token::Sqrt         => hash_byte(h, 0x74),
+        Token::Pow          => hash_byte(h, 0x75),
+        Token::Now          => hash_byte(h, 0x76),
+        Token::Extract      => hash_byte(h, 0x77),
+        Token::DateAdd      => hash_byte(h, 0x78),
+        Token::DateDiff     => hash_byte(h, 0x79),
+        Token::Cast         => hash_byte(h, 0x7A),
 
         // Operators.
         Token::Eq       => hash_byte(h, 0x40),

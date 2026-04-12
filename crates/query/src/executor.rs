@@ -4203,6 +4203,7 @@ fn collect_field_refs(expr: &Expr, out: &mut Vec<String>) {
             for item in list { collect_field_refs(item, out); }
         }
         Expr::ScalarFunc(_, args) => { for a in args { collect_field_refs(a, out); } }
+        Expr::Cast(inner, _) => { collect_field_refs(inner, out); }
         Expr::Case { whens, else_expr } => {
             for (c, r) in whens { collect_field_refs(c, out); collect_field_refs(r, out); }
             if let Some(e) = else_expr { collect_field_refs(e, out); }
@@ -4312,6 +4313,7 @@ fn contains_subquery(expr: &Expr) -> bool {
                 || else_expr.as_ref().map_or(false, |e| contains_subquery(e))
         }
         Expr::ScalarFunc(_, args) => args.iter().any(contains_subquery),
+        Expr::Cast(inner, _) => contains_subquery(inner),
         Expr::FunctionCall(_, inner) => contains_subquery(inner),
         Expr::Coalesce(l, r) => contains_subquery(l) || contains_subquery(r),
         _ => false,
@@ -4452,6 +4454,10 @@ fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value {
                 None => Value::Empty,
             }
         }
+        Expr::Cast(inner, cast_type) => {
+            let val = eval_expr(inner, row, columns);
+            eval_cast(val, *cast_type)
+        }
         Expr::FunctionCall(_, _) | Expr::Param(_) | Expr::Window { .. } => Value::Empty,
     }
 }
@@ -4506,6 +4512,220 @@ fn eval_scalar_func(func: ScalarFn, args: &[Value]) -> Value {
             }
             Value::Str(result)
         }
+        // Math functions
+        ScalarFn::Abs => match args.first() {
+            Some(Value::Int(n)) => Value::Int(n.abs()),
+            Some(Value::Float(f)) => Value::Float(f.abs()),
+            _ => Value::Empty,
+        },
+        ScalarFn::Round => {
+            let decimals = match args.get(1) {
+                Some(Value::Int(d)) => *d as i32,
+                _ => 0,
+            };
+            match args.first() {
+                Some(Value::Float(f)) => {
+                    let factor = 10_f64.powi(decimals);
+                    Value::Float((f * factor).round() / factor)
+                }
+                Some(Value::Int(n)) => Value::Int(*n),
+                _ => Value::Empty,
+            }
+        }
+        ScalarFn::Ceil => match args.first() {
+            Some(Value::Float(f)) => Value::Float(f.ceil()),
+            Some(Value::Int(n)) => Value::Int(*n),
+            _ => Value::Empty,
+        },
+        ScalarFn::Floor => match args.first() {
+            Some(Value::Float(f)) => Value::Float(f.floor()),
+            Some(Value::Int(n)) => Value::Int(*n),
+            _ => Value::Empty,
+        },
+        ScalarFn::Sqrt => match args.first() {
+            Some(Value::Float(f)) => Value::Float(f.sqrt()),
+            Some(Value::Int(n)) => Value::Float((*n as f64).sqrt()),
+            _ => Value::Empty,
+        },
+        ScalarFn::Pow => {
+            match (args.first(), args.get(1)) {
+                (Some(Value::Float(base)), Some(Value::Float(exp))) => Value::Float(base.powf(*exp)),
+                (Some(Value::Float(base)), Some(Value::Int(exp))) => Value::Float(base.powi(*exp as i32)),
+                (Some(Value::Int(base)), Some(Value::Int(exp))) => {
+                    if *exp >= 0 {
+                        Value::Int(base.pow(*exp as u32))
+                    } else {
+                        Value::Float((*base as f64).powi(*exp as i32))
+                    }
+                }
+                (Some(Value::Int(base)), Some(Value::Float(exp))) => Value::Float((*base as f64).powf(*exp)),
+                _ => Value::Empty,
+            }
+        }
+        // Date/time functions
+        ScalarFn::Now => {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let micros = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as i64;
+            Value::DateTime(micros)
+        }
+        ScalarFn::Extract => {
+            // extract("part", datetime_expr)
+            let part = match args.first() {
+                Some(Value::Str(s)) => s.as_str(),
+                _ => return Value::Empty,
+            };
+            let micros = match args.get(1) {
+                Some(Value::DateTime(m)) => *m,
+                Some(Value::Int(m)) => *m, // treat raw int as micros
+                _ => return Value::Empty,
+            };
+            datetime_extract(part, micros)
+        }
+        ScalarFn::DateAdd => {
+            // date_add(datetime_expr, amount, "unit")
+            let micros = match args.first() {
+                Some(Value::DateTime(m)) => *m,
+                Some(Value::Int(m)) => *m,
+                _ => return Value::Empty,
+            };
+            let amount = match args.get(1) {
+                Some(Value::Int(n)) => *n,
+                _ => return Value::Empty,
+            };
+            let unit = match args.get(2) {
+                Some(Value::Str(s)) => s.as_str(),
+                _ => return Value::Empty,
+            };
+            let delta_micros = match unit {
+                "microsecond" | "microseconds" | "us" => amount,
+                "millisecond" | "milliseconds" | "ms" => amount * 1_000,
+                "second" | "seconds" | "s" => amount * 1_000_000,
+                "minute" | "minutes" | "m" => amount * 60_000_000,
+                "hour" | "hours" | "h" => amount * 3_600_000_000,
+                "day" | "days" | "d" => amount * 86_400_000_000,
+                _ => return Value::Empty,
+            };
+            Value::DateTime(micros + delta_micros)
+        }
+        ScalarFn::DateDiff => {
+            // date_diff(dt1, dt2, "unit")
+            let m1 = match args.first() {
+                Some(Value::DateTime(m)) => *m,
+                Some(Value::Int(m)) => *m,
+                _ => return Value::Empty,
+            };
+            let m2 = match args.get(1) {
+                Some(Value::DateTime(m)) => *m,
+                Some(Value::Int(m)) => *m,
+                _ => return Value::Empty,
+            };
+            let unit = match args.get(2) {
+                Some(Value::Str(s)) => s.as_str(),
+                _ => return Value::Empty,
+            };
+            let diff = m1 - m2;
+            let result = match unit {
+                "microsecond" | "microseconds" | "us" => diff,
+                "millisecond" | "milliseconds" | "ms" => diff / 1_000,
+                "second" | "seconds" | "s" => diff / 1_000_000,
+                "minute" | "minutes" | "m" => diff / 60_000_000,
+                "hour" | "hours" | "h" => diff / 3_600_000_000,
+                "day" | "days" | "d" => diff / 86_400_000_000,
+                _ => return Value::Empty,
+            };
+            Value::Int(result)
+        }
+    }
+}
+
+/// Extract a component from a DateTime value (microseconds since epoch).
+fn datetime_extract(part: &str, micros: i64) -> Value {
+    // Convert micros to seconds + remainder for calendar calculations
+    let total_secs = micros / 1_000_000;
+    let micro_rem = (micros % 1_000_000) as i64;
+
+    // Simple civil calendar from Unix timestamp (no TZ — UTC assumed)
+    let days_since_epoch = if total_secs >= 0 {
+        total_secs / 86400
+    } else {
+        (total_secs - 86399) / 86400
+    };
+    let secs_of_day = (total_secs - days_since_epoch * 86400) as i64;
+
+    match part {
+        "hour" => Value::Int(secs_of_day / 3600),
+        "minute" => Value::Int((secs_of_day % 3600) / 60),
+        "second" => Value::Int(secs_of_day % 60),
+        "millisecond" => Value::Int(micro_rem / 1000),
+        "microsecond" => Value::Int(micro_rem),
+        "epoch" => Value::Int(total_secs),
+        "year" | "month" | "day" => {
+            // Civil date from days since 1970-01-01 (algorithm from Howard Hinnant)
+            let z = days_since_epoch + 719468;
+            let era = if z >= 0 { z } else { z - 146096 } / 146097;
+            let doe = (z - era * 146097) as u32;
+            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+            let y = (yoe as i64) + era * 400;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let d = doy - (153 * mp + 2) / 5 + 1;
+            let m = if mp < 10 { mp + 3 } else { mp - 9 };
+            let y = if m <= 2 { y + 1 } else { y };
+            match part {
+                "year" => Value::Int(y),
+                "month" => Value::Int(m as i64),
+                "day" => Value::Int(d as i64),
+                _ => unreachable!(),
+            }
+        }
+        _ => Value::Empty,
+    }
+}
+
+/// Evaluate a CAST expression.
+fn eval_cast(val: Value, target: CastType) -> Value {
+    match target {
+        CastType::Int => match val {
+            Value::Int(n) => Value::Int(n),
+            Value::Float(f) => Value::Int(f as i64),
+            Value::Bool(b) => Value::Int(if b { 1 } else { 0 }),
+            Value::Str(s) => s.parse::<i64>().map(Value::Int).unwrap_or(Value::Empty),
+            Value::DateTime(m) => Value::Int(m),
+            _ => Value::Empty,
+        },
+        CastType::Float => match val {
+            Value::Float(f) => Value::Float(f),
+            Value::Int(n) => Value::Float(n as f64),
+            Value::Str(s) => s.parse::<f64>().map(Value::Float).unwrap_or(Value::Empty),
+            Value::Bool(b) => Value::Float(if b { 1.0 } else { 0.0 }),
+            _ => Value::Empty,
+        },
+        CastType::Str => match val {
+            Value::Str(s) => Value::Str(s),
+            Value::Int(n) => Value::Str(n.to_string()),
+            Value::Float(f) => Value::Str(f.to_string()),
+            Value::Bool(b) => Value::Str(b.to_string()),
+            Value::DateTime(m) => Value::Str(m.to_string()),
+            _ => Value::Empty,
+        },
+        CastType::Bool => match val {
+            Value::Bool(b) => Value::Bool(b),
+            Value::Int(n) => Value::Bool(n != 0),
+            Value::Str(s) => match s.as_str() {
+                "true" | "1" | "yes" => Value::Bool(true),
+                "false" | "0" | "no" => Value::Bool(false),
+                _ => Value::Empty,
+            },
+            _ => Value::Empty,
+        },
+        CastType::DateTime => match val {
+            Value::DateTime(m) => Value::DateTime(m),
+            Value::Int(m) => Value::DateTime(m),
+            _ => Value::Empty,
+        },
     }
 }
 
@@ -5625,6 +5845,9 @@ fn collect_field_indices(expr: &Expr, columns: &[String], out: &mut Vec<usize>) 
             for arg in args {
                 collect_field_indices(arg, columns, out);
             }
+        }
+        Expr::Cast(inner, _) => {
+            collect_field_indices(inner, columns, out);
         }
         Expr::Case { whens, else_expr } => {
             for (cond, result) in whens {
@@ -8445,6 +8668,219 @@ mod tests {
                 let names: Vec<_> = rows.iter().map(|r| &r[0]).collect();
                 assert!(names.contains(&&Value::Str("Bob".into())));
                 assert!(names.contains(&&Value::Str("Charlie".into())));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    // ─── CAST tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_cast_int_to_str() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql(r#"User { s: cast(.age, "str") }"#).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Str("30".into()));
+                assert_eq!(rows[1][0], Value::Str("25".into()));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_cast_str_to_int() {
+        let mut engine = test_engine();
+        engine.execute_powql(r#"type Numbers { required val: str }"#).unwrap();
+        engine.execute_powql(r#"insert Numbers { val := "42" }"#).unwrap();
+        let result = engine.execute_powql(r#"Numbers { n: cast(.val, "int") }"#).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Int(42));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_cast_float_to_int() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Floats { required val: float }").unwrap();
+        engine.execute_powql("insert Floats { val := 3.7 }").unwrap();
+        let result = engine.execute_powql(r#"Floats { n: cast(.val, "int") }"#).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Int(3));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_cast_int_to_float() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql(r#"User { f: cast(.age, "float") }"#).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Float(30.0));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_cast_int_to_bool() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql(r#"User { b: cast(.age, "bool") }"#).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                // age=30 -> true (non-zero)
+                assert_eq!(rows[0][0], Value::Bool(true));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    // ─── Math function tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_abs() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Nums { required val: int }").unwrap();
+        engine.execute_powql("insert Nums { val := -42 }").unwrap();
+        let result = engine.execute_powql("Nums { a: abs(.val) }").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Int(42));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_round() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Floats { required val: float }").unwrap();
+        engine.execute_powql("insert Floats { val := 3.14159 }").unwrap();
+        let result = engine.execute_powql("Floats { r: round(.val, 2) }").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Float(3.14));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_ceil_floor() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Floats { required val: float }").unwrap();
+        engine.execute_powql("insert Floats { val := 3.2 }").unwrap();
+        let c = engine.execute_powql("Floats { c: ceil(.val) }").unwrap();
+        let f = engine.execute_powql("Floats { f: floor(.val) }").unwrap();
+        match (c, f) {
+            (QueryResult::Rows { rows: cr, .. }, QueryResult::Rows { rows: fr, .. }) => {
+                assert_eq!(cr[0][0], Value::Float(4.0));
+                assert_eq!(fr[0][0], Value::Float(3.0));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_sqrt() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Nums { required val: int }").unwrap();
+        engine.execute_powql("insert Nums { val := 144 }").unwrap();
+        let result = engine.execute_powql("Nums { s: sqrt(.val) }").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Float(12.0));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_pow() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Nums { required val: int }").unwrap();
+        engine.execute_powql("insert Nums { val := 3 }").unwrap();
+        let result = engine.execute_powql("Nums { p: pow(.val, 4) }").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Int(81));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    // ─── Date/time function tests ─────────────────────────────────────
+
+    #[test]
+    fn test_now_returns_datetime() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Events { required name: str }").unwrap();
+        engine.execute_powql(r#"insert Events { name := "test" }"#).unwrap();
+        let result = engine.execute_powql("Events { ts: now() }").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                match &rows[0][0] {
+                    Value::DateTime(m) => assert!(*m > 0, "now() should return positive timestamp"),
+                    other => panic!("expected DateTime, got {other:?}"),
+                }
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_extract_from_datetime() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Events { required ts: datetime }").unwrap();
+        // 2024-01-15 12:30:45 UTC in microseconds
+        // 2024-01-15 = 19737 days since epoch
+        // 19737 * 86400 = 1705276800 seconds + 12*3600 + 30*60 + 45 = 1705321845
+        // * 1_000_000 = 1705321845000000
+        engine.execute_powql("insert Events { ts := 1705321845000000 }").unwrap();
+        let result = engine.execute_powql(r#"Events { y: extract("year", .ts), m: extract("month", .ts), d: extract("day", .ts), h: extract("hour", .ts) }"#).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Int(2024));
+                assert_eq!(rows[0][1], Value::Int(1));
+                assert_eq!(rows[0][2], Value::Int(15));
+                assert_eq!(rows[0][3], Value::Int(12));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_date_add() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Events { required ts: datetime }").unwrap();
+        let base = 1705321845000000_i64; // 2024-01-15 12:30:45 UTC
+        engine.execute_powql(&format!("insert Events {{ ts := {base} }}")).unwrap();
+        let result = engine.execute_powql(r#"Events { later: date_add(.ts, 2, "hours") }"#).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::DateTime(base + 2 * 3_600_000_000));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_date_diff() {
+        let mut engine = test_engine();
+        engine.execute_powql("type Events { required start_ts: datetime, required end_ts: datetime }").unwrap();
+        let t1 = 1705321845000000_i64; // 2024-01-15 12:30:45 UTC
+        let t2 = t1 + 3 * 86_400_000_000; // +3 days
+        engine.execute_powql(&format!("insert Events {{ start_ts := {t1}, end_ts := {t2} }}")).unwrap();
+        let result = engine.execute_powql(r#"Events { diff: date_diff(.end_ts, .start_ts, "days") }"#).unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Int(3));
             }
             _ => panic!("expected rows"),
         }

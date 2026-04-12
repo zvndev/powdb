@@ -385,6 +385,7 @@ fn count_expr(expr: &Expr, n: &mut usize) {
                 count_expr(a, n);
             }
         }
+        Expr::Cast(inner, _) => count_expr(inner, n),
         Expr::Case { whens, else_expr } => {
             for (cond, result) in whens {
                 count_expr(cond, n);
@@ -446,6 +447,7 @@ fn substitute_expr(expr: &mut Expr, literals: &[Literal], idx: &mut usize) {
                 substitute_expr(a, literals, idx);
             }
         }
+        Expr::Cast(inner, _) => substitute_expr(inner, literals, idx),
         Expr::Case { whens, else_expr } => {
             for (cond, result) in whens {
                 substitute_expr(cond, literals, idx);
@@ -713,6 +715,7 @@ mod tests {
                     collect_expr_literals(a, out);
                 }
             }
+            Expr::Cast(inner, _) => collect_expr_literals(inner, out),
             Expr::Case { whens, else_expr } => {
                 for (cond, result) in whens {
                     collect_expr_literals(cond, out);

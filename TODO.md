@@ -12,16 +12,16 @@ Target: 1–2 days
 - [ ] A-04: Publish TS client to npm (`@zvndev/powdb-client`)
 - [ ] A-05: Update README benchmark claims — qualify "3–9×" to aggregate/sort workloads
 
-### Sprint B — Core Missing Features *(ACTIVE)*
+### Sprint B — Core Missing Features *(DONE)*
 Target: 3–5 days
 
-- [ ] B-01: Graceful shutdown (signal handler + in-flight drain)
-- [ ] B-02: Connection timeouts (idle + query)
-- [ ] B-03: CAST / type conversion expressions
-- [ ] B-04: Math functions (ABS, ROUND, CEIL, FLOOR, SQRT, POW)
-- [ ] B-05: Date/time functions (NOW, EXTRACT, DATE_ADD, DATEDIFF)
-- [ ] B-06: UPSERT implementation (token exists, executor missing)
-- [ ] B-07: Range scan via B+tree index (col > X, col BETWEEN X AND Y)
+- [x] B-01: Graceful shutdown (signal handler + in-flight drain)
+- [x] B-02: Connection timeouts (idle + query)
+- [x] B-03: CAST / type conversion expressions
+- [x] B-04: Math functions (ABS, ROUND, CEIL, FLOOR, SQRT, POW)
+- [x] B-05: Date/time functions (NOW, EXTRACT, DATE_ADD, DATEDIFF)
+- [x] B-06: UPSERT implementation (token exists, executor missing)
+- [x] B-07: Range scan via B+tree index (col > X, col BETWEEN X AND Y)
 
 ### Sprint C — Security & Ops *(ACTIVE)*
 Target: 2–3 days

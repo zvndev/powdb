@@ -7,6 +7,28 @@ pub struct ParseError {
     pub message: String,
 }
 
+fn token_to_scalar_fn(tok: &Token) -> ScalarFn {
+    match tok {
+        Token::Upper => ScalarFn::Upper,
+        Token::Lower => ScalarFn::Lower,
+        Token::Length => ScalarFn::Length,
+        Token::Trim => ScalarFn::Trim,
+        Token::Substring => ScalarFn::Substring,
+        Token::Concat => ScalarFn::Concat,
+        Token::Abs => ScalarFn::Abs,
+        Token::Round => ScalarFn::Round,
+        Token::Ceil => ScalarFn::Ceil,
+        Token::Floor => ScalarFn::Floor,
+        Token::Sqrt => ScalarFn::Sqrt,
+        Token::Pow => ScalarFn::Pow,
+        Token::Now => ScalarFn::Now,
+        Token::Extract => ScalarFn::Extract,
+        Token::DateAdd => ScalarFn::DateAdd,
+        Token::DateDiff => ScalarFn::DateDiff,
+        _ => unreachable!(),
+    }
+}
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -445,16 +467,11 @@ impl Parser {
                         }
                     }
                     Token::Upper | Token::Lower | Token::Length | Token::Trim
-                    | Token::Substring | Token::Concat => {
-                        let func = match first {
-                            Token::Upper => ScalarFn::Upper,
-                            Token::Lower => ScalarFn::Lower,
-                            Token::Length => ScalarFn::Length,
-                            Token::Trim => ScalarFn::Trim,
-                            Token::Substring => ScalarFn::Substring,
-                            Token::Concat => ScalarFn::Concat,
-                            _ => unreachable!(),
-                        };
+                    | Token::Substring | Token::Concat
+                    | Token::Abs | Token::Round | Token::Ceil | Token::Floor
+                    | Token::Sqrt | Token::Pow
+                    | Token::Now | Token::Extract | Token::DateAdd | Token::DateDiff => {
+                        let func = token_to_scalar_fn(&first);
                         self.expect(&Token::LParen)?;
                         let mut args = Vec::new();
                         while *self.peek() != Token::RParen {
@@ -463,6 +480,14 @@ impl Parser {
                         }
                         self.expect(&Token::RParen)?;
                         Expr::ScalarFunc(func, args)
+                    }
+                    Token::Cast => {
+                        self.expect(&Token::LParen)?;
+                        let inner = self.parse_expr()?;
+                        self.expect(&Token::Comma)?;
+                        let cast_type = self.parse_cast_type()?;
+                        self.expect(&Token::RParen)?;
+                        Expr::Cast(Box::new(inner), cast_type)
                     }
                     Token::Case => {
                         let mut whens = Vec::new();
@@ -552,6 +577,21 @@ impl Parser {
         }
         self.expect(&Token::RParen)?;
         Ok((partition_by, order_by))
+    }
+
+    /// Parse a cast target type from a string literal: `"int"`, `"float"`, `"str"`, `"bool"`, `"datetime"`.
+    fn parse_cast_type(&mut self) -> Result<CastType, ParseError> {
+        match self.advance() {
+            Token::StringLit(s) => match s.as_str() {
+                "int" | "Int" | "INT" => Ok(CastType::Int),
+                "float" | "Float" | "FLOAT" => Ok(CastType::Float),
+                "str" | "Str" | "STR" | "string" | "String" => Ok(CastType::Str),
+                "bool" | "Bool" | "BOOL" | "boolean" => Ok(CastType::Bool),
+                "datetime" | "DateTime" | "DATETIME" => Ok(CastType::DateTime),
+                other => Err(ParseError { message: format!("invalid cast type: \"{other}\"") }),
+            },
+            t => Err(ParseError { message: format!("expected string literal for cast type, got {t:?}") }),
+        }
     }
 
     fn parse_order(&mut self) -> Result<OrderClause, ParseError> {
@@ -1024,16 +1064,12 @@ impl Parser {
                 Ok(Expr::FunctionCall(func, Box::new(inner)))
             }
             Token::Upper | Token::Lower | Token::Length | Token::Trim
-            | Token::Substring | Token::Concat => {
-                let func = match self.advance() {
-                    Token::Upper => ScalarFn::Upper,
-                    Token::Lower => ScalarFn::Lower,
-                    Token::Length => ScalarFn::Length,
-                    Token::Trim => ScalarFn::Trim,
-                    Token::Substring => ScalarFn::Substring,
-                    Token::Concat => ScalarFn::Concat,
-                    _ => unreachable!(),
-                };
+            | Token::Substring | Token::Concat
+            | Token::Abs | Token::Round | Token::Ceil | Token::Floor
+            | Token::Sqrt | Token::Pow
+            | Token::Now | Token::Extract | Token::DateAdd | Token::DateDiff => {
+                let tok = self.advance();
+                let func = token_to_scalar_fn(&tok);
                 self.expect(&Token::LParen)?;
                 let mut args = Vec::new();
                 while *self.peek() != Token::RParen {
@@ -1042,6 +1078,15 @@ impl Parser {
                 }
                 self.expect(&Token::RParen)?;
                 Ok(Expr::ScalarFunc(func, args))
+            }
+            Token::Cast => {
+                self.advance();
+                self.expect(&Token::LParen)?;
+                let inner = self.parse_expr()?;
+                self.expect(&Token::Comma)?;
+                let cast_type = self.parse_cast_type()?;
+                self.expect(&Token::RParen)?;
+                Ok(Expr::Cast(Box::new(inner), cast_type))
             }
             Token::Case => {
                 self.advance();
@@ -1315,6 +1360,17 @@ fn tokens_to_text(tokens: &[Token]) -> String {
             Token::Trim => out.push_str("trim"),
             Token::Substring => out.push_str("substring"),
             Token::Concat => out.push_str("concat"),
+            Token::Abs => out.push_str("abs"),
+            Token::Round => out.push_str("round"),
+            Token::Ceil => out.push_str("ceil"),
+            Token::Floor => out.push_str("floor"),
+            Token::Sqrt => out.push_str("sqrt"),
+            Token::Pow => out.push_str("pow"),
+            Token::Now => out.push_str("now"),
+            Token::Extract => out.push_str("extract"),
+            Token::DateAdd => out.push_str("date_add"),
+            Token::DateDiff => out.push_str("date_diff"),
+            Token::Cast => out.push_str("cast"),
             Token::Case => out.push_str("case"),
             Token::When => out.push_str("when"),
             Token::Then => out.push_str("then"),

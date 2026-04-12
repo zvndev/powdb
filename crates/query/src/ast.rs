@@ -220,6 +220,28 @@ pub enum ScalarFn {
     Trim,
     Substring,  // substring(expr, start, len) — 1-indexed
     Concat,     // concat(expr, expr, ...) — variadic
+    // Math
+    Abs,
+    Round,      // round(expr) or round(expr, decimals)
+    Ceil,
+    Floor,
+    Sqrt,
+    Pow,        // pow(base, exponent)
+    // Date/time
+    Now,        // now() — returns current unix timestamp in microseconds
+    Extract,    // extract("year"|"month"|..., datetime_expr)
+    DateAdd,    // date_add(datetime_expr, amount, "unit")
+    DateDiff,   // date_diff(dt1, dt2, "unit")
+}
+
+/// Target type for CAST expressions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CastType {
+    Int,
+    Float,
+    Str,
+    Bool,
+    DateTime,
 }
 
 /// Expressions.
@@ -260,6 +282,8 @@ pub enum Expr {
         partition_by: Vec<String>,
         order_by: Vec<OrderKey>,
     },
+    /// Type cast: `cast(expr, "int")` or `cast(expr, "str")` etc.
+    Cast(Box<Expr>, CastType),
 }
 
 #[derive(Debug, Clone, PartialEq)]
