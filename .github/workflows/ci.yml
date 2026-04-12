@@ -1,0 +1,78 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-test:
+    name: clippy + fmt + test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      RUSTFLAGS: "-C target-cpu=x86-64-v2"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ci-${{ runner.os }}-
+
+      - name: Check formatting
+        # Pre-existing formatting drift across the codebase means this
+        # step is advisory for now. Once a bulk `cargo fmt` lands, remove
+        # continue-on-error to make it blocking.
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      - name: Clippy lints
+        # -D warnings promotes all warnings to errors.
+        # -A flags below silence pre-existing lints in source files that
+        # predate this CI workflow. New lint categories will still fail.
+        run: >-
+          cargo clippy --workspace --all-targets --
+          -D warnings
+          -A clippy::approx_constant
+          -A clippy::manual_div_ceil
+          -A clippy::needless_range_loop
+          -A clippy::question_mark
+          -A clippy::new_without_default
+          -A clippy::while_let_loop
+          -A clippy::map_clone
+          -A clippy::unnecessary_map_or
+          -A clippy::useless_vec
+          -A clippy::doc_lazy_continuation
+          -A clippy::io_other_error
+          -A clippy::ineffective_open_options
+          -A clippy::identity_op
+          -A clippy::expect_fun_call
+          -A clippy::needless_borrow
+          -A clippy::ptr_arg
+          -A clippy::unnecessary_cast
+          -A clippy::cloned_ref_to_slice_refs
+          -A unused-variables
+
+      - name: Run tests
+        run: cargo test --workspace

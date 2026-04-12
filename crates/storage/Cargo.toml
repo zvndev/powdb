@@ -10,3 +10,6 @@ crc32fast.workspace = true
 tracing.workspace = true
 rustc-hash.workspace = true
 libc = "0.2"
+
+[dev-dependencies]
+proptest = "1"
