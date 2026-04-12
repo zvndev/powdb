@@ -185,6 +185,19 @@ pub enum AggFunc {
     Max,
 }
 
+/// Window function identifier.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WindowFunc {
+    RowNumber,
+    Rank,
+    DenseRank,
+    Sum,
+    Avg,
+    Count,
+    Min,
+    Max,
+}
+
 /// Scalar (non-aggregate) function — operates on single values.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScalarFn {
@@ -226,6 +239,13 @@ pub enum Expr {
     Case {
         whens: Vec<(Box<Expr>, Box<Expr>)>,
         else_expr: Option<Box<Expr>>,
+    },
+    /// Window function: `func(args) over (partition ... order ...)`
+    Window {
+        function: WindowFunc,
+        args: Vec<Expr>,
+        partition_by: Vec<String>,
+        order_by: Vec<OrderKey>,
     },
 }
 

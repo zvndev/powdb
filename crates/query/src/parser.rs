@@ -345,6 +345,18 @@ impl Parser {
                         }
                     }
                     Token::DotIdent(name) => Expr::Field(name),
+                    Token::RowNumber | Token::Rank | Token::DenseRank => {
+                        let wfunc = match first {
+                            Token::RowNumber  => WindowFunc::RowNumber,
+                            Token::Rank       => WindowFunc::Rank,
+                            Token::DenseRank  => WindowFunc::DenseRank,
+                            _ => return Err(ParseError { message: "unexpected window function token".into() }),
+                        };
+                        self.expect(&Token::LParen)?;
+                        self.expect(&Token::RParen)?;
+                        let (partition_by, order_by) = self.parse_over_clause()?;
+                        Expr::Window { function: wfunc, args: vec![], partition_by, order_by }
+                    }
                     Token::Count | Token::Avg | Token::Sum | Token::Min | Token::Max => {
                         let mut func = match first {
                             Token::Count => AggFunc::Count,
@@ -352,14 +364,25 @@ impl Parser {
                             Token::Sum   => AggFunc::Sum,
                             Token::Min   => AggFunc::Min,
                             Token::Max   => AggFunc::Max,
-                            _ => unreachable!(),
+                            _ => return Err(ParseError { message: "unexpected aggregate token".into() }),
                         };
                         self.expect(&Token::LParen)?;
                         // count(*) — count all rows
                         if func == AggFunc::Count && *self.peek() == Token::Star {
                             self.advance();
                             self.expect(&Token::RParen)?;
-                            Expr::FunctionCall(AggFunc::Count, Box::new(Expr::Field("*".into())))
+                            // Check for OVER — count(*) over (...)
+                            if *self.peek() == Token::Over {
+                                let (partition_by, order_by) = self.parse_over_clause()?;
+                                Expr::Window {
+                                    function: WindowFunc::Count,
+                                    args: vec![Expr::Field("*".into())],
+                                    partition_by,
+                                    order_by,
+                                }
+                            } else {
+                                Expr::FunctionCall(AggFunc::Count, Box::new(Expr::Field("*".into())))
+                            }
                         } else {
                         // count(distinct .field) → CountDistinct
                         if func == AggFunc::Count && *self.peek() == Token::Distinct {
@@ -368,7 +391,23 @@ impl Parser {
                         }
                         let inner = self.parse_expr()?;
                         self.expect(&Token::RParen)?;
-                        Expr::FunctionCall(func, Box::new(inner))
+                        // Check for OVER — e.g. sum(.salary) over (...)
+                        if *self.peek() == Token::Over {
+                            let wfunc = match func {
+                                AggFunc::Count => WindowFunc::Count,
+                                AggFunc::Avg   => WindowFunc::Avg,
+                                AggFunc::Sum   => WindowFunc::Sum,
+                                AggFunc::Min   => WindowFunc::Min,
+                                AggFunc::Max   => WindowFunc::Max,
+                                _ => return Err(ParseError {
+                                    message: "count(distinct ...) over (...) is not supported".into(),
+                                }),
+                            };
+                            let (partition_by, order_by) = self.parse_over_clause()?;
+                            Expr::Window { function: wfunc, args: vec![inner], partition_by, order_by }
+                        } else {
+                            Expr::FunctionCall(func, Box::new(inner))
+                        }
                         }
                     }
                     Token::Upper | Token::Lower | Token::Length | Token::Trim
@@ -419,6 +458,66 @@ impl Parser {
         }
         self.expect(&Token::RBrace)?;
         Ok(fields)
+    }
+
+    /// Parse the OVER clause for a window function:
+    /// `over (partition .col1, .col2 order .col3 asc, .col4 desc)`
+    fn parse_over_clause(&mut self) -> Result<(Vec<String>, Vec<OrderKey>), ParseError> {
+        self.expect(&Token::Over)?;
+        self.expect(&Token::LParen)?;
+        let mut partition_by = Vec::new();
+        let mut order_by = Vec::new();
+        if *self.peek() == Token::Partition {
+            self.advance();
+            loop {
+                match self.peek() {
+                    Token::DotIdent(name) => {
+                        let name = name.clone();
+                        self.advance();
+                        partition_by.push(name);
+                    }
+                    _ => break,
+                }
+                if *self.peek() == Token::Comma {
+                    // Only consume comma if the next token is another DotIdent
+                    // (i.e. still in the partition list). If the next meaningful
+                    // token is `order`, `RParen`, etc., stop.
+                    if matches!(self.tokens.get(self.pos + 1), Some(Token::DotIdent(_))) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        if *self.peek() == Token::Order {
+            self.advance();
+            loop {
+                let field = match self.peek() {
+                    Token::DotIdent(name) => {
+                        let name = name.clone();
+                        self.advance();
+                        name
+                    }
+                    _ => break,
+                };
+                let descending = match self.peek() {
+                    Token::Desc => { self.advance(); true }
+                    Token::Asc => { self.advance(); false }
+                    _ => false,
+                };
+                order_by.push(OrderKey { field, descending });
+                if *self.peek() == Token::Comma {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect(&Token::RParen)?;
+        Ok((partition_by, order_by))
     }
 
     fn parse_order(&mut self) -> Result<OrderClause, ParseError> {
@@ -824,6 +923,19 @@ impl Parser {
                 }
                 Ok(Expr::Field(name))
             }
+            // Window-only functions: row_number(), rank(), dense_rank()
+            Token::RowNumber | Token::Rank | Token::DenseRank => {
+                let wfunc = match self.advance() {
+                    Token::RowNumber  => WindowFunc::RowNumber,
+                    Token::Rank       => WindowFunc::Rank,
+                    Token::DenseRank  => WindowFunc::DenseRank,
+                    _ => return Err(ParseError { message: "unexpected window function token".into() }),
+                };
+                self.expect(&Token::LParen)?;
+                self.expect(&Token::RParen)?;
+                let (partition_by, order_by) = self.parse_over_clause()?;
+                Ok(Expr::Window { function: wfunc, args: vec![], partition_by, order_by })
+            }
             // Aggregate function calls inside expressions (projections, HAVING).
             // Top-level `count(User)` still routes through parse_aggregate_query
             // in parse_statement; this arm handles `count(.id)`, `sum(.age)`, etc.
@@ -834,13 +946,23 @@ impl Parser {
                     Token::Sum   => AggFunc::Sum,
                     Token::Min   => AggFunc::Min,
                     Token::Max   => AggFunc::Max,
-                    _ => unreachable!(),
+                    _ => return Err(ParseError { message: "unexpected aggregate token".into() }),
                 };
                 self.expect(&Token::LParen)?;
                 // count(*) — count all rows including nulls
                 if func == AggFunc::Count && *self.peek() == Token::Star {
                     self.advance();
                     self.expect(&Token::RParen)?;
+                    // Check for OVER — count(*) over (...)
+                    if *self.peek() == Token::Over {
+                        let (partition_by, order_by) = self.parse_over_clause()?;
+                        return Ok(Expr::Window {
+                            function: WindowFunc::Count,
+                            args: vec![Expr::Field("*".into())],
+                            partition_by,
+                            order_by,
+                        });
+                    }
                     return Ok(Expr::FunctionCall(AggFunc::Count, Box::new(Expr::Field("*".into()))));
                 }
                 // count(distinct .field) → CountDistinct
@@ -850,6 +972,21 @@ impl Parser {
                 }
                 let inner = self.parse_expr()?;
                 self.expect(&Token::RParen)?;
+                // Check for OVER — e.g. sum(.salary) over (...)
+                if *self.peek() == Token::Over {
+                    let wfunc = match func {
+                        AggFunc::Count => WindowFunc::Count,
+                        AggFunc::Avg   => WindowFunc::Avg,
+                        AggFunc::Sum   => WindowFunc::Sum,
+                        AggFunc::Min   => WindowFunc::Min,
+                        AggFunc::Max   => WindowFunc::Max,
+                        _ => return Err(ParseError {
+                            message: "count(distinct ...) over (...) is not supported".into(),
+                        }),
+                    };
+                    let (partition_by, order_by) = self.parse_over_clause()?;
+                    return Ok(Expr::Window { function: wfunc, args: vec![inner], partition_by, order_by });
+                }
                 Ok(Expr::FunctionCall(func, Box::new(inner)))
             }
             Token::Upper | Token::Lower | Token::Length | Token::Trim
@@ -1148,6 +1285,11 @@ fn tokens_to_text(tokens: &[Token]) -> String {
             Token::Then => out.push_str("then"),
             Token::Else => out.push_str("else"),
             Token::End => out.push_str("end"),
+            Token::Over => out.push_str("over"),
+            Token::Partition => out.push_str("partition"),
+            Token::RowNumber => out.push_str("row_number"),
+            Token::Rank => out.push_str("rank"),
+            Token::DenseRank => out.push_str("dense_rank"),
             Token::Alter => out.push_str("alter"),
             Token::Drop => out.push_str("drop"),
             Token::Add => out.push_str("add"),
@@ -2316,6 +2458,113 @@ mod tests {
                 }
             }
             _ => panic!("expected Query"),
+        }
+    }
+
+    // ---- Window function parser tests ----------------------------------------
+
+    #[test]
+    fn test_parse_window_row_number_order() {
+        let stmt = parse("User { .name, rn: row_number() over (order .age) }").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let proj = q.projection.unwrap();
+                assert_eq!(proj.len(), 2);
+                assert_eq!(proj[1].alias.as_deref(), Some("rn"));
+                match &proj[1].expr {
+                    Expr::Window { function, args, partition_by, order_by } => {
+                        assert_eq!(*function, WindowFunc::RowNumber);
+                        assert!(args.is_empty());
+                        assert!(partition_by.is_empty());
+                        assert_eq!(order_by.len(), 1);
+                        assert_eq!(order_by[0].field, "age");
+                        assert!(!order_by[0].descending);
+                    }
+                    other => panic!("expected Window, got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_window_sum_partition_order() {
+        let stmt = parse("User { .name, s: sum(.salary) over (partition .dept order .salary) }").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let proj = q.projection.unwrap();
+                assert_eq!(proj.len(), 2);
+                assert_eq!(proj[1].alias.as_deref(), Some("s"));
+                match &proj[1].expr {
+                    Expr::Window { function, args, partition_by, order_by } => {
+                        assert_eq!(*function, WindowFunc::Sum);
+                        assert_eq!(args.len(), 1);
+                        assert!(matches!(&args[0], Expr::Field(f) if f == "salary"));
+                        assert_eq!(partition_by, &["dept"]);
+                        assert_eq!(order_by.len(), 1);
+                        assert_eq!(order_by[0].field, "salary");
+                        assert!(!order_by[0].descending);
+                    }
+                    other => panic!("expected Window, got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_window_rank_desc() {
+        let stmt = parse("User { .dept, .salary, r: rank() over (partition .dept order .salary desc) }").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let proj = q.projection.unwrap();
+                assert_eq!(proj.len(), 3);
+                match &proj[2].expr {
+                    Expr::Window { function, partition_by, order_by, .. } => {
+                        assert_eq!(*function, WindowFunc::Rank);
+                        assert_eq!(partition_by, &["dept"]);
+                        assert_eq!(order_by.len(), 1);
+                        assert!(order_by[0].descending);
+                    }
+                    other => panic!("expected Window, got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_window_dense_rank() {
+        let stmt = parse("User { .name, dr: dense_rank() over (order .score desc) }").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let proj = q.projection.unwrap();
+                assert_eq!(proj.len(), 2);
+                match &proj[1].expr {
+                    Expr::Window { function, .. } => {
+                        assert_eq!(*function, WindowFunc::DenseRank);
+                    }
+                    other => panic!("expected Window, got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sum_without_over_is_aggregate() {
+        // sum(.salary) alone (no `over`) stays as FunctionCall, not Window.
+        let stmt = parse("User group .dept { .dept, total: sum(.salary) }").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let proj = q.projection.unwrap();
+                assert_eq!(proj.len(), 2);
+                match &proj[1].expr {
+                    Expr::FunctionCall(AggFunc::Sum, _) => {} // correct
+                    other => panic!("expected FunctionCall(Sum), got {other:?}"),
+                }
+            }
+            _ => panic!("expected query"),
         }
     }
 }
