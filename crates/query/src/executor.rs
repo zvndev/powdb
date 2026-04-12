@@ -5,7 +5,7 @@ use crate::plan_cache::PlanCache;
 use crate::planner;
 use crate::result::QueryResult;
 use powdb_storage::catalog::Catalog;
-use powdb_storage::row::{RowLayout, decode_column, decode_row};
+use powdb_storage::row::{RowLayout, decode_column, decode_row, patch_var_column_in_place};
 use powdb_storage::types::*;
 use powdb_storage::view::{ViewDef, ViewRegistry};
 use std::cmp::Reverse;
@@ -622,15 +622,14 @@ impl Engine {
             }
 
             PlanNode::Project { input, fields } => {
-                // Fast path: Project over IndexScan.
+                // Fast path: Project over IndexScan. Avoids full-row decode
+                // by calling decode_column only for projected fields.
                 if let PlanNode::IndexScan { table, column, key } = input.as_ref() {
-                    let schema = self.catalog.schema(table)
-                        .ok_or_else(|| format!("table '{table}' not found"))?
-                        .clone();
-                    let all_columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
                     let key_value = literal_to_value(key)?;
                     let tbl = self.catalog.get_table(table)
                         .ok_or_else(|| format!("table '{table}' not found"))?;
+                    let schema = &tbl.schema;
+                    let layout = tbl.row_layout();
 
                     let proj_columns: Vec<String> = fields.iter().map(|f| {
                         f.alias.clone().unwrap_or_else(|| match &f.expr {
@@ -641,14 +640,13 @@ impl Engine {
 
                     let proj_indices: Vec<usize> = fields.iter().filter_map(|f| {
                         if let Expr::Field(name) = &f.expr {
-                            all_columns.iter().position(|c| c == name)
+                            schema.column_index(name)
                         } else {
                             None
                         }
                     }).collect();
 
                     if let Some(btree) = tbl.index(column) {
-                        let layout = RowLayout::new(&schema);
                         let lookup_result = match &key_value {
                             Value::Int(k) => btree.lookup_int(*k),
                             other => btree.lookup(other),
@@ -657,7 +655,7 @@ impl Engine {
                             Some(rid) => match tbl.heap.get(rid) {
                                 Some(data) => {
                                     let row: Vec<Value> = proj_indices.iter()
-                                        .map(|&ci| decode_column(&schema, &layout, &data, ci))
+                                        .map(|&ci| decode_column(schema, layout, &data, ci))
                                         .collect();
                                     vec![row]
                                 }
@@ -2365,6 +2363,27 @@ impl Engine {
                 // decide whether to read the old row for index diff.
                 let changed_cols: Vec<usize> = col_indices.clone();
 
+                // ── Fused scan+update for Update(Filter(SeqScan)) ────────
+                // Perf sprint: instead of the two-pass collect-RIDs-then-loop
+                // pattern (which pays one ensure_hot per matched row on the
+                // second pass), fuse the predicate evaluation and in-place
+                // byte-level mutation into a single heap walk. Same idea as
+                // the fused scan_delete_matching path for deletes.
+                if let Some(ref resolved_assignments) = resolved_assignments {
+                    if let PlanNode::Filter { input: inner, predicate } = input.as_ref() {
+                        if let PlanNode::SeqScan { table: t } = inner.as_ref() {
+                            if t == table {
+                                let fused_result = self.try_fused_scan_update(
+                                    table, predicate, resolved_assignments, &changed_cols,
+                                );
+                                if let Some(result) = fused_result {
+                                    return result;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Collect matching RowIds in a single pass.
                 let matching_rids = self.collect_rids_for_mutation(input, table)?;
 
@@ -2924,14 +2943,10 @@ impl Engine {
             }
 
             PlanNode::IndexScan { table, column, key } => {
-                let schema = self.catalog.schema(table)
-                    .ok_or_else(|| format!("table '{table}' not found"))?
-                    .clone();
-                let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
                 let key_value = literal_to_value(key)?;
-
                 let tbl = self.catalog.get_table(table)
                     .ok_or_else(|| format!("table '{table}' not found"))?;
+                let columns: Vec<String> = tbl.schema.columns.iter().map(|c| c.name.clone()).collect();
 
                 // Fast path: the table has a B-tree on this column. A single
                 // point lookup returns 0 or 1 rows — this is the whole reason
@@ -2964,18 +2979,19 @@ impl Engine {
                 // first one. A non-indexed column isn't necessarily unique.
                 // We compile the eq predicate once and stream without any
                 // per-row decode for non-matching rows.
-                let fast = FastLayout::new(&schema);
+                let schema = &tbl.schema;
+                let fast = FastLayout::new(schema);
                 let synth_pred = Expr::BinaryOp(
                     Box::new(Expr::Field(column.clone())),
                     BinOp::Eq,
                     Box::new(key.clone()),
                 );
-                if let Some(compiled) = compile_predicate(&synth_pred, &columns, &fast, &schema) {
+                if let Some(compiled) = compile_predicate(&synth_pred, &columns, &fast, schema) {
                     // Mission F: skip the first 4 Vec doublings.
                     let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
                     self.catalog.for_each_row_raw(table, |_rid, data| {
                         if compiled(data) {
-                            rows.push(decode_row(&schema, data));
+                            rows.push(decode_row(schema, data));
                         }
                     }).map_err(|e| e.to_string())?;
                     return Ok(QueryResult::Rows { columns, rows });
@@ -3601,6 +3617,150 @@ impl Engine {
     /// for update/delete: SeqScan, IndexScan, and Filter(SeqScan). Other
     /// shapes fall back to `generic_rid_match`.
     ///
+    /// Perf sprint: try to fuse the predicate evaluation and in-place
+    /// byte-level mutation into a single heap walk. Returns `Some(result)`
+    /// if the fused path fired, `None` to fall through to the generic
+    /// two-pass code.
+    ///
+    /// Covers two shapes:
+    /// 1. Fixed-width non-null literal assignments on non-indexed columns
+    ///    → byte-patch every matched row in place (row length unchanged).
+    /// 2. Single var-col literal assignment on a non-indexed column
+    ///    → `patch_var_column_in_place` on every matched row (may shrink);
+    ///    rows that can't be patched in place are collected for fallback.
+    fn try_fused_scan_update(
+        &mut self,
+        table: &str,
+        predicate: &Expr,
+        resolved: &[(usize, Value)],
+        changed_cols: &[usize],
+    ) -> Option<Result<QueryResult, String>> {
+        // Build compiled predicate. Requires a schema borrow that must be
+        // dropped before we call scan_patch_matching_logged.
+        let compiled = {
+            let schema = self.catalog.schema(table)?;
+            let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+            let fast = FastLayout::new(schema);
+            compile_predicate(predicate, &columns, &fast, schema)?
+        };
+
+        // ── Path 1: fixed-width fast patch ──────────────────────────
+        let fixed_patches: Option<Vec<FastPatch>> = {
+            let tbl = self.catalog.get_table(table)?;
+            let schema = &tbl.schema;
+            let all_fixed_nonnull = resolved.iter().all(|(idx, val)| {
+                is_fixed_size(schema.columns[*idx].type_id) && !val.is_empty()
+            });
+            let no_indexed = !resolved.iter().any(|(idx, _)| tbl.has_indexed_col(*idx));
+            if all_fixed_nonnull && no_indexed {
+                let layout = RowLayout::new(schema);
+                let bitmap_size = layout.bitmap_size();
+                Some(resolved.iter().map(|(idx, val)| {
+                    let fixed_off = layout.fixed_offset(*idx)
+                        .expect("is_fixed_size already checked");
+                    let field_off = 2 + bitmap_size + fixed_off;
+                    let bytes: FixedBytes = match val {
+                        Value::Int(v)      => FixedBytes::I64(v.to_le_bytes()),
+                        Value::Float(v)    => FixedBytes::F64(v.to_le_bytes()),
+                        Value::Bool(v)     => FixedBytes::Bool(if *v { 1 } else { 0 }),
+                        Value::DateTime(v) => FixedBytes::I64(v.to_le_bytes()),
+                        Value::Uuid(v)     => FixedBytes::Uuid(*v),
+                        _ => unreachable!("all_fixed_nonnull guard"),
+                    };
+                    FastPatch {
+                        field_off,
+                        bitmap_byte_off: 2 + idx / 8,
+                        bit_mask: 1u8 << (idx % 8),
+                        bytes,
+                    }
+                }).collect())
+            } else {
+                None
+            }
+        };
+        if let Some(patches) = fixed_patches {
+            let result = self.catalog.scan_patch_matching_logged(
+                table,
+                compiled,
+                |row| {
+                    for p in &patches {
+                        row[p.bitmap_byte_off] &= !p.bit_mask;
+                        let field_bytes = p.bytes.as_slice();
+                        row[p.field_off..p.field_off + field_bytes.len()]
+                            .copy_from_slice(field_bytes);
+                    }
+                    Some(row.len() as u16)
+                },
+            ).map_err(|e| e.to_string());
+            match result {
+                Ok((count, _)) => {
+                    self.view_registry.mark_dependents_dirty(table);
+                    return Some(Ok(QueryResult::Modified(count)));
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+
+        // ── Path 2: single var-col shrink fast patch ────────────────
+        let var_patch: Option<(usize, Option<Vec<u8>>)> = {
+            let tbl = self.catalog.get_table(table)?;
+            let schema = &tbl.schema;
+            let is_single = resolved.len() == 1;
+            let is_var = is_single
+                && !is_fixed_size(schema.columns[resolved[0].0].type_id);
+            let no_indexed = !resolved.iter().any(|(idx, _)| tbl.has_indexed_col(*idx));
+            if is_single && is_var && no_indexed {
+                let (idx, val) = &resolved[0];
+                let bytes_opt = match val {
+                    Value::Str(s)   => Some(s.as_bytes().to_vec()),
+                    Value::Bytes(b) => Some(b.clone()),
+                    Value::Empty    => None,
+                    _               => return None, // type mismatch, fall through
+                };
+                Some((*idx, bytes_opt))
+            } else {
+                None
+            }
+        };
+        if let Some((col_idx, ref new_bytes_opt)) = var_patch {
+            // Build a fresh RowLayout before the mutable borrow.
+            let layout = {
+                let schema = self.catalog.schema(table)?;
+                RowLayout::new(schema)
+            };
+            let new_bytes_ref: Option<&[u8]> = new_bytes_opt.as_deref();
+            let result = self.catalog.scan_patch_matching_logged(
+                table,
+                compiled,
+                |row| patch_var_column_in_place(row, &layout, col_idx, new_bytes_ref),
+            ).map_err(|e| e.to_string());
+            match result {
+                Ok((mut count, fallback_rids)) => {
+                    // Handle rows where in-place patch failed (new > old).
+                    for rid in fallback_rids {
+                        let mut row = match self.catalog.get(table, rid) {
+                            Some(r) => r,
+                            None => continue,
+                        };
+                        for (idx, val) in resolved.iter() {
+                            row[*idx] = val.clone();
+                        }
+                        self.catalog
+                            .update_hinted(table, rid, &row, Some(changed_cols))
+                            .map_err(|e| e.to_string())
+                            .ok();
+                        count += 1;
+                    }
+                    self.view_registry.mark_dependents_dirty(table);
+                    return Some(Ok(QueryResult::Modified(count)));
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+
+        None // no fused path applicable — fall through
+    }
+
     /// Mission C Phase 3: schema is looked up via `self.catalog.schema(table)`
     /// inside the branches that actually need it. Previously the caller had
     /// to clone the full Schema (6+ String allocs) before every mutation just

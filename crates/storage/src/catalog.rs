@@ -550,6 +550,49 @@ impl Catalog {
         Ok(count)
     }
 
+    /// Single-pass fused scan + in-place patch with WAL logging.
+    /// Evaluates `pred` on raw row bytes and applies `try_mutate` to each
+    /// match on the same hot page — no second pass. Returns
+    /// `(patched_count, fallback_rids)`.
+    ///
+    /// Perf sprint: update analogue of `scan_delete_matching_logged`.
+    /// Eliminates the two-pass collect-then-patch pattern.
+    pub fn scan_patch_matching_logged<P, M>(
+        &mut self,
+        table: &str,
+        pred: P,
+        try_mutate: M,
+    ) -> io::Result<(u64, Vec<RowId>)>
+    where
+        P: FnMut(&[u8]) -> bool,
+        M: FnMut(&mut [u8]) -> Option<u16>,
+    {
+        if self.wal.is_off() {
+            return self.by_name_mut(table)?
+                .scan_patch_matching_with_hook(pred, try_mutate, |_, _| {});
+        }
+        let slot = *self.name_to_slot.get(table).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found"))
+        })?;
+        let tx_id = self.next_tx();
+        let Catalog { tables, wal, .. } = self;
+        let tbl = &mut tables[slot];
+        let name_bytes = table.as_bytes();
+        let result = tbl.scan_patch_matching_with_hook(pred, try_mutate, |rid, row_bytes| {
+            let mut payload: Vec<u8> = Vec::with_capacity(
+                4 + name_bytes.len() + 10 + row_bytes.len(),
+            );
+            payload.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            payload.extend_from_slice(name_bytes);
+            payload.extend_from_slice(&rid.page_id.to_le_bytes());
+            payload.extend_from_slice(&rid.slot_index.to_le_bytes());
+            payload.extend_from_slice(&(row_bytes.len() as u32).to_le_bytes());
+            payload.extend_from_slice(row_bytes);
+            let _ = wal.append(tx_id, WalRecordType::Update, &payload);
+        })?;
+        Ok(result)
+    }
+
     pub fn update(&mut self, table: &str, rid: RowId, values: &Row) -> io::Result<RowId> {
         // Mission B (post-review, second pass): WAL Off → no payload
         // construction.

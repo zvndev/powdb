@@ -63,16 +63,10 @@ const N_ROWS_WRITE: usize = 100_000;
 /// while staying under a ~5s total bench budget.
 const N_ROWS_DESTRUCTIVE: usize = 10_000;
 
-/// Smaller fixture for `update_by_filter` until FASTPATH's fused
-/// `Update(Filter(SeqScan))` fast path lands. The current executor uses an
-/// O(N·M) scan-then-match pattern: the filter materialises matching rows
-/// once, then the update layer re-scans the entire table for each row
-/// checking value equality. At 100K rows × ~16K matches that's 1.6 billion
-/// ops per iter and every sample takes ~30 s. Reducing to 10K rows
-/// (≈1.6K matches, 16M ops) brings a single iter under ~1 s pre-FASTPATH
-/// and still exercises the same code path. After FASTPATH lands, this can
-/// be bumped back to N_ROWS_WRITE in the rebaseline commit.
-const N_ROWS_UPDATE_FILTER: usize = 10_000;
+/// Fixture size for `update_by_filter`. Perf sprint: FASTPATH's fused
+/// `Update(Filter(SeqScan))` fast path eliminates the two-pass
+/// collect-then-patch pattern, so the benchmark can run at 100K rows.
+const N_ROWS_UPDATE_FILTER: usize = 100_000;
 
 /// Number of pre-generated query strings per read bench. Cycling through a
 /// small ring amortises hash-lookups against the plan cache without letting

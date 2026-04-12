@@ -646,6 +646,78 @@ impl HeapFile {
         Ok(count)
     }
 
+    /// Single-pass scan that evaluates a predicate and applies an in-place
+    /// mutation to every matching row. Returns `(patched_count, fallback_rids)`
+    /// where `fallback_rids` contains rows that matched the predicate but
+    /// where `try_mutate` returned `None` (e.g. a var-col patch that
+    /// couldn't shrink in place).
+    ///
+    /// `try_mutate` receives the row's raw `&mut [u8]` and returns
+    /// `Some(new_len)` on success (the slot is shrunk if `new_len < old_len`)
+    /// or `None` to signal a fallback. For fixed-width patches that don't
+    /// change row length, return `Some(bytes.len() as u16)`.
+    ///
+    /// The `hook` closure fires after every successful patch with the
+    /// post-mutation bytes — used by the catalog layer for WAL logging.
+    ///
+    /// Perf sprint: mirrors `scan_delete_matching` but mutates instead of
+    /// deleting. Eliminates the two-pass collect-RIDs-then-loop pattern
+    /// that caused `update_by_filter` to pay one `ensure_hot` per matched
+    /// row on the second pass.
+    pub fn scan_patch_matching<P, M, H>(
+        &mut self,
+        mut pred: P,
+        mut try_mutate: M,
+        mut hook: H,
+    ) -> io::Result<(u64, Vec<RowId>)>
+    where
+        P: FnMut(&[u8]) -> bool,
+        M: FnMut(&mut [u8]) -> Option<u16>,
+        H: FnMut(RowId, &[u8]),
+    {
+        let num_pages = self.disk.num_pages();
+        if num_pages == 0 {
+            return Ok((0, Vec::new()));
+        }
+        let mut count = 0u64;
+        let mut fallback: Vec<RowId> = Vec::new();
+        for page_id in 0..num_pages {
+            self.ensure_hot(page_id)?;
+            let hot = self.hot_page.as_mut().unwrap();
+            let slot_count = hot.page.slot_count();
+            let mut any_mutated = false;
+            for slot in 0..slot_count {
+                let matches = match hot.page.get(slot) {
+                    Some(bytes) => pred(bytes),
+                    None => false,
+                };
+                if matches {
+                    let rid = RowId { page_id, slot_index: slot };
+                    if let Some(bytes) = hot.page.slot_bytes_mut(slot) {
+                        let old_len = bytes.len() as u16;
+                        if let Some(new_len) = try_mutate(bytes) {
+                            if new_len < old_len {
+                                hot.page.shrink_slot(slot, new_len);
+                            }
+                            // Re-read the (possibly shrunk) bytes for the hook.
+                            if let Some(final_bytes) = hot.page.get(slot) {
+                                hook(rid, final_bytes);
+                            }
+                            any_mutated = true;
+                            count += 1;
+                        } else {
+                            fallback.push(rid);
+                        }
+                    }
+                }
+            }
+            if any_mutated {
+                hot.dirty = true;
+            }
+        }
+        Ok((count, fallback))
+    }
+
     /// Update a row. Returns new RowId (may change if row moves).
     ///
     /// Mission C Phase 1: in-place updates land on the hot page directly.
