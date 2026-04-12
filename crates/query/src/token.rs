@@ -74,6 +74,13 @@ pub enum Token {
     Else,       // else
     End,        // end
 
+    // Window functions
+    Over,       // over
+    Partition,  // partition
+    RowNumber,  // row_number
+    Rank,       // rank
+    DenseRank,  // dense_rank
+
     // DDL
     Alter,      // alter
     Drop,       // drop

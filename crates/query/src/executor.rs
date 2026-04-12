@@ -1071,6 +1071,11 @@ impl Engine {
                 Ok(QueryResult::Rows { columns, rows })
             }
 
+            PlanNode::Window { input, windows } => {
+                let result = self.execute_plan_readonly(input)?;
+                execute_window(result, windows)
+            }
+
             PlanNode::Union { left, right, all } => {
                 let left_result = self.execute_plan_readonly(left)?;
                 let right_result = self.execute_plan_readonly(right)?;
@@ -1121,6 +1126,11 @@ impl Engine {
     fn materialize_subqueries_readonly(&self, expr: &Expr) -> Result<Expr, String> {
         match expr {
             Expr::InSubquery { expr: inner, subquery, negated } => {
+                if is_correlated_subquery(subquery, &self.catalog) {
+                    return Err(
+                        "correlated subqueries are not yet supported \u{2014} use a join instead".into()
+                    );
+                }
                 let inner = self.materialize_subqueries_readonly(inner)?;
                 let sub_plan = crate::planner::plan_statement(
                     Statement::Query(*subquery.clone()),
@@ -1144,6 +1154,11 @@ impl Engine {
                 })
             }
             Expr::ExistsSubquery { subquery, negated } => {
+                if is_correlated_subquery(subquery, &self.catalog) {
+                    return Err(
+                        "correlated subqueries are not yet supported \u{2014} use a join instead".into()
+                    );
+                }
                 let sub_plan = crate::planner::plan_statement(
                     Statement::Query(*subquery.clone()),
                 ).map_err(|e| e.message)?;
@@ -1572,6 +1587,11 @@ impl Engine {
     fn materialize_subqueries(&mut self, expr: &Expr) -> Result<Expr, String> {
         match expr {
             Expr::InSubquery { expr: inner, subquery, negated } => {
+                if is_correlated_subquery(subquery, &self.catalog) {
+                    return Err(
+                        "correlated subqueries are not yet supported \u{2014} use a join instead".into()
+                    );
+                }
                 let inner = self.materialize_subqueries(inner)?;
                 // Plan and execute the subquery.
                 let sub_plan = crate::planner::plan_statement(
@@ -1596,11 +1616,13 @@ impl Engine {
                 })
             }
             Expr::ExistsSubquery { subquery, negated } => {
+                if is_correlated_subquery(subquery, &self.catalog) {
+                    return Err(
+                        "correlated subqueries are not yet supported \u{2014} use a join instead".into()
+                    );
+                }
                 // Uncorrelated EXISTS: run the subquery once and collapse
-                // into a Bool literal. Correlated subqueries (referencing
-                // outer columns) aren't supported yet — the planner would
-                // fail on the unknown field reference, surfacing a clear
-                // error rather than silently misbehaving.
+                // into a Bool literal.
                 let sub_plan = crate::planner::plan_statement(
                     Statement::Query(*subquery.clone()),
                 ).map_err(|e| e.message)?;
@@ -2653,6 +2675,11 @@ impl Engine {
                 })
             }
 
+            PlanNode::Window { input, windows } => {
+                let result = self.execute_plan(input)?;
+                execute_window(result, windows)
+            }
+
             PlanNode::Union { left, right, all } => {
                 let left_result = self.execute_plan(left)?;
                 let right_result = self.execute_plan(right)?;
@@ -3565,6 +3592,60 @@ fn type_name_to_id(name: &str) -> TypeId {
 /// materialization. Non-literal-representable values become `Literal::Int(0)`
 /// (shouldn't happen in practice — subqueries return primitive columns).
 /// Check if an expression tree contains any `InSubquery` nodes.
+/// Collect all `Expr::Field` names referenced by an expression tree.
+fn collect_field_refs(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Field(name) => out.push(name.clone()),
+        Expr::QualifiedField { qualifier, field } => {
+            out.push(format!("{qualifier}.{field}"));
+        }
+        Expr::BinaryOp(l, _, r) => { collect_field_refs(l, out); collect_field_refs(r, out); }
+        Expr::UnaryOp(_, inner) => collect_field_refs(inner, out),
+        Expr::FunctionCall(_, inner) => collect_field_refs(inner, out),
+        Expr::Coalesce(l, r) => { collect_field_refs(l, out); collect_field_refs(r, out); }
+        Expr::InList { expr, list, .. } => {
+            collect_field_refs(expr, out);
+            for item in list { collect_field_refs(item, out); }
+        }
+        Expr::ScalarFunc(_, args) => { for a in args { collect_field_refs(a, out); } }
+        Expr::Case { whens, else_expr } => {
+            for (c, r) in whens { collect_field_refs(c, out); collect_field_refs(r, out); }
+            if let Some(e) = else_expr { collect_field_refs(e, out); }
+        }
+        _ => {}
+    }
+}
+
+/// Detect whether a subquery is correlated: any `Expr::Field` reference in
+/// the subquery's filter that doesn't match a column in the subquery's
+/// source table indicates a reference to an outer scope.
+fn is_correlated_subquery(subquery: &QueryExpr, catalog: &Catalog) -> bool {
+    let filter = match &subquery.filter {
+        Some(f) => f,
+        None => return false,
+    };
+    let schema = match catalog.schema(&subquery.source) {
+        Some(s) => s,
+        None => return false, // table not found — not correlation, just an error
+    };
+    let table_cols: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+    let mut refs = Vec::new();
+    collect_field_refs(filter, &mut refs);
+    // If any referenced field doesn't exist in the subquery's source table,
+    // it's (probably) a reference to an outer scope — i.e., correlated.
+    refs.iter().any(|r| {
+        // Skip qualified references (alias.field) — they unambiguously
+        // target a specific source and will only match the subquery's own
+        // source if they share the alias.
+        if r.contains('.') {
+            let alias = subquery.alias.as_deref().unwrap_or(&subquery.source);
+            !r.starts_with(alias)
+        } else {
+            !table_cols.iter().any(|c| c == r)
+        }
+    })
+}
+
 fn contains_subquery(expr: &Expr) -> bool {
     match expr {
         Expr::InSubquery { .. } => true,
@@ -3719,7 +3800,7 @@ fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value {
                 None => Value::Empty,
             }
         }
-        Expr::FunctionCall(_, _) | Expr::Param(_) => Value::Empty,
+        Expr::FunctionCall(_, _) | Expr::Param(_) | Expr::Window { .. } => Value::Empty,
     }
 }
 
@@ -3774,6 +3855,219 @@ fn eval_scalar_func(func: ScalarFn, args: &[Value]) -> Value {
             Value::Str(result)
         }
     }
+}
+
+/// Execute window function computations. Shared by both read and write paths.
+///
+/// For each `WindowDef`:
+///   1. Sort rows by (partition_by keys, order_by keys).
+///   2. Walk sorted rows, detecting partition boundaries.
+///   3. Compute the window value per row (running aggregates reset at
+///      partition boundaries).
+///   4. Append the computed column to each row and register the column name.
+///
+/// All computed columns are appended to the original row data; the
+/// downstream `Project` node plucks the ones the user asked for.
+fn execute_window(result: QueryResult, windows: &[WindowDef]) -> Result<QueryResult, String> {
+    let (mut columns, mut rows) = match result {
+        QueryResult::Rows { columns, rows } => (columns, rows),
+        _ => return Err("window function requires row input".into()),
+    };
+
+    for wdef in windows {
+        // Resolve partition/order column indices against current columns.
+        let part_indices: Vec<usize> = wdef.partition_by.iter().map(|name| {
+            columns.iter().position(|c| c == name)
+                .ok_or_else(|| format!("window partition column '{name}' not found"))
+        }).collect::<Result<Vec<_>, _>>()?;
+
+        let ord_indices: Vec<(usize, bool)> = wdef.order_by.iter().map(|sk| {
+            columns.iter().position(|c| c == &sk.field)
+                .map(|i| (i, sk.descending))
+                .ok_or_else(|| format!("window order column '{}' not found", sk.field))
+        }).collect::<Result<Vec<_>, _>>()?;
+
+        // Resolve the argument column index (for aggregate windows).
+        let arg_col_idx: Option<usize> = if let Some(arg) = wdef.args.first() {
+            match arg {
+                Expr::Field(name) => {
+                    if name == "*" {
+                        None // count(*) style — no specific column
+                    } else {
+                        Some(columns.iter().position(|c| c == name)
+                            .ok_or_else(|| format!("window arg column '{name}' not found"))?)
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        // Build a sort-index to sort rows by partition_by then order_by
+        // without actually reordering the original Vec (we need original
+        // order to write results back).
+        let n = rows.len();
+        let mut indices: Vec<usize> = (0..n).collect();
+        indices.sort_by(|&a, &b| {
+            // Compare partition keys first.
+            for &pi in &part_indices {
+                let cmp = rows[a][pi].cmp(&rows[b][pi]);
+                if cmp != std::cmp::Ordering::Equal {
+                    return cmp;
+                }
+            }
+            // Then order keys.
+            for &(oi, desc) in &ord_indices {
+                let cmp = rows[a][oi].cmp(&rows[b][oi]);
+                if cmp != std::cmp::Ordering::Equal {
+                    return if desc { cmp.reverse() } else { cmp };
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+
+        // Compute window values in sorted order, tracking partition boundaries.
+        let mut win_values: Vec<Value> = vec![Value::Empty; n];
+        let mut partition_start = 0usize;
+        // Running state for aggregate windows:
+        let mut running_count: i64 = 0;
+        let mut running_int_sum: i64 = 0;
+        let mut running_float_sum: f64 = 0.0;
+        let mut running_saw_float = false;
+        let mut running_min: Option<Value> = None;
+        let mut running_max: Option<Value> = None;
+        let mut rank_counter: i64 = 0;
+        let mut dense_rank_counter: i64 = 0;
+        let mut prev_order_key: Option<Vec<Value>> = None;
+        let mut same_rank_count: i64 = 0;
+
+        for sorted_pos in 0..n {
+            let row_idx = indices[sorted_pos];
+
+            // Detect partition boundary.
+            let new_partition = if sorted_pos == 0 {
+                true
+            } else {
+                let prev_row_idx = indices[sorted_pos - 1];
+                part_indices.iter().any(|&pi| rows[row_idx][pi] != rows[prev_row_idx][pi])
+            };
+
+            if new_partition {
+                partition_start = sorted_pos;
+                running_count = 0;
+                running_int_sum = 0;
+                running_float_sum = 0.0;
+                running_saw_float = false;
+                running_min = None;
+                running_max = None;
+                rank_counter = 0;
+                dense_rank_counter = 0;
+                prev_order_key = None;
+                same_rank_count = 0;
+            }
+
+            // Extract current order key for rank tracking.
+            let current_order_key: Vec<Value> = ord_indices.iter()
+                .map(|&(oi, _)| rows[row_idx][oi].clone())
+                .collect();
+            let same_as_prev = prev_order_key.as_ref() == Some(&current_order_key);
+
+            let value = match wdef.function {
+                WindowFunc::RowNumber => {
+                    Value::Int((sorted_pos - partition_start + 1) as i64)
+                }
+                WindowFunc::Rank => {
+                    if same_as_prev {
+                        same_rank_count += 1;
+                    } else {
+                        rank_counter += same_rank_count + 1;
+                        same_rank_count = 0;
+                        if rank_counter == 0 { rank_counter = 1; }
+                    }
+                    Value::Int(rank_counter)
+                }
+                WindowFunc::DenseRank => {
+                    if !same_as_prev {
+                        dense_rank_counter += 1;
+                    }
+                    Value::Int(dense_rank_counter)
+                }
+                WindowFunc::Sum => {
+                    if let Some(ci) = arg_col_idx {
+                        match &rows[row_idx][ci] {
+                            Value::Int(v) => running_int_sum += v,
+                            Value::Float(v) => { running_float_sum += v; running_saw_float = true; }
+                            _ => {}
+                        }
+                    }
+                    if running_saw_float {
+                        Value::Float(running_float_sum + running_int_sum as f64)
+                    } else {
+                        Value::Int(running_int_sum)
+                    }
+                }
+                WindowFunc::Avg => {
+                    if let Some(ci) = arg_col_idx {
+                        match &rows[row_idx][ci] {
+                            Value::Int(v) => { running_float_sum += *v as f64; running_count += 1; }
+                            Value::Float(v) => { running_float_sum += v; running_count += 1; }
+                            _ => {}
+                        }
+                    }
+                    if running_count == 0 { Value::Empty } else {
+                        Value::Float(running_float_sum / running_count as f64)
+                    }
+                }
+                WindowFunc::Count => {
+                    if let Some(ci) = arg_col_idx {
+                        if !rows[row_idx][ci].is_empty() {
+                            running_count += 1;
+                        }
+                    } else {
+                        // count(*) — count all rows
+                        running_count += 1;
+                    }
+                    Value::Int(running_count)
+                }
+                WindowFunc::Min => {
+                    if let Some(ci) = arg_col_idx {
+                        let v = &rows[row_idx][ci];
+                        if !v.is_empty() {
+                            running_min = Some(match &running_min {
+                                None => v.clone(),
+                                Some(cur) => if v < cur { v.clone() } else { cur.clone() },
+                            });
+                        }
+                    }
+                    running_min.clone().unwrap_or(Value::Empty)
+                }
+                WindowFunc::Max => {
+                    if let Some(ci) = arg_col_idx {
+                        let v = &rows[row_idx][ci];
+                        if !v.is_empty() {
+                            running_max = Some(match &running_max {
+                                None => v.clone(),
+                                Some(cur) => if v > cur { v.clone() } else { cur.clone() },
+                            });
+                        }
+                    }
+                    running_max.clone().unwrap_or(Value::Empty)
+                }
+            };
+
+            prev_order_key = Some(current_order_key);
+            win_values[row_idx] = value;
+        }
+
+        // Append the computed window column to each row.
+        for (ri, row) in rows.iter_mut().enumerate() {
+            row.push(win_values[ri].clone());
+        }
+        columns.push(wdef.output_name.clone());
+    }
+
+    Ok(QueryResult::Rows { columns, rows })
 }
 
 /// Mission E2b: compute one aggregate over a set of rows in a group.

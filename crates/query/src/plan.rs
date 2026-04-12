@@ -1,4 +1,4 @@
-use crate::ast::{AggFunc, AlterAction, Expr, Assignment, JoinKind};
+use crate::ast::{AggFunc, AlterAction, Expr, Assignment, JoinKind, WindowFunc};
 
 /// Physical plan nodes — what the executor actually runs.
 #[derive(Debug, Clone)]
@@ -55,6 +55,11 @@ pub enum PlanNode {
     RefreshView { name: String },
     /// Drop a materialized view (backing table + registry entry).
     DropView { name: String },
+    /// Window function computation layer.
+    Window {
+        input: Box<PlanNode>,
+        windows: Vec<WindowDef>,
+    },
     /// UNION [ALL]: execute both sides, concatenate (ALL) or deduplicate.
     Union { left: Box<PlanNode>, right: Box<PlanNode>, all: bool },
 }
@@ -78,5 +83,15 @@ pub struct GroupAgg {
     /// Source column name to aggregate over.
     pub field: String,
     /// Synthetic output column name (`__agg_0`, `__agg_1`, …).
+    pub output_name: String,
+}
+
+/// One window function definition inside a `PlanNode::Window`.
+#[derive(Debug, Clone)]
+pub struct WindowDef {
+    pub function: WindowFunc,
+    pub args: Vec<Expr>,
+    pub partition_by: Vec<String>,
+    pub order_by: Vec<SortKey>,
     pub output_name: String,
 }

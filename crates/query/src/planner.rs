@@ -132,10 +132,14 @@ fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
     }
 
     if let Some(proj) = q.projection {
-        let fields = proj.into_iter().map(|pf| ProjectField {
+        let mut fields: Vec<ProjectField> = proj.into_iter().map(|pf| ProjectField {
             alias: pf.alias,
             expr: pf.expr,
         }).collect();
+        let windows = extract_windows(&mut fields);
+        if !windows.is_empty() {
+            node = PlanNode::Window { input: Box::new(node), windows };
+        }
         node = PlanNode::Project { input: Box::new(node), fields };
     }
 
@@ -259,10 +263,14 @@ fn plan_joined_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
     }
 
     if let Some(proj) = q.projection {
-        let fields = proj.into_iter().map(|pf| ProjectField {
+        let mut fields: Vec<ProjectField> = proj.into_iter().map(|pf| ProjectField {
             alias: pf.alias,
             expr: pf.expr,
         }).collect();
+        let windows = extract_windows(&mut fields);
+        if !windows.is_empty() {
+            node = PlanNode::Window { input: Box::new(node), windows };
+        }
         node = PlanNode::Project { input: Box::new(node), fields };
     }
 
@@ -359,6 +367,30 @@ fn try_extract_eq_index_key(table: &str, pred: &Expr) -> Option<PlanNode> {
         column,
         key,
     })
+}
+
+/// Walk projection fields, replacing every `Expr::Window { .. }` with
+/// `Expr::Field("__win_N")` and collecting the corresponding `WindowDef`
+/// descriptors. Returns the list of window definitions to insert as a
+/// `PlanNode::Window` before the `Project` node.
+fn extract_windows(proj_fields: &mut [ProjectField]) -> Vec<WindowDef> {
+    let mut defs = Vec::new();
+    let mut counter = 0usize;
+    for f in proj_fields.iter_mut() {
+        if let Expr::Window { function, args, partition_by, order_by } = &f.expr {
+            let output_name = format!("__win_{counter}");
+            defs.push(WindowDef {
+                function: *function,
+                args: args.clone(),
+                partition_by: partition_by.clone(),
+                order_by: order_by.iter().map(|k| SortKey { field: k.field.clone(), descending: k.descending }).collect(),
+                output_name: output_name.clone(),
+            });
+            f.expr = Expr::Field(output_name);
+            counter += 1;
+        }
+    }
+    defs
 }
 
 /// Walk projection fields and HAVING expression, replacing every
@@ -677,6 +709,66 @@ mod tests {
                     }
                     other => panic!("expected GroupBy, got {other:?}"),
                 }
+            }
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_plan_window_inserts_window_node_before_project() {
+        let plan = plan("User { .name, rn: row_number() over (order .age) }").unwrap();
+        // Expected shape: Project(Window(SeqScan))
+        match plan {
+            PlanNode::Project { input, fields } => {
+                assert_eq!(fields.len(), 2);
+                // The window expr should have been replaced with Field("__win_0")
+                assert!(matches!(&fields[1].expr, Expr::Field(name) if name == "__win_0"),
+                    "expected Field(__win_0), got {:?}", fields[1].expr);
+                match *input {
+                    PlanNode::Window { input: inner, windows } => {
+                        assert_eq!(windows.len(), 1);
+                        assert_eq!(windows[0].output_name, "__win_0");
+                        assert!(matches!(*inner, PlanNode::SeqScan { .. }));
+                    }
+                    other => panic!("expected Window, got {other:?}"),
+                }
+            }
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_plan_multiple_windows() {
+        let plan = plan(
+            "User { .name, rn: row_number() over (order .age), s: sum(.salary) over (partition .dept order .salary) }"
+        ).unwrap();
+        match plan {
+            PlanNode::Project { input, fields } => {
+                assert_eq!(fields.len(), 3);
+                assert!(matches!(&fields[1].expr, Expr::Field(name) if name == "__win_0"));
+                assert!(matches!(&fields[2].expr, Expr::Field(name) if name == "__win_1"));
+                match *input {
+                    PlanNode::Window { windows, .. } => {
+                        assert_eq!(windows.len(), 2);
+                        assert_eq!(windows[0].output_name, "__win_0");
+                        assert_eq!(windows[1].output_name, "__win_1");
+                    }
+                    other => panic!("expected Window, got {other:?}"),
+                }
+            }
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_plan_no_window_without_over() {
+        // Plain aggregate in projection should not create a Window node.
+        let plan = plan("User group .dept { .dept, total: sum(.salary) }").unwrap();
+        match plan {
+            PlanNode::Project { input, .. } => {
+                // Input should be GroupBy, not Window.
+                assert!(matches!(*input, PlanNode::GroupBy { .. }),
+                    "expected GroupBy under Project, got {:?}", input);
             }
             other => panic!("expected Project, got {other:?}"),
         }

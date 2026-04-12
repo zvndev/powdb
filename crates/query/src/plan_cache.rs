@@ -208,6 +208,14 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
         PlanNode::CreateView { .. } => {}
         PlanNode::RefreshView { .. } => {}
         PlanNode::DropView { .. } => {}
+        PlanNode::Window { input, windows } => {
+            substitute_plan(input, literals, idx);
+            for w in windows {
+                for arg in &mut w.args {
+                    substitute_expr(arg, literals, idx);
+                }
+            }
+        }
         PlanNode::Union { left, right, .. } => {
             substitute_plan(left, literals, idx);
             substitute_plan(right, literals, idx);
@@ -303,6 +311,14 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
         PlanNode::CreateView { .. } => {}
         PlanNode::RefreshView { .. } => {}
         PlanNode::DropView { .. } => {}
+        PlanNode::Window { input, windows } => {
+            count_plan(input, n);
+            for w in windows {
+                for arg in &w.args {
+                    count_expr(arg, n);
+                }
+            }
+        }
         PlanNode::Union { left, right, .. } => {
             count_plan(left, n);
             count_plan(right, n);
@@ -352,6 +368,11 @@ fn count_expr(expr: &Expr, n: &mut usize) {
         Expr::ExistsSubquery { .. } => {
             // Subquery literals are not counted — the subquery is
             // re-planned/executed separately.
+        }
+        Expr::Window { args, .. } => {
+            for a in args {
+                count_expr(a, n);
+            }
         }
     }
 }
@@ -406,6 +427,11 @@ fn substitute_expr(expr: &mut Expr, literals: &[Literal], idx: &mut usize) {
         Expr::ExistsSubquery { .. } => {
             // Subquery has its own literal list; nothing to substitute
             // at this level.
+        }
+        Expr::Window { args, .. } => {
+            for a in args {
+                substitute_expr(a, literals, idx);
+            }
         }
     }
 }
@@ -594,6 +620,14 @@ mod tests {
             PlanNode::CreateView { .. } => {}
             PlanNode::RefreshView { .. } => {}
             PlanNode::DropView { .. } => {}
+            PlanNode::Window { input, windows } => {
+                collect_literals_for_test(input, out);
+                for w in windows {
+                    for arg in &w.args {
+                        collect_expr_literals(arg, out);
+                    }
+                }
+            }
             PlanNode::Union { left, right, .. } => {
                 collect_literals_for_test(left, out);
                 collect_literals_for_test(right, out);
@@ -639,6 +673,11 @@ mod tests {
                 collect_expr_literals(expr, out);
             }
             Expr::ExistsSubquery { .. } => {}
+            Expr::Window { args, .. } => {
+                for a in args {
+                    collect_expr_literals(a, out);
+                }
+            }
         }
     }
 }
