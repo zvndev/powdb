@@ -27,7 +27,10 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
         }
 
         // Dot-ident: .fieldname
-        if chars[pos] == '.' && pos + 1 < chars.len() && (chars[pos + 1].is_alphabetic() || chars[pos + 1] == '_') {
+        if chars[pos] == '.'
+            && pos + 1 < chars.len()
+            && (chars[pos + 1].is_alphabetic() || chars[pos + 1] == '_')
+        {
             pos += 1; // skip dot
             let start = pos;
             while pos < chars.len() && (chars[pos].is_alphanumeric() || chars[pos] == '_') {
@@ -57,11 +60,26 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
             while pos < chars.len() && chars[pos] != '"' {
                 if chars[pos] == '\\' && pos + 1 < chars.len() {
                     match chars[pos + 1] {
-                        '"' => { s.push('"'); pos += 2; }
-                        '\\' => { s.push('\\'); pos += 2; }
-                        'n' => { s.push('\n'); pos += 2; }
-                        't' => { s.push('\t'); pos += 2; }
-                        _ => { s.push(chars[pos + 1]); pos += 2; }
+                        '"' => {
+                            s.push('"');
+                            pos += 2;
+                        }
+                        '\\' => {
+                            s.push('\\');
+                            pos += 2;
+                        }
+                        'n' => {
+                            s.push('\n');
+                            pos += 2;
+                        }
+                        't' => {
+                            s.push('\t');
+                            pos += 2;
+                        }
+                        _ => {
+                            s.push(chars[pos + 1]);
+                            pos += 2;
+                        }
                     }
                 } else {
                     s.push(chars[pos]);
@@ -69,7 +87,10 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                 }
             }
             if pos >= chars.len() {
-                return Err(LexError { message: "unterminated string".into(), position: pos });
+                return Err(LexError {
+                    message: "unterminated string".into(),
+                    position: pos,
+                });
             }
             pos += 1; // closing quote
             tokens.push(Token::StringLit(s));
@@ -77,13 +98,25 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
         }
 
         // Number (int or float)
-        if chars[pos].is_ascii_digit() || (chars[pos] == '-' && pos + 1 < chars.len() && chars[pos + 1].is_ascii_digit()) {
+        if chars[pos].is_ascii_digit()
+            || (chars[pos] == '-' && pos + 1 < chars.len() && chars[pos + 1].is_ascii_digit())
+        {
             let start = pos;
-            if chars[pos] == '-' { pos += 1; }
-            while pos < chars.len() && chars[pos].is_ascii_digit() { pos += 1; }
-            if pos < chars.len() && chars[pos] == '.' && pos + 1 < chars.len() && chars[pos + 1].is_ascii_digit() {
+            if chars[pos] == '-' {
                 pos += 1;
-                while pos < chars.len() && chars[pos].is_ascii_digit() { pos += 1; }
+            }
+            while pos < chars.len() && chars[pos].is_ascii_digit() {
+                pos += 1;
+            }
+            if pos < chars.len()
+                && chars[pos] == '.'
+                && pos + 1 < chars.len()
+                && chars[pos + 1].is_ascii_digit()
+            {
+                pos += 1;
+                while pos < chars.len() && chars[pos].is_ascii_digit() {
+                    pos += 1;
+                }
                 let s: String = chars[start..pos].iter().collect();
                 tokens.push(Token::FloatLit(s.parse().unwrap()));
             } else {
@@ -101,91 +134,91 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
             }
             let word: String = chars[start..pos].iter().collect();
             let token = match word.as_str() {
-                "type"         => Token::Type,
-                "filter"       => Token::Filter,
-                "order"        => Token::Order,
-                "limit"        => Token::Limit,
-                "offset"       => Token::Offset,
-                "insert"       => Token::Insert,
-                "update"       => Token::Update,
-                "delete"       => Token::Delete,
-                "upsert"       => Token::Upsert,
-                "conflict"     => Token::Conflict,
-                "select"       => Token::Select,
-                "required"     => Token::Required,
-                "multi"        => Token::Multi,
-                "link"         => Token::Link,
-                "index"        => Token::Index,
-                "on"           => Token::On,
-                "asc"          => Token::Asc,
-                "desc"         => Token::Desc,
-                "and"          => Token::And,
-                "or"           => Token::Or,
-                "not"          => Token::Not,
-                "exists"       => Token::Exists,
-                "let"          => Token::Let,
-                "as"           => Token::As,
-                "match"        => Token::Match,
-                "group"        => Token::Group,
-                "join"         => Token::Join,
-                "inner"        => Token::Inner,
-                "left"         => Token::LeftKw,
-                "right"        => Token::RightKw,
-                "outer"        => Token::Outer,
-                "cross"        => Token::Cross,
-                "transaction"  => Token::Transaction,
-                "view"         => Token::View,
+                "type" => Token::Type,
+                "filter" => Token::Filter,
+                "order" => Token::Order,
+                "limit" => Token::Limit,
+                "offset" => Token::Offset,
+                "insert" => Token::Insert,
+                "update" => Token::Update,
+                "delete" => Token::Delete,
+                "upsert" => Token::Upsert,
+                "conflict" => Token::Conflict,
+                "select" => Token::Select,
+                "required" => Token::Required,
+                "multi" => Token::Multi,
+                "link" => Token::Link,
+                "index" => Token::Index,
+                "on" => Token::On,
+                "asc" => Token::Asc,
+                "desc" => Token::Desc,
+                "and" => Token::And,
+                "or" => Token::Or,
+                "not" => Token::Not,
+                "exists" => Token::Exists,
+                "let" => Token::Let,
+                "as" => Token::As,
+                "match" => Token::Match,
+                "group" => Token::Group,
+                "join" => Token::Join,
+                "inner" => Token::Inner,
+                "left" => Token::LeftKw,
+                "right" => Token::RightKw,
+                "outer" => Token::Outer,
+                "cross" => Token::Cross,
+                "transaction" => Token::Transaction,
+                "view" => Token::View,
                 "materialized" => Token::Materialized,
-                "materialize"  => Token::Materialized,
-                "refresh"      => Token::Refresh,
-                "union"        => Token::Union,
-                "having"       => Token::Having,
-                "distinct"     => Token::Distinct,
-                "in"           => Token::In,
-                "between"      => Token::Between,
-                "like"         => Token::Like,
-                "count"        => Token::Count,
-                "avg"          => Token::Avg,
-                "sum"          => Token::Sum,
-                "min"          => Token::Min,
-                "max"          => Token::Max,
-                "is"           => Token::Is,
-                "null"         => Token::Null,
-                "upper"        => Token::Upper,
-                "lower"        => Token::Lower,
-                "length"       => Token::Length,
-                "trim"         => Token::Trim,
-                "substring"    => Token::Substring,
-                "concat"       => Token::Concat,
-                "abs"          => Token::Abs,
-                "round"        => Token::Round,
-                "ceil"         => Token::Ceil,
-                "floor"        => Token::Floor,
-                "sqrt"         => Token::Sqrt,
-                "pow"          => Token::Pow,
-                "now"          => Token::Now,
-                "extract"      => Token::Extract,
-                "date_add"     => Token::DateAdd,
-                "date_diff"    => Token::DateDiff,
-                "cast"         => Token::Cast,
-                "case"         => Token::Case,
-                "when"         => Token::When,
-                "then"         => Token::Then,
-                "else"         => Token::Else,
-                "end"          => Token::End,
-                "over"         => Token::Over,
-                "partition"    => Token::Partition,
-                "row_number"   => Token::RowNumber,
-                "rank"         => Token::Rank,
-                "dense_rank"   => Token::DenseRank,
-                "alter"        => Token::Alter,
-                "drop"         => Token::Drop,
-                "add"          => Token::Add,
-                "column"       => Token::Column,
-                "explain"      => Token::Explain,
-                "true"         => Token::BoolLit(true),
-                "false"        => Token::BoolLit(false),
-                _              => Token::Ident(word),
+                "materialize" => Token::Materialized,
+                "refresh" => Token::Refresh,
+                "union" => Token::Union,
+                "having" => Token::Having,
+                "distinct" => Token::Distinct,
+                "in" => Token::In,
+                "between" => Token::Between,
+                "like" => Token::Like,
+                "count" => Token::Count,
+                "avg" => Token::Avg,
+                "sum" => Token::Sum,
+                "min" => Token::Min,
+                "max" => Token::Max,
+                "is" => Token::Is,
+                "null" => Token::Null,
+                "upper" => Token::Upper,
+                "lower" => Token::Lower,
+                "length" => Token::Length,
+                "trim" => Token::Trim,
+                "substring" => Token::Substring,
+                "concat" => Token::Concat,
+                "abs" => Token::Abs,
+                "round" => Token::Round,
+                "ceil" => Token::Ceil,
+                "floor" => Token::Floor,
+                "sqrt" => Token::Sqrt,
+                "pow" => Token::Pow,
+                "now" => Token::Now,
+                "extract" => Token::Extract,
+                "date_add" => Token::DateAdd,
+                "date_diff" => Token::DateDiff,
+                "cast" => Token::Cast,
+                "case" => Token::Case,
+                "when" => Token::When,
+                "then" => Token::Then,
+                "else" => Token::Else,
+                "end" => Token::End,
+                "over" => Token::Over,
+                "partition" => Token::Partition,
+                "row_number" => Token::RowNumber,
+                "rank" => Token::Rank,
+                "dense_rank" => Token::DenseRank,
+                "alter" => Token::Alter,
+                "drop" => Token::Drop,
+                "add" => Token::Add,
+                "column" => Token::Column,
+                "explain" => Token::Explain,
+                "true" => Token::BoolLit(true),
+                "false" => Token::BoolLit(false),
+                _ => Token::Ident(word),
             };
             tokens.push(token);
             continue;
@@ -195,12 +228,36 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
         if pos + 1 < chars.len() {
             let two: String = chars[pos..pos + 2].iter().collect();
             match two.as_str() {
-                ":=" => { tokens.push(Token::Assign); pos += 2; continue; }
-                "->" => { tokens.push(Token::Arrow); pos += 2; continue; }
-                "!=" => { tokens.push(Token::Neq); pos += 2; continue; }
-                "<=" => { tokens.push(Token::Lte); pos += 2; continue; }
-                ">=" => { tokens.push(Token::Gte); pos += 2; continue; }
-                "??" => { tokens.push(Token::Coalesce); pos += 2; continue; }
+                ":=" => {
+                    tokens.push(Token::Assign);
+                    pos += 2;
+                    continue;
+                }
+                "->" => {
+                    tokens.push(Token::Arrow);
+                    pos += 2;
+                    continue;
+                }
+                "!=" => {
+                    tokens.push(Token::Neq);
+                    pos += 2;
+                    continue;
+                }
+                "<=" => {
+                    tokens.push(Token::Lte);
+                    pos += 2;
+                    continue;
+                }
+                ">=" => {
+                    tokens.push(Token::Gte);
+                    pos += 2;
+                    continue;
+                }
+                "??" => {
+                    tokens.push(Token::Coalesce);
+                    pos += 2;
+                    continue;
+                }
                 _ => {}
             }
         }
@@ -222,7 +279,12 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
             ',' => Token::Comma,
             ':' => Token::Colon,
             '.' => Token::Dot,
-            c => return Err(LexError { message: format!("unexpected character: {c}"), position: pos }),
+            c => {
+                return Err(LexError {
+                    message: format!("unexpected character: {c}"),
+                    position: pos,
+                })
+            }
         };
         tokens.push(token);
         pos += 1;
@@ -240,80 +302,95 @@ mod tests {
     #[test]
     fn test_lex_simple_query() {
         let tokens = lex("User filter .age > 30").unwrap();
-        assert_eq!(tokens, vec![
-            Token::Ident("User".into()),
-            Token::Filter,
-            Token::DotIdent("age".into()),
-            Token::Gt,
-            Token::IntLit(30),
-            Token::Eof,
-        ]);
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Ident("User".into()),
+                Token::Filter,
+                Token::DotIdent("age".into()),
+                Token::Gt,
+                Token::IntLit(30),
+                Token::Eof,
+            ]
+        );
     }
 
     #[test]
     fn test_lex_projection() {
         let tokens = lex("User { name, email }").unwrap();
-        assert_eq!(tokens, vec![
-            Token::Ident("User".into()),
-            Token::LBrace,
-            Token::Ident("name".into()),
-            Token::Comma,
-            Token::Ident("email".into()),
-            Token::RBrace,
-            Token::Eof,
-        ]);
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Ident("User".into()),
+                Token::LBrace,
+                Token::Ident("name".into()),
+                Token::Comma,
+                Token::Ident("email".into()),
+                Token::RBrace,
+                Token::Eof,
+            ]
+        );
     }
 
     #[test]
     fn test_lex_insert() {
         let tokens = lex(r#"insert User { name := "Alice", age := 30 }"#).unwrap();
-        assert_eq!(tokens, vec![
-            Token::Insert,
-            Token::Ident("User".into()),
-            Token::LBrace,
-            Token::Ident("name".into()),
-            Token::Assign,
-            Token::StringLit("Alice".into()),
-            Token::Comma,
-            Token::Ident("age".into()),
-            Token::Assign,
-            Token::IntLit(30),
-            Token::RBrace,
-            Token::Eof,
-        ]);
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Insert,
+                Token::Ident("User".into()),
+                Token::LBrace,
+                Token::Ident("name".into()),
+                Token::Assign,
+                Token::StringLit("Alice".into()),
+                Token::Comma,
+                Token::Ident("age".into()),
+                Token::Assign,
+                Token::IntLit(30),
+                Token::RBrace,
+                Token::Eof,
+            ]
+        );
     }
 
     #[test]
     fn test_lex_params() {
         let tokens = lex("User filter .age > $min_age").unwrap();
-        assert_eq!(tokens, vec![
-            Token::Ident("User".into()),
-            Token::Filter,
-            Token::DotIdent("age".into()),
-            Token::Gt,
-            Token::Param("min_age".into()),
-            Token::Eof,
-        ]);
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Ident("User".into()),
+                Token::Filter,
+                Token::DotIdent("age".into()),
+                Token::Gt,
+                Token::Param("min_age".into()),
+                Token::Eof,
+            ]
+        );
     }
 
     #[test]
     fn test_lex_string_with_escapes() {
         let tokens = lex(r#""hello \"world\"""#).unwrap();
-        assert_eq!(tokens, vec![
-            Token::StringLit("hello \"world\"".into()),
-            Token::Eof,
-        ]);
+        assert_eq!(
+            tokens,
+            vec![Token::StringLit("hello \"world\"".into()), Token::Eof,]
+        );
     }
 
     #[test]
     fn test_lex_aggregation() {
         let tokens = lex("count(User)").unwrap();
-        assert_eq!(tokens, vec![
-            Token::Count,
-            Token::LParen,
-            Token::Ident("User".into()),
-            Token::RParen,
-            Token::Eof,
-        ]);
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Count,
+                Token::LParen,
+                Token::Ident("User".into()),
+                Token::RParen,
+                Token::Eof,
+            ]
+        );
     }
 }

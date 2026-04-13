@@ -10,10 +10,8 @@ use powdb_storage::types::{ColumnDef, Row, RowId, Schema, TypeId, Value};
 use std::path::PathBuf;
 
 fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "powdb_index_persist_{name}_{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("powdb_index_persist_{name}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }

@@ -19,7 +19,9 @@ fn parse_args() -> CliArgs {
     let mut data_dir = "./powdb_data".to_string();
     let mut remote: Option<String> = None;
     let mut db: String = "main".to_string();
-    let mut password: Option<String> = std::env::var("POWDB_PASSWORD").ok().filter(|s| !s.is_empty());
+    let mut password: Option<String> = std::env::var("POWDB_PASSWORD")
+        .ok()
+        .filter(|s| !s.is_empty());
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -28,22 +30,34 @@ fn parse_args() -> CliArgs {
         match argv[i].as_str() {
             "--remote" | "-r" => {
                 i += 1;
-                if i >= argv.len() { eprintln!("--remote requires host:port"); std::process::exit(2); }
+                if i >= argv.len() {
+                    eprintln!("--remote requires host:port");
+                    std::process::exit(2);
+                }
                 remote = Some(argv[i].clone());
             }
             "--db" => {
                 i += 1;
-                if i >= argv.len() { eprintln!("--db requires a name"); std::process::exit(2); }
+                if i >= argv.len() {
+                    eprintln!("--db requires a name");
+                    std::process::exit(2);
+                }
                 db = argv[i].clone();
             }
             "--password" => {
                 i += 1;
-                if i >= argv.len() { eprintln!("--password requires a value"); std::process::exit(2); }
+                if i >= argv.len() {
+                    eprintln!("--password requires a value");
+                    std::process::exit(2);
+                }
                 password = Some(argv[i].clone());
             }
             "--data-dir" | "-d" => {
                 i += 1;
-                if i >= argv.len() { eprintln!("--data-dir requires a path"); std::process::exit(2); }
+                if i >= argv.len() {
+                    eprintln!("--data-dir requires a path");
+                    std::process::exit(2);
+                }
                 data_dir = argv[i].clone();
             }
             "--help" | "-h" => {
@@ -56,12 +70,16 @@ fn parse_args() -> CliArgs {
                 println!("    -r, --remote <HOST:PORT>   Connect to a remote server over TCP");
                 println!("        --db <NAME>            Database name (default: main)");
                 println!("        --password <PW>        Password for remote auth");
-                println!("    -d, --data-dir <PATH>      Embedded data dir (default: ./powdb_data)");
+                println!(
+                    "    -d, --data-dir <PATH>      Embedded data dir (default: ./powdb_data)"
+                );
                 println!("    -h, --help                 Print this message");
                 println!();
                 println!("MODES:");
                 println!("    Embedded (default):  powdb-cli ./mydata");
-                println!("    Remote:              powdb-cli --remote 127.0.0.1:5433 --password secret");
+                println!(
+                    "    Remote:              powdb-cli --remote 127.0.0.1:5433 --password secret"
+                );
                 std::process::exit(0);
             }
             other if !other.starts_with('-') && !saw_positional => {
@@ -77,13 +95,20 @@ fn parse_args() -> CliArgs {
         i += 1;
     }
 
-    CliArgs { data_dir, remote, db, password }
+    CliArgs {
+        data_dir,
+        remote,
+        db,
+        password,
+    }
 }
 
 fn main() {
     // Tracing for the CLI (mostly off by default; users can set RUST_LOG=debug).
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+        )
         .with_target(false)
         .init();
 
@@ -94,7 +119,11 @@ fn main() {
             .enable_all()
             .build()
             .expect("failed to build tokio runtime");
-        rt.block_on(run_remote(remote_addr.clone(), args.db.clone(), args.password.clone()));
+        rt.block_on(run_remote(
+            remote_addr.clone(),
+            args.db.clone(),
+            args.password.clone(),
+        ));
     } else {
         run_embedded(&args.data_dir);
     }
@@ -107,8 +136,7 @@ fn run_embedded(data_dir: &str) {
     eprintln!("Data directory: {data_dir}");
     eprintln!("Type PowQL queries. Use Ctrl-D to exit.\n");
 
-    let mut engine = Engine::new(Path::new(data_dir))
-        .expect("failed to initialize engine");
+    let mut engine = Engine::new(Path::new(data_dir)).expect("failed to initialize engine");
 
     let mut rl = DefaultEditor::new().expect("failed to init readline");
 
@@ -158,7 +186,10 @@ async fn run_remote(addr: String, db: String, password: Option<String>) {
     let mut writer = BufWriter::new(writer);
 
     // Send CONNECT
-    let connect = Message::Connect { db_name: db.clone(), password };
+    let connect = Message::Connect {
+        db_name: db.clone(),
+        password,
+    };
     if let Err(e) = connect.write_to(&mut writer).await {
         eprintln!("failed to send CONNECT: {e}");
         std::process::exit(1);
@@ -212,7 +243,9 @@ async fn run_remote(addr: String, db: String, password: Option<String>) {
 
         rl.add_history_entry(trimmed).ok();
 
-        let q = Message::Query { query: trimmed.to_string() };
+        let q = Message::Query {
+            query: trimmed.to_string(),
+        };
         if q.write_to(&mut writer).await.is_err() {
             eprintln!("write error — disconnected");
             break;
@@ -251,7 +284,8 @@ fn print_local_result(result: &QueryResult) {
                 println!("(empty set)");
                 return;
             }
-            let str_rows: Vec<Vec<String>> = rows.iter()
+            let str_rows: Vec<Vec<String>> = rows
+                .iter()
                 .map(|row| row.iter().map(format_value).collect())
                 .collect();
             print_table(columns, &str_rows);
@@ -284,7 +318,10 @@ fn print_remote_result(msg: &Message) {
             println!("{value}");
         }
         Message::ResultOk { affected } => {
-            println!("{affected} row{} affected", if *affected == 1 { "" } else { "s" });
+            println!(
+                "{affected} row{} affected",
+                if *affected == 1 { "" } else { "s" }
+            );
         }
         Message::Error { message } => {
             eprintln!("Error: {message}");
@@ -305,7 +342,9 @@ fn print_table(columns: &[String], rows: &[Vec<String>]) {
         }
     }
 
-    let header: Vec<String> = columns.iter().enumerate()
+    let header: Vec<String> = columns
+        .iter()
+        .enumerate()
         .map(|(i, c)| format!("{:width$}", c, width = widths[i]))
         .collect();
     println!(" {} ", header.join(" | "));
@@ -313,24 +352,30 @@ fn print_table(columns: &[String], rows: &[Vec<String>]) {
     println!("-{}-", sep.join("-+-"));
 
     for row in rows {
-        let cells: Vec<String> = row.iter().enumerate()
+        let cells: Vec<String> = row
+            .iter()
+            .enumerate()
             .map(|(i, v)| format!("{:width$}", v, width = widths[i]))
             .collect();
         println!(" {} ", cells.join(" | "));
     }
 
-    println!("({} row{})", rows.len(), if rows.len() == 1 { "" } else { "s" });
+    println!(
+        "({} row{})",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" }
+    );
 }
 
 fn format_value(v: &Value) -> String {
     match v {
-        Value::Int(n)      => n.to_string(),
-        Value::Float(n)    => format!("{n}"),
-        Value::Bool(b)     => b.to_string(),
-        Value::Str(s)      => s.clone(),
+        Value::Int(n) => n.to_string(),
+        Value::Float(n) => format!("{n}"),
+        Value::Bool(b) => b.to_string(),
+        Value::Str(s) => s.clone(),
         Value::DateTime(t) => format!("{t}"),
-        Value::Uuid(u)     => format!("{:02x}{:02x}{:02x}{:02x}-...", u[0], u[1], u[2], u[3]),
-        Value::Bytes(b)    => format!("<{} bytes>", b.len()),
-        Value::Empty       => "{}".into(),
+        Value::Uuid(u) => format!("{:02x}{:02x}{:02x}{:02x}-...", u[0], u[1], u[2], u[3]),
+        Value::Bytes(b) => format!("<{} bytes>", b.len()),
+        Value::Empty => "{}".into(),
     }
 }

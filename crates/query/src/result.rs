@@ -7,10 +7,12 @@ pub enum QueryResult {
         columns: Vec<String>,
         rows: Vec<Vec<Value>>,
     },
-    Scalar(Value),     // count, avg, etc.
-    Modified(u64),     // insert/update/delete — number of rows affected
-    Created(String),   // DDL — type name created
-    Executed { message: String }, // DDL — alter/drop feedback
+    Scalar(Value),   // count, avg, etc.
+    Modified(u64),   // insert/update/delete — number of rows affected
+    Created(String), // DDL — type name created
+    Executed {
+        message: String,
+    }, // DDL — alter/drop feedback
 }
 
 impl QueryResult {

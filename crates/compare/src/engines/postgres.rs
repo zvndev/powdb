@@ -55,9 +55,7 @@ impl PostgresEngine {
         };
 
         let mut client = Client::connect(&url, NoTls)
-            .or_else(|_| {
-                Client::connect("postgresql://localhost:5432/powdb_bench", NoTls)
-            })
+            .or_else(|_| Client::connect("postgresql://localhost:5432/powdb_bench", NoTls))
             .ok()?;
 
         client

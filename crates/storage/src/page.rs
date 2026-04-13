@@ -1,17 +1,17 @@
 pub const PAGE_SIZE: usize = 4096;
 pub const PAGE_HEADER_SIZE: usize = 8;
-const SLOT_COUNT_SIZE: usize = 2;    // u16 at bottom of page
-const SLOT_ENTRY_SIZE: usize = 4;    // u16 offset + u16 length per slot
+const SLOT_COUNT_SIZE: usize = 2; // u16 at bottom of page
+const SLOT_ENTRY_SIZE: usize = 4; // u16 offset + u16 length per slot
 const DELETED_MARKER: u16 = 0xFFFF;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PageType {
-    Data     = 1,
-    Index    = 2,
+    Data = 1,
+    Index = 2,
     Overflow = 3,
-    Wal      = 4,
-    Meta     = 5,
+    Wal = 4,
+    Meta = 5,
 }
 
 impl PageType {
@@ -248,9 +248,7 @@ impl Page {
 
     /// Iterate over all live (non-deleted) slots. Returns (slot_index, data).
     pub fn iter(&self) -> impl Iterator<Item = (u16, &[u8])> {
-        (0..self.slot_count()).filter_map(move |i| {
-            self.get(i).map(|data| (i, data))
-        })
+        (0..self.slot_count()).filter_map(move |i| self.get(i).map(|data| (i, data)))
     }
 }
 
@@ -262,17 +260,12 @@ impl Page {
 /// over `entry_off` with no function call per slot.
 #[inline]
 pub fn iter_page_slots(page_bytes: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
-    let slot_count = u16::from_le_bytes(
-        page_bytes[PAGE_SIZE - 2..PAGE_SIZE].try_into().unwrap(),
-    );
+    let slot_count = u16::from_le_bytes(page_bytes[PAGE_SIZE - 2..PAGE_SIZE].try_into().unwrap());
     (0..slot_count).filter_map(move |i| {
         let entry_off = PAGE_SIZE - SLOT_COUNT_SIZE - ((i as usize + 1) * SLOT_ENTRY_SIZE);
-        let offset = u16::from_le_bytes(
-            page_bytes[entry_off..entry_off + 2].try_into().unwrap(),
-        );
-        let length = u16::from_le_bytes(
-            page_bytes[entry_off + 2..entry_off + 4].try_into().unwrap(),
-        );
+        let offset = u16::from_le_bytes(page_bytes[entry_off..entry_off + 2].try_into().unwrap());
+        let length =
+            u16::from_le_bytes(page_bytes[entry_off + 2..entry_off + 4].try_into().unwrap());
         if length == DELETED_MARKER {
             return None;
         }
@@ -292,7 +285,10 @@ mod tests {
         assert_eq!(page.page_id(), 0);
         assert_eq!(page.page_type(), PageType::Data);
         assert_eq!(page.slot_count(), 0);
-        assert_eq!(page.free_space(), PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_COUNT_SIZE);
+        assert_eq!(
+            page.free_space(),
+            PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_COUNT_SIZE
+        );
     }
 
     #[test]
@@ -407,7 +403,10 @@ mod tests {
         // 4096 - 8 (header) - 2 (slot_count) = 4086 usable
         // Each row: 10 data + 4 slot entry = 14 bytes
         // 4086 / 14 = 291 rows
-        assert!(count > 280 && count <= 292, "expected ~291 rows, got {count}");
+        assert!(
+            count > 280 && count <= 292,
+            "expected ~291 rows, got {count}"
+        );
         assert_eq!(page.slot_count(), count);
     }
 }

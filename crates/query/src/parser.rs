@@ -56,7 +56,9 @@ impl Parser {
         if &t == expected {
             Ok(())
         } else {
-            Err(ParseError { message: format!("expected {expected:?}, got {t:?}") })
+            Err(ParseError {
+                message: format!("expected {expected:?}, got {t:?}"),
+            })
         }
     }
 
@@ -78,7 +80,9 @@ impl Parser {
                 self.parse_aggregate_query()
             }
             Token::Ident(_) => self.parse_query_or_mutation(),
-            _ => Err(ParseError { message: format!("unexpected token: {:?}", self.peek()) }),
+            _ => Err(ParseError {
+                message: format!("unexpected token: {:?}", self.peek()),
+            }),
         }?;
         // Check for UNION chaining after any query-producing statement.
         self.maybe_parse_union(stmt)
@@ -87,7 +91,11 @@ impl Parser {
     fn parse_query_or_mutation(&mut self) -> Result<Statement, ParseError> {
         let source = match self.advance() {
             Token::Ident(name) => name,
-            t => return Err(ParseError { message: format!("expected type name, got {t:?}") }),
+            t => {
+                return Err(ParseError {
+                    message: format!("expected type name, got {t:?}"),
+                })
+            }
         };
         let alias = self.try_parse_alias();
         let joins = self.parse_joins()?;
@@ -140,7 +148,11 @@ impl Parser {
                     }
                     self.advance();
                     let assignments = self.parse_assignments()?;
-                    return Ok(Statement::UpdateQuery(UpdateExpr { source, filter, assignments }));
+                    return Ok(Statement::UpdateQuery(UpdateExpr {
+                        source,
+                        filter,
+                        assignments,
+                    }));
                 }
                 Token::Delete => {
                     if !joins.is_empty() {
@@ -311,7 +323,12 @@ impl Parser {
                 });
             };
 
-            joins.push(JoinClause { kind, source, alias, on });
+            joins.push(JoinClause {
+                kind,
+                source,
+                alias,
+                on,
+            });
         }
         Ok(joins)
     }
@@ -320,10 +337,17 @@ impl Parser {
         self.expect(&Token::Insert)?;
         let target = match self.advance() {
             Token::Ident(name) => name,
-            t => return Err(ParseError { message: format!("expected type name, got {t:?}") }),
+            t => {
+                return Err(ParseError {
+                    message: format!("expected type name, got {t:?}"),
+                })
+            }
         };
         let assignments = self.parse_assignments()?;
-        Ok(Statement::Insert(InsertExpr { target, assignments }))
+        Ok(Statement::Insert(InsertExpr {
+            target,
+            assignments,
+        }))
     }
 
     /// Parse: `upsert Table on .key_col { assignments } [on conflict { update_assignments }]`
@@ -331,12 +355,20 @@ impl Parser {
         self.expect(&Token::Upsert)?;
         let target = match self.advance() {
             Token::Ident(name) => name,
-            t => return Err(ParseError { message: format!("expected type name, got {t:?}") }),
+            t => {
+                return Err(ParseError {
+                    message: format!("expected type name, got {t:?}"),
+                })
+            }
         };
         self.expect(&Token::On)?;
         let key_column = match self.advance() {
             Token::DotIdent(name) => name,
-            t => return Err(ParseError { message: format!("expected .key_column, got {t:?}") }),
+            t => {
+                return Err(ParseError {
+                    message: format!("expected .key_column, got {t:?}"),
+                })
+            }
         };
         let assignments = self.parse_assignments()?;
         let on_conflict = if *self.peek() == Token::On {
@@ -360,7 +392,11 @@ impl Parser {
         while *self.peek() != Token::RBrace {
             let field = match self.advance() {
                 Token::Ident(name) => name,
-                t => return Err(ParseError { message: format!("expected field name, got {t:?}") }),
+                t => {
+                    return Err(ParseError {
+                        message: format!("expected field name, got {t:?}"),
+                    })
+                }
             };
             self.expect(&Token::Assign)?;
             let value = self.parse_expr()?;
@@ -383,10 +419,17 @@ impl Parser {
                 self.advance();
                 let alias = match first {
                     Token::Ident(name) => name,
-                    _ => return Err(ParseError { message: "expected alias name".into() }),
+                    _ => {
+                        return Err(ParseError {
+                            message: "expected alias name".into(),
+                        })
+                    }
                 };
                 let expr = self.parse_expr()?;
-                fields.push(ProjectionField { alias: Some(alias), expr });
+                fields.push(ProjectionField {
+                    alias: Some(alias),
+                    expr,
+                });
             } else {
                 let expr = match first {
                     // Mission E1.2: `{ u.name }` — a qualifier followed by
@@ -395,7 +438,10 @@ impl Parser {
                     Token::Ident(name) => {
                         if let Token::DotIdent(field) = self.peek().clone() {
                             self.advance();
-                            Expr::QualifiedField { qualifier: name, field }
+                            Expr::QualifiedField {
+                                qualifier: name,
+                                field,
+                            }
                         } else {
                             Expr::Field(name)
                         }
@@ -403,24 +449,37 @@ impl Parser {
                     Token::DotIdent(name) => Expr::Field(name),
                     Token::RowNumber | Token::Rank | Token::DenseRank => {
                         let wfunc = match first {
-                            Token::RowNumber  => WindowFunc::RowNumber,
-                            Token::Rank       => WindowFunc::Rank,
-                            Token::DenseRank  => WindowFunc::DenseRank,
-                            _ => return Err(ParseError { message: "unexpected window function token".into() }),
+                            Token::RowNumber => WindowFunc::RowNumber,
+                            Token::Rank => WindowFunc::Rank,
+                            Token::DenseRank => WindowFunc::DenseRank,
+                            _ => {
+                                return Err(ParseError {
+                                    message: "unexpected window function token".into(),
+                                })
+                            }
                         };
                         self.expect(&Token::LParen)?;
                         self.expect(&Token::RParen)?;
                         let (partition_by, order_by) = self.parse_over_clause()?;
-                        Expr::Window { function: wfunc, args: vec![], partition_by, order_by }
+                        Expr::Window {
+                            function: wfunc,
+                            args: vec![],
+                            partition_by,
+                            order_by,
+                        }
                     }
                     Token::Count | Token::Avg | Token::Sum | Token::Min | Token::Max => {
                         let mut func = match first {
                             Token::Count => AggFunc::Count,
-                            Token::Avg   => AggFunc::Avg,
-                            Token::Sum   => AggFunc::Sum,
-                            Token::Min   => AggFunc::Min,
-                            Token::Max   => AggFunc::Max,
-                            _ => return Err(ParseError { message: "unexpected aggregate token".into() }),
+                            Token::Avg => AggFunc::Avg,
+                            Token::Sum => AggFunc::Sum,
+                            Token::Min => AggFunc::Min,
+                            Token::Max => AggFunc::Max,
+                            _ => {
+                                return Err(ParseError {
+                                    message: "unexpected aggregate token".into(),
+                                })
+                            }
                         };
                         self.expect(&Token::LParen)?;
                         // count(*) — count all rows
@@ -437,46 +496,70 @@ impl Parser {
                                     order_by,
                                 }
                             } else {
-                                Expr::FunctionCall(AggFunc::Count, Box::new(Expr::Field("*".into())))
+                                Expr::FunctionCall(
+                                    AggFunc::Count,
+                                    Box::new(Expr::Field("*".into())),
+                                )
                             }
                         } else {
-                        // count(distinct .field) → CountDistinct
-                        if func == AggFunc::Count && *self.peek() == Token::Distinct {
-                            self.advance();
-                            func = AggFunc::CountDistinct;
-                        }
-                        let inner = self.parse_expr()?;
-                        self.expect(&Token::RParen)?;
-                        // Check for OVER — e.g. sum(.salary) over (...)
-                        if *self.peek() == Token::Over {
-                            let wfunc = match func {
-                                AggFunc::Count => WindowFunc::Count,
-                                AggFunc::Avg   => WindowFunc::Avg,
-                                AggFunc::Sum   => WindowFunc::Sum,
-                                AggFunc::Min   => WindowFunc::Min,
-                                AggFunc::Max   => WindowFunc::Max,
-                                _ => return Err(ParseError {
-                                    message: "count(distinct ...) over (...) is not supported".into(),
-                                }),
-                            };
-                            let (partition_by, order_by) = self.parse_over_clause()?;
-                            Expr::Window { function: wfunc, args: vec![inner], partition_by, order_by }
-                        } else {
-                            Expr::FunctionCall(func, Box::new(inner))
-                        }
+                            // count(distinct .field) → CountDistinct
+                            if func == AggFunc::Count && *self.peek() == Token::Distinct {
+                                self.advance();
+                                func = AggFunc::CountDistinct;
+                            }
+                            let inner = self.parse_expr()?;
+                            self.expect(&Token::RParen)?;
+                            // Check for OVER — e.g. sum(.salary) over (...)
+                            if *self.peek() == Token::Over {
+                                let wfunc =
+                                    match func {
+                                        AggFunc::Count => WindowFunc::Count,
+                                        AggFunc::Avg => WindowFunc::Avg,
+                                        AggFunc::Sum => WindowFunc::Sum,
+                                        AggFunc::Min => WindowFunc::Min,
+                                        AggFunc::Max => WindowFunc::Max,
+                                        _ => return Err(ParseError {
+                                            message:
+                                                "count(distinct ...) over (...) is not supported"
+                                                    .into(),
+                                        }),
+                                    };
+                                let (partition_by, order_by) = self.parse_over_clause()?;
+                                Expr::Window {
+                                    function: wfunc,
+                                    args: vec![inner],
+                                    partition_by,
+                                    order_by,
+                                }
+                            } else {
+                                Expr::FunctionCall(func, Box::new(inner))
+                            }
                         }
                     }
-                    Token::Upper | Token::Lower | Token::Length | Token::Trim
-                    | Token::Substring | Token::Concat
-                    | Token::Abs | Token::Round | Token::Ceil | Token::Floor
-                    | Token::Sqrt | Token::Pow
-                    | Token::Now | Token::Extract | Token::DateAdd | Token::DateDiff => {
+                    Token::Upper
+                    | Token::Lower
+                    | Token::Length
+                    | Token::Trim
+                    | Token::Substring
+                    | Token::Concat
+                    | Token::Abs
+                    | Token::Round
+                    | Token::Ceil
+                    | Token::Floor
+                    | Token::Sqrt
+                    | Token::Pow
+                    | Token::Now
+                    | Token::Extract
+                    | Token::DateAdd
+                    | Token::DateDiff => {
                         let func = token_to_scalar_fn(&first);
                         self.expect(&Token::LParen)?;
                         let mut args = Vec::new();
                         while *self.peek() != Token::RParen {
                             args.push(self.parse_expr()?);
-                            if *self.peek() == Token::Comma { self.advance(); }
+                            if *self.peek() == Token::Comma {
+                                self.advance();
+                            }
                         }
                         self.expect(&Token::RParen)?;
                         Expr::ScalarFunc(func, args)
@@ -507,7 +590,11 @@ impl Parser {
                         self.expect(&Token::End)?;
                         Expr::Case { whens, else_expr }
                     }
-                    _ => return Err(ParseError { message: format!("expected field, got {first:?}") }),
+                    _ => {
+                        return Err(ParseError {
+                            message: format!("expected field, got {first:?}"),
+                        })
+                    }
                 };
                 fields.push(ProjectionField { alias: None, expr });
             }
@@ -552,8 +639,14 @@ impl Parser {
                 let field = name.clone();
                 self.advance();
                 let descending = match self.peek() {
-                    Token::Desc => { self.advance(); true }
-                    Token::Asc => { self.advance(); false }
+                    Token::Desc => {
+                        self.advance();
+                        true
+                    }
+                    Token::Asc => {
+                        self.advance();
+                        false
+                    }
                     _ => false,
                 };
                 order_by.push(OrderKey { field, descending });
@@ -577,9 +670,13 @@ impl Parser {
                 "str" | "Str" | "STR" | "string" | "String" => Ok(CastType::Str),
                 "bool" | "Bool" | "BOOL" | "boolean" => Ok(CastType::Bool),
                 "datetime" | "DateTime" | "DATETIME" => Ok(CastType::DateTime),
-                other => Err(ParseError { message: format!("invalid cast type: \"{other}\"") }),
+                other => Err(ParseError {
+                    message: format!("invalid cast type: \"{other}\""),
+                }),
             },
-            t => Err(ParseError { message: format!("expected string literal for cast type, got {t:?}") }),
+            t => Err(ParseError {
+                message: format!("expected string literal for cast type, got {t:?}"),
+            }),
         }
     }
 
@@ -588,11 +685,21 @@ impl Parser {
         loop {
             let field = match self.advance() {
                 Token::DotIdent(name) => name,
-                t => return Err(ParseError { message: format!("expected .field after order, got {t:?}") }),
+                t => {
+                    return Err(ParseError {
+                        message: format!("expected .field after order, got {t:?}"),
+                    })
+                }
             };
             let descending = match self.peek() {
-                Token::Desc => { self.advance(); true }
-                Token::Asc => { self.advance(); false }
+                Token::Desc => {
+                    self.advance();
+                    true
+                }
+                Token::Asc => {
+                    self.advance();
+                    false
+                }
                 _ => false,
             };
             keys.push(OrderKey { field, descending });
@@ -612,7 +719,11 @@ impl Parser {
             Token::Sum => AggFunc::Sum,
             Token::Min => AggFunc::Min,
             Token::Max => AggFunc::Max,
-            t => return Err(ParseError { message: format!("expected aggregate function, got {t:?}") }),
+            t => {
+                return Err(ParseError {
+                    message: format!("expected aggregate function, got {t:?}"),
+                })
+            }
         };
         self.expect(&Token::LParen)?;
         // count(distinct User ...) → CountDistinct
@@ -622,7 +733,11 @@ impl Parser {
         }
         let source = match self.advance() {
             Token::Ident(name) => name,
-            t => return Err(ParseError { message: format!("expected type name, got {t:?}") }),
+            t => {
+                return Err(ParseError {
+                    message: format!("expected type name, got {t:?}"),
+                })
+            }
         };
         // Allow a full read-pipeline tail inside the parens, e.g.
         // `count(User filter .age > 27 limit 100)`. parse_query_tail stops at
@@ -649,7 +764,10 @@ impl Parser {
                 query.projection = None;
             }
         }
-        query.aggregation = Some(AggregateExpr { function: func, field: agg_field });
+        query.aggregation = Some(AggregateExpr {
+            function: func,
+            field: agg_field,
+        });
         Ok(Statement::Query(query))
     }
 
@@ -703,7 +821,11 @@ impl Parser {
             Token::Like => {
                 self.advance();
                 let pattern = self.parse_additive()?;
-                return Ok(Expr::BinaryOp(Box::new(left), BinOp::Like, Box::new(pattern)));
+                return Ok(Expr::BinaryOp(
+                    Box::new(left),
+                    BinOp::Like,
+                    Box::new(pattern),
+                ));
             }
             Token::Between => {
                 self.advance();
@@ -739,10 +861,10 @@ impl Parser {
         }
 
         let op = match self.peek() {
-            Token::Eq  => BinOp::Eq,
+            Token::Eq => BinOp::Eq,
             Token::Neq => BinOp::Neq,
-            Token::Lt  => BinOp::Lt,
-            Token::Gt  => BinOp::Gt,
+            Token::Lt => BinOp::Lt,
+            Token::Gt => BinOp::Gt,
             Token::Lte => BinOp::Lte,
             Token::Gte => BinOp::Gte,
             _ => return Ok(left),
@@ -786,7 +908,11 @@ impl Parser {
             }
         }
         self.expect(&Token::RParen)?;
-        Ok(Expr::InList { expr: Box::new(expr), list, negated })
+        Ok(Expr::InList {
+            expr: Box::new(expr),
+            list,
+            negated,
+        })
     }
 
     /// Try to parse a `(subquery)` tail for `exists` / `not exists`.
@@ -827,14 +953,22 @@ impl Parser {
         if negated {
             // NOT BETWEEN: expr < low OR expr > high
             Ok(Expr::BinaryOp(
-                Box::new(Expr::BinaryOp(Box::new(expr.clone()), BinOp::Lt, Box::new(low))),
+                Box::new(Expr::BinaryOp(
+                    Box::new(expr.clone()),
+                    BinOp::Lt,
+                    Box::new(low),
+                )),
                 BinOp::Or,
                 Box::new(Expr::BinaryOp(Box::new(expr), BinOp::Gt, Box::new(high))),
             ))
         } else {
             // BETWEEN: expr >= low AND expr <= high
             Ok(Expr::BinaryOp(
-                Box::new(Expr::BinaryOp(Box::new(expr.clone()), BinOp::Gte, Box::new(low))),
+                Box::new(Expr::BinaryOp(
+                    Box::new(expr.clone()),
+                    BinOp::Gte,
+                    Box::new(low),
+                )),
                 BinOp::And,
                 Box::new(Expr::BinaryOp(Box::new(expr), BinOp::Lte, Box::new(high))),
             ))
@@ -872,7 +1006,7 @@ impl Parser {
         let mut left = self.parse_multiplicative()?;
         loop {
             let op = match self.peek() {
-                Token::Plus  => BinOp::Add,
+                Token::Plus => BinOp::Add,
                 Token::Minus => BinOp::Sub,
                 Token::Coalesce => {
                     self.advance();
@@ -893,7 +1027,7 @@ impl Parser {
         let mut left = self.parse_primary()?;
         loop {
             let op = match self.peek() {
-                Token::Star  => BinOp::Mul,
+                Token::Star => BinOp::Mul,
                 Token::Slash => BinOp::Div,
                 _ => break,
             };
@@ -977,22 +1111,34 @@ impl Parser {
                 // so a trailing DotIdent here means a qualified reference.
                 if let Token::DotIdent(field) = self.peek().clone() {
                     self.advance();
-                    return Ok(Expr::QualifiedField { qualifier: name, field });
+                    return Ok(Expr::QualifiedField {
+                        qualifier: name,
+                        field,
+                    });
                 }
                 Ok(Expr::Field(name))
             }
             // Window-only functions: row_number(), rank(), dense_rank()
             Token::RowNumber | Token::Rank | Token::DenseRank => {
                 let wfunc = match self.advance() {
-                    Token::RowNumber  => WindowFunc::RowNumber,
-                    Token::Rank       => WindowFunc::Rank,
-                    Token::DenseRank  => WindowFunc::DenseRank,
-                    _ => return Err(ParseError { message: "unexpected window function token".into() }),
+                    Token::RowNumber => WindowFunc::RowNumber,
+                    Token::Rank => WindowFunc::Rank,
+                    Token::DenseRank => WindowFunc::DenseRank,
+                    _ => {
+                        return Err(ParseError {
+                            message: "unexpected window function token".into(),
+                        })
+                    }
                 };
                 self.expect(&Token::LParen)?;
                 self.expect(&Token::RParen)?;
                 let (partition_by, order_by) = self.parse_over_clause()?;
-                Ok(Expr::Window { function: wfunc, args: vec![], partition_by, order_by })
+                Ok(Expr::Window {
+                    function: wfunc,
+                    args: vec![],
+                    partition_by,
+                    order_by,
+                })
             }
             // Aggregate function calls inside expressions (projections, HAVING).
             // Top-level `count(User)` still routes through parse_aggregate_query
@@ -1000,11 +1146,15 @@ impl Parser {
             Token::Count | Token::Avg | Token::Sum | Token::Min | Token::Max => {
                 let mut func = match self.advance() {
                     Token::Count => AggFunc::Count,
-                    Token::Avg   => AggFunc::Avg,
-                    Token::Sum   => AggFunc::Sum,
-                    Token::Min   => AggFunc::Min,
-                    Token::Max   => AggFunc::Max,
-                    _ => return Err(ParseError { message: "unexpected aggregate token".into() }),
+                    Token::Avg => AggFunc::Avg,
+                    Token::Sum => AggFunc::Sum,
+                    Token::Min => AggFunc::Min,
+                    Token::Max => AggFunc::Max,
+                    _ => {
+                        return Err(ParseError {
+                            message: "unexpected aggregate token".into(),
+                        })
+                    }
                 };
                 self.expect(&Token::LParen)?;
                 // count(*) — count all rows including nulls
@@ -1021,7 +1171,10 @@ impl Parser {
                             order_by,
                         });
                     }
-                    return Ok(Expr::FunctionCall(AggFunc::Count, Box::new(Expr::Field("*".into()))));
+                    return Ok(Expr::FunctionCall(
+                        AggFunc::Count,
+                        Box::new(Expr::Field("*".into())),
+                    ));
                 }
                 // count(distinct .field) → CountDistinct
                 if func == AggFunc::Count && *self.peek() == Token::Distinct {
@@ -1034,31 +1187,51 @@ impl Parser {
                 if *self.peek() == Token::Over {
                     let wfunc = match func {
                         AggFunc::Count => WindowFunc::Count,
-                        AggFunc::Avg   => WindowFunc::Avg,
-                        AggFunc::Sum   => WindowFunc::Sum,
-                        AggFunc::Min   => WindowFunc::Min,
-                        AggFunc::Max   => WindowFunc::Max,
-                        _ => return Err(ParseError {
-                            message: "count(distinct ...) over (...) is not supported".into(),
-                        }),
+                        AggFunc::Avg => WindowFunc::Avg,
+                        AggFunc::Sum => WindowFunc::Sum,
+                        AggFunc::Min => WindowFunc::Min,
+                        AggFunc::Max => WindowFunc::Max,
+                        _ => {
+                            return Err(ParseError {
+                                message: "count(distinct ...) over (...) is not supported".into(),
+                            })
+                        }
                     };
                     let (partition_by, order_by) = self.parse_over_clause()?;
-                    return Ok(Expr::Window { function: wfunc, args: vec![inner], partition_by, order_by });
+                    return Ok(Expr::Window {
+                        function: wfunc,
+                        args: vec![inner],
+                        partition_by,
+                        order_by,
+                    });
                 }
                 Ok(Expr::FunctionCall(func, Box::new(inner)))
             }
-            Token::Upper | Token::Lower | Token::Length | Token::Trim
-            | Token::Substring | Token::Concat
-            | Token::Abs | Token::Round | Token::Ceil | Token::Floor
-            | Token::Sqrt | Token::Pow
-            | Token::Now | Token::Extract | Token::DateAdd | Token::DateDiff => {
+            Token::Upper
+            | Token::Lower
+            | Token::Length
+            | Token::Trim
+            | Token::Substring
+            | Token::Concat
+            | Token::Abs
+            | Token::Round
+            | Token::Ceil
+            | Token::Floor
+            | Token::Sqrt
+            | Token::Pow
+            | Token::Now
+            | Token::Extract
+            | Token::DateAdd
+            | Token::DateDiff => {
                 let tok = self.advance();
                 let func = token_to_scalar_fn(&tok);
                 self.expect(&Token::LParen)?;
                 let mut args = Vec::new();
                 while *self.peek() != Token::RParen {
                     args.push(self.parse_expr()?);
-                    if *self.peek() == Token::Comma { self.advance(); }
+                    if *self.peek() == Token::Comma {
+                        self.advance();
+                    }
                 }
                 self.expect(&Token::RParen)?;
                 Ok(Expr::ScalarFunc(func, args))
@@ -1091,7 +1264,9 @@ impl Parser {
                 self.expect(&Token::End)?;
                 Ok(Expr::Case { whens, else_expr })
             }
-            t => Err(ParseError { message: format!("unexpected token in expression: {t:?}") }),
+            t => Err(ParseError {
+                message: format!("unexpected token in expression: {t:?}"),
+            }),
         }
     }
 
@@ -1101,13 +1276,19 @@ impl Parser {
         self.expect(&Token::Alter)?;
         let table = match self.advance() {
             Token::Ident(name) => name,
-            t => return Err(ParseError { message: format!("expected table name after alter, got {t:?}") }),
+            t => {
+                return Err(ParseError {
+                    message: format!("expected table name after alter, got {t:?}"),
+                })
+            }
         };
         match self.peek() {
             Token::Add => {
                 self.advance();
                 // optional `column` keyword
-                if *self.peek() == Token::Column { self.advance(); }
+                if *self.peek() == Token::Column {
+                    self.advance();
+                }
                 let required = if *self.peek() == Token::Required {
                     self.advance();
                     true
@@ -1116,32 +1297,52 @@ impl Parser {
                 };
                 let name = match self.advance() {
                     Token::Ident(n) => n,
-                    t => return Err(ParseError { message: format!("expected column name, got {t:?}") }),
+                    t => {
+                        return Err(ParseError {
+                            message: format!("expected column name, got {t:?}"),
+                        })
+                    }
                 };
                 self.expect(&Token::Colon)?;
                 let type_name = match self.advance() {
                     Token::Ident(n) => n,
-                    t => return Err(ParseError { message: format!("expected type name, got {t:?}") }),
+                    t => {
+                        return Err(ParseError {
+                            message: format!("expected type name, got {t:?}"),
+                        })
+                    }
                 };
                 Ok(Statement::AlterTable(AlterTableExpr {
                     table,
-                    action: AlterAction::AddColumn { name, type_name, required },
+                    action: AlterAction::AddColumn {
+                        name,
+                        type_name,
+                        required,
+                    },
                 }))
             }
             Token::Drop => {
                 self.advance();
                 // optional `column` keyword
-                if *self.peek() == Token::Column { self.advance(); }
+                if *self.peek() == Token::Column {
+                    self.advance();
+                }
                 let name = match self.advance() {
                     Token::Ident(n) => n,
-                    t => return Err(ParseError { message: format!("expected column name, got {t:?}") }),
+                    t => {
+                        return Err(ParseError {
+                            message: format!("expected column name, got {t:?}"),
+                        })
+                    }
                 };
                 Ok(Statement::AlterTable(AlterTableExpr {
                     table,
                     action: AlterAction::DropColumn { name },
                 }))
             }
-            t => Err(ParseError { message: format!("expected add or drop after alter <table>, got {t:?}") }),
+            t => Err(ParseError {
+                message: format!("expected add or drop after alter <table>, got {t:?}"),
+            }),
         }
     }
 
@@ -1152,13 +1353,21 @@ impl Parser {
             self.advance(); // consume `view`
             let name = match self.advance() {
                 Token::Ident(name) => name,
-                t => return Err(ParseError { message: format!("expected view name after drop view, got {t:?}") }),
+                t => {
+                    return Err(ParseError {
+                        message: format!("expected view name after drop view, got {t:?}"),
+                    })
+                }
             };
             return Ok(Statement::DropView(DropViewExpr { name }));
         }
         let table = match self.advance() {
             Token::Ident(name) => name,
-            t => return Err(ParseError { message: format!("expected table name after drop, got {t:?}") }),
+            t => {
+                return Err(ParseError {
+                    message: format!("expected table name after drop, got {t:?}"),
+                })
+            }
         };
         Ok(Statement::DropTable(DropTableExpr { table }))
     }
@@ -1171,19 +1380,31 @@ impl Parser {
         self.expect(&Token::Materialized)?;
         let name = match self.advance() {
             Token::Ident(name) => name,
-            t => return Err(ParseError { message: format!("expected view name after materialize, got {t:?}") }),
+            t => {
+                return Err(ParseError {
+                    message: format!("expected view name after materialize, got {t:?}"),
+                })
+            }
         };
         self.expect(&Token::As)?;
         // Record position so we can reconstruct the query text for storage.
         let query_start = self.pos;
         let source = match self.advance() {
             Token::Ident(s) => s,
-            t => return Err(ParseError { message: format!("expected source table name, got {t:?}") }),
+            t => {
+                return Err(ParseError {
+                    message: format!("expected source table name, got {t:?}"),
+                })
+            }
         };
         let query = self.parse_query_tail(source)?;
         // Reconstruct query text from tokens for storage and re-execution.
         let query_text = tokens_to_text(&self.tokens[query_start..self.pos]);
-        Ok(Statement::CreateView(CreateViewExpr { name, query, query_text }))
+        Ok(Statement::CreateView(CreateViewExpr {
+            name,
+            query,
+            query_text,
+        }))
     }
 
     /// Check for `union [all]` after a query and build a left-associative
@@ -1193,7 +1414,9 @@ impl Parser {
             return Ok(left);
         }
         if !matches!(left, Statement::Query(_) | Statement::Union(_)) {
-            return Err(ParseError { message: "UNION requires a query on the left side".into() });
+            return Err(ParseError {
+                message: "UNION requires a query on the left side".into(),
+            });
         }
         self.advance(); // consume `union`
         let all = if let Token::Ident(s) = self.peek() {
@@ -1224,7 +1447,9 @@ impl Parser {
                 self.parse_aggregate_query()
             }
             Token::Ident(_) => self.parse_query_or_mutation(),
-            _ => Err(ParseError { message: format!("expected query after UNION, got {:?}", self.peek()) }),
+            _ => Err(ParseError {
+                message: format!("expected query after UNION, got {:?}", self.peek()),
+            }),
         }
     }
 
@@ -1233,7 +1458,11 @@ impl Parser {
         self.expect(&Token::Refresh)?;
         let name = match self.advance() {
             Token::Ident(name) => name,
-            t => return Err(ParseError { message: format!("expected view name after refresh, got {t:?}") }),
+            t => {
+                return Err(ParseError {
+                    message: format!("expected view name after refresh, got {t:?}"),
+                })
+            }
         };
         Ok(Statement::RefreshView(RefreshViewExpr { name }))
     }
@@ -1242,7 +1471,11 @@ impl Parser {
         self.expect(&Token::Type)?;
         let name = match self.advance() {
             Token::Ident(n) => n,
-            t => return Err(ParseError { message: format!("expected type name, got {t:?}") }),
+            t => {
+                return Err(ParseError {
+                    message: format!("expected type name, got {t:?}"),
+                })
+            }
         };
         self.expect(&Token::LBrace)?;
         let mut fields = Vec::new();
@@ -1255,14 +1488,26 @@ impl Parser {
             };
             let field_name = match self.advance() {
                 Token::Ident(n) => n,
-                t => return Err(ParseError { message: format!("expected field name, got {t:?}") }),
+                t => {
+                    return Err(ParseError {
+                        message: format!("expected field name, got {t:?}"),
+                    })
+                }
             };
             self.expect(&Token::Colon)?;
             let type_name = match self.advance() {
                 Token::Ident(n) => n,
-                t => return Err(ParseError { message: format!("expected type name, got {t:?}") }),
+                t => {
+                    return Err(ParseError {
+                        message: format!("expected type name, got {t:?}"),
+                    })
+                }
             };
-            fields.push(FieldDef { name: field_name, type_name, required });
+            fields.push(FieldDef {
+                name: field_name,
+                type_name,
+                required,
+            });
             if *self.peek() == Token::Comma {
                 self.advance();
             }
@@ -1283,12 +1528,22 @@ fn tokens_to_text(tokens: &[Token]) -> String {
         }
         match tok {
             Token::Ident(s) => out.push_str(s),
-            Token::DotIdent(s) => { out.push('.'); out.push_str(s); }
+            Token::DotIdent(s) => {
+                out.push('.');
+                out.push_str(s);
+            }
             Token::IntLit(v) => out.push_str(&v.to_string()),
             Token::FloatLit(v) => out.push_str(&v.to_string()),
-            Token::StringLit(s) => { out.push('"'); out.push_str(s); out.push('"'); }
+            Token::StringLit(s) => {
+                out.push('"');
+                out.push_str(s);
+                out.push('"');
+            }
             Token::BoolLit(v) => out.push_str(if *v { "true" } else { "false" }),
-            Token::Param(s) => { out.push('$'); out.push_str(s); }
+            Token::Param(s) => {
+                out.push('$');
+                out.push_str(s);
+            }
             Token::Type => out.push_str("type"),
             Token::Filter => out.push_str("filter"),
             Token::Order => out.push_str("order"),
@@ -1559,7 +1814,10 @@ mod tests {
                 let agg = q.aggregation.expect("aggregate");
                 assert_eq!(agg.function, AggFunc::Sum);
                 assert_eq!(agg.field.as_deref(), Some("age"));
-                assert!(q.projection.is_none(), "projection should be lifted into agg.field");
+                assert!(
+                    q.projection.is_none(),
+                    "projection should be lifted into agg.field"
+                );
             }
             _ => panic!("expected query"),
         }
@@ -1577,8 +1835,15 @@ mod tests {
                 Statement::Query(q) => {
                     let agg = q.aggregation.unwrap();
                     assert_eq!(agg.function, expected, "func mismatch for {src}");
-                    assert_eq!(agg.field.as_deref(), Some("age"), "field mismatch for {src}");
-                    assert!(q.projection.is_none(), "projection should be cleared for {src}");
+                    assert_eq!(
+                        agg.field.as_deref(),
+                        Some("age"),
+                        "field mismatch for {src}"
+                    );
+                    assert!(
+                        q.projection.is_none(),
+                        "projection should be cleared for {src}"
+                    );
                 }
                 _ => panic!("expected query for {src}"),
             }
@@ -1763,15 +2028,14 @@ mod tests {
     fn test_parse_update_on_joined_query_errors() {
         // E1.1 explicitly rejects update/delete on joined queries — SQL
         // semantics here are messy and we're not implementing them yet.
-        let err = parse("User as u join Order as o on u.id = o.user_id update { age := 1 }")
-            .unwrap_err();
+        let err =
+            parse("User as u join Order as o on u.id = o.user_id update { age := 1 }").unwrap_err();
         assert!(err.message.contains("update"));
     }
 
     #[test]
     fn test_parse_delete_on_joined_query_errors() {
-        let err =
-            parse("User as u join Order as o on u.id = o.user_id delete").unwrap_err();
+        let err = parse("User as u join Order as o on u.id = o.user_id delete").unwrap_err();
         assert!(err.message.contains("delete"));
     }
 
@@ -1793,16 +2057,18 @@ mod tests {
     fn test_parse_in_list() {
         let stmt = parse(r#"User filter .name in ("Alice", "Bob")"#).unwrap();
         match stmt {
-            Statement::Query(q) => {
-                match q.filter.unwrap() {
-                    Expr::InList { expr, list, negated } => {
-                        assert!(!negated);
-                        assert!(matches!(*expr, Expr::Field(f) if f == "name"));
-                        assert_eq!(list.len(), 2);
-                    }
-                    other => panic!("expected InList, got {other:?}"),
+            Statement::Query(q) => match q.filter.unwrap() {
+                Expr::InList {
+                    expr,
+                    list,
+                    negated,
+                } => {
+                    assert!(!negated);
+                    assert!(matches!(*expr, Expr::Field(f) if f == "name"));
+                    assert_eq!(list.len(), 2);
                 }
-            }
+                other => panic!("expected InList, got {other:?}"),
+            },
             _ => panic!("expected query"),
         }
     }
@@ -1811,15 +2077,13 @@ mod tests {
     fn test_parse_not_in_list() {
         let stmt = parse("User filter .age not in (1, 2, 3)").unwrap();
         match stmt {
-            Statement::Query(q) => {
-                match q.filter.unwrap() {
-                    Expr::InList { negated, list, .. } => {
-                        assert!(negated);
-                        assert_eq!(list.len(), 3);
-                    }
-                    other => panic!("expected InList, got {other:?}"),
+            Statement::Query(q) => match q.filter.unwrap() {
+                Expr::InList { negated, list, .. } => {
+                    assert!(negated);
+                    assert_eq!(list.len(), 3);
                 }
-            }
+                other => panic!("expected InList, got {other:?}"),
+            },
             _ => panic!("expected query"),
         }
     }
@@ -1858,15 +2122,13 @@ mod tests {
     fn test_parse_like() {
         let stmt = parse(r#"User filter .name like "A%""#).unwrap();
         match stmt {
-            Statement::Query(q) => {
-                match q.filter.unwrap() {
-                    Expr::BinaryOp(l, BinOp::Like, r) => {
-                        assert!(matches!(*l, Expr::Field(f) if f == "name"));
-                        assert!(matches!(*r, Expr::Literal(Literal::String(s)) if s == "A%"));
-                    }
-                    other => panic!("expected Like, got {other:?}"),
+            Statement::Query(q) => match q.filter.unwrap() {
+                Expr::BinaryOp(l, BinOp::Like, r) => {
+                    assert!(matches!(*l, Expr::Field(f) if f == "name"));
+                    assert!(matches!(*r, Expr::Literal(Literal::String(s)) if s == "A%"));
                 }
-            }
+                other => panic!("expected Like, got {other:?}"),
+            },
             _ => panic!("expected query"),
         }
     }
@@ -1875,14 +2137,12 @@ mod tests {
     fn test_parse_not_like() {
         let stmt = parse(r#"User filter .name not like "A%""#).unwrap();
         match stmt {
-            Statement::Query(q) => {
-                match q.filter.unwrap() {
-                    Expr::UnaryOp(UnaryOp::Not, inner) => {
-                        assert!(matches!(*inner, Expr::BinaryOp(_, BinOp::Like, _)));
-                    }
-                    other => panic!("expected Not(Like), got {other:?}"),
+            Statement::Query(q) => match q.filter.unwrap() {
+                Expr::UnaryOp(UnaryOp::Not, inner) => {
+                    assert!(matches!(*inner, Expr::BinaryOp(_, BinOp::Like, _)));
                 }
-            }
+                other => panic!("expected Not(Like), got {other:?}"),
+            },
             _ => panic!("expected query"),
         }
     }
@@ -1899,7 +2159,10 @@ mod tests {
                 assert!(gb.having.is_none());
                 let proj = q.projection.unwrap();
                 assert_eq!(proj.len(), 2);
-                assert!(matches!(&proj[1].expr, Expr::FunctionCall(AggFunc::Count, _)));
+                assert!(matches!(
+                    &proj[1].expr,
+                    Expr::FunctionCall(AggFunc::Count, _)
+                ));
                 assert_eq!(proj[1].alias.as_deref(), Some("n"));
             }
             _ => panic!("expected query"),
@@ -1946,7 +2209,10 @@ mod tests {
             Statement::Query(q) => {
                 let proj = q.projection.unwrap();
                 assert_eq!(proj.len(), 3);
-                assert!(matches!(&proj[1].expr, Expr::FunctionCall(AggFunc::Count, _)));
+                assert!(matches!(
+                    &proj[1].expr,
+                    Expr::FunctionCall(AggFunc::Count, _)
+                ));
                 assert!(matches!(&proj[2].expr, Expr::FunctionCall(AggFunc::Sum, _)));
             }
             _ => panic!("expected query"),
@@ -1955,12 +2221,16 @@ mod tests {
 
     #[test]
     fn test_parse_aggregate_in_aliased_projection() {
-        let stmt = parse("User group .status { .status, total: count(.name), average: avg(.age) }").unwrap();
+        let stmt = parse("User group .status { .status, total: count(.name), average: avg(.age) }")
+            .unwrap();
         match stmt {
             Statement::Query(q) => {
                 let proj = q.projection.unwrap();
                 assert_eq!(proj[1].alias.as_deref(), Some("total"));
-                assert!(matches!(&proj[1].expr, Expr::FunctionCall(AggFunc::Count, _)));
+                assert!(matches!(
+                    &proj[1].expr,
+                    Expr::FunctionCall(AggFunc::Count, _)
+                ));
                 assert_eq!(proj[2].alias.as_deref(), Some("average"));
                 assert!(matches!(&proj[2].expr, Expr::FunctionCall(AggFunc::Avg, _)));
             }
@@ -2140,12 +2410,10 @@ mod tests {
             Statement::Query(q) => {
                 let filter = q.filter.unwrap();
                 match filter {
-                    Expr::BinaryOp(left, BinOp::Gt, _) => {
-                        match *left {
-                            Expr::BinaryOp(_, BinOp::Mul, _) => {}
-                            other => panic!("expected Mul, got {other:?}"),
-                        }
-                    }
+                    Expr::BinaryOp(left, BinOp::Gt, _) => match *left {
+                        Expr::BinaryOp(_, BinOp::Mul, _) => {}
+                        other => panic!("expected Mul, got {other:?}"),
+                    },
                     other => panic!("expected BinaryOp Gt, got {other:?}"),
                 }
             }
@@ -2177,14 +2445,12 @@ mod tests {
             Statement::Query(q) => {
                 let filter = q.filter.unwrap();
                 match filter {
-                    Expr::BinaryOp(left, BinOp::Gt, _) => {
-                        match *left {
-                            Expr::BinaryOp(_, BinOp::Add, right) => {
-                                assert!(matches!(*right, Expr::BinaryOp(_, BinOp::Mul, _)));
-                            }
-                            other => panic!("expected Add, got {other:?}"),
+                    Expr::BinaryOp(left, BinOp::Gt, _) => match *left {
+                        Expr::BinaryOp(_, BinOp::Add, right) => {
+                            assert!(matches!(*right, Expr::BinaryOp(_, BinOp::Mul, _)));
                         }
-                    }
+                        other => panic!("expected Add, got {other:?}"),
+                    },
                     other => panic!("expected Gt, got {other:?}"),
                 }
             }
@@ -2232,7 +2498,11 @@ mod tests {
             Statement::AlterTable(at) => {
                 assert_eq!(at.table, "User");
                 match at.action {
-                    AlterAction::AddColumn { name, type_name, required } => {
+                    AlterAction::AddColumn {
+                        name,
+                        type_name,
+                        required,
+                    } => {
                         assert_eq!(name, "status");
                         assert_eq!(type_name, "str");
                         assert!(!required);
@@ -2248,12 +2518,10 @@ mod tests {
     fn test_parse_alter_add_required_column() {
         let stmt = parse("alter User add required status: str").unwrap();
         match stmt {
-            Statement::AlterTable(at) => {
-                match at.action {
-                    AlterAction::AddColumn { required, .. } => assert!(required),
-                    other => panic!("expected AddColumn, got {other:?}"),
-                }
-            }
+            Statement::AlterTable(at) => match at.action {
+                AlterAction::AddColumn { required, .. } => assert!(required),
+                other => panic!("expected AddColumn, got {other:?}"),
+            },
             other => panic!("expected AlterTable, got {other:?}"),
         }
     }
@@ -2277,12 +2545,10 @@ mod tests {
     fn test_parse_alter_drop_without_column_keyword() {
         let stmt = parse("alter User drop status").unwrap();
         match stmt {
-            Statement::AlterTable(at) => {
-                match at.action {
-                    AlterAction::DropColumn { name } => assert_eq!(name, "status"),
-                    other => panic!("expected DropColumn, got {other:?}"),
-                }
-            }
+            Statement::AlterTable(at) => match at.action {
+                AlterAction::DropColumn { name } => assert_eq!(name, "status"),
+                other => panic!("expected DropColumn, got {other:?}"),
+            },
             other => panic!("expected AlterTable, got {other:?}"),
         }
     }
@@ -2305,7 +2571,11 @@ mod tests {
             Statement::Query(q) => {
                 let filter = q.filter.unwrap();
                 match filter {
-                    Expr::InSubquery { expr, subquery, negated } => {
+                    Expr::InSubquery {
+                        expr,
+                        subquery,
+                        negated,
+                    } => {
                         assert!(!negated);
                         assert!(matches!(*expr, Expr::Field(ref f) if f == "name"));
                         assert_eq!(subquery.source, "VIP");
@@ -2321,12 +2591,10 @@ mod tests {
     fn test_parse_not_in_subquery() {
         let stmt = parse("User filter .id not in (Order { .user_id })").unwrap();
         match stmt {
-            Statement::Query(q) => {
-                match q.filter.unwrap() {
-                    Expr::InSubquery { negated, .. } => assert!(negated),
-                    other => panic!("expected InSubquery, got {other:?}"),
-                }
-            }
+            Statement::Query(q) => match q.filter.unwrap() {
+                Expr::InSubquery { negated, .. } => assert!(negated),
+                other => panic!("expected InSubquery, got {other:?}"),
+            },
             _ => panic!("expected query"),
         }
     }
@@ -2336,15 +2604,13 @@ mod tests {
         // Ensure existing IN (literal) parsing isn't broken
         let stmt = parse("User filter .age in (25, 30, 35)").unwrap();
         match stmt {
-            Statement::Query(q) => {
-                match q.filter.unwrap() {
-                    Expr::InList { list, negated, .. } => {
-                        assert!(!negated);
-                        assert_eq!(list.len(), 3);
-                    }
-                    other => panic!("expected InList, got {other:?}"),
+            Statement::Query(q) => match q.filter.unwrap() {
+                Expr::InList { list, negated, .. } => {
+                    assert!(!negated);
+                    assert_eq!(list.len(), 3);
                 }
-            }
+                other => panic!("expected InList, got {other:?}"),
+            },
             _ => panic!("expected query"),
         }
     }
@@ -2548,7 +2814,12 @@ mod tests {
                 assert_eq!(proj.len(), 2);
                 assert_eq!(proj[1].alias.as_deref(), Some("rn"));
                 match &proj[1].expr {
-                    Expr::Window { function, args, partition_by, order_by } => {
+                    Expr::Window {
+                        function,
+                        args,
+                        partition_by,
+                        order_by,
+                    } => {
                         assert_eq!(*function, WindowFunc::RowNumber);
                         assert!(args.is_empty());
                         assert!(partition_by.is_empty());
@@ -2565,14 +2836,20 @@ mod tests {
 
     #[test]
     fn test_parse_window_sum_partition_order() {
-        let stmt = parse("User { .name, s: sum(.salary) over (partition .dept order .salary) }").unwrap();
+        let stmt =
+            parse("User { .name, s: sum(.salary) over (partition .dept order .salary) }").unwrap();
         match stmt {
             Statement::Query(q) => {
                 let proj = q.projection.unwrap();
                 assert_eq!(proj.len(), 2);
                 assert_eq!(proj[1].alias.as_deref(), Some("s"));
                 match &proj[1].expr {
-                    Expr::Window { function, args, partition_by, order_by } => {
+                    Expr::Window {
+                        function,
+                        args,
+                        partition_by,
+                        order_by,
+                    } => {
                         assert_eq!(*function, WindowFunc::Sum);
                         assert_eq!(args.len(), 1);
                         assert!(matches!(&args[0], Expr::Field(f) if f == "salary"));
@@ -2590,13 +2867,20 @@ mod tests {
 
     #[test]
     fn test_parse_window_rank_desc() {
-        let stmt = parse("User { .dept, .salary, r: rank() over (partition .dept order .salary desc) }").unwrap();
+        let stmt =
+            parse("User { .dept, .salary, r: rank() over (partition .dept order .salary desc) }")
+                .unwrap();
         match stmt {
             Statement::Query(q) => {
                 let proj = q.projection.unwrap();
                 assert_eq!(proj.len(), 3);
                 match &proj[2].expr {
-                    Expr::Window { function, partition_by, order_by, .. } => {
+                    Expr::Window {
+                        function,
+                        partition_by,
+                        order_by,
+                        ..
+                    } => {
                         assert_eq!(*function, WindowFunc::Rank);
                         assert_eq!(partition_by, &["dept"]);
                         assert_eq!(order_by.len(), 1);

@@ -56,7 +56,10 @@ impl BufferPool {
             ref_bit: true,
         });
         // Write to disk immediately so it exists for read-back
-        self.disk.write_page(page_id, self.frames[frame_idx].as_ref().unwrap().page.as_bytes())?;
+        self.disk.write_page(
+            page_id,
+            self.frames[frame_idx].as_ref().unwrap().page.as_bytes(),
+        )?;
         Ok(page_id)
     }
 

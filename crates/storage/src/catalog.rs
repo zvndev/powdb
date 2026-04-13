@@ -98,8 +98,13 @@ impl Catalog {
         }
         let entries = read_catalog_file(&cat_path)?;
         let mut tables: Vec<Table> = Vec::with_capacity(entries.len());
-        let mut name_to_slot = FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
-        for CatalogEntry { schema, indexed_cols } in entries {
+        let mut name_to_slot =
+            FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
+        for CatalogEntry {
+            schema,
+            indexed_cols,
+        } in entries
+        {
             let name = schema.table_name.clone();
             // Mission 3: rehydrate persisted indexes. `Table::open_with_indexes`
             // tries to `BTree::load` each named index file; if a file is
@@ -328,7 +333,10 @@ impl Catalog {
     pub fn create_table(&mut self, schema: Schema) -> io::Result<()> {
         let name = schema.table_name.clone();
         if self.name_to_slot.contains_key(&name) {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("table '{name}' already exists")));
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("table '{name}' already exists"),
+            ));
         }
         let table = Table::create(schema, &self.data_dir)?;
         let slot = self.tables.len();
@@ -396,16 +404,24 @@ impl Catalog {
     /// consolidates ~14 copies of that idiom into this one place.
     #[inline]
     fn by_name(&self, table: &str) -> io::Result<&Table> {
-        let slot = *self.name_to_slot.get(table)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
+        let slot = *self.name_to_slot.get(table).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("table '{table}' not found"),
+            )
+        })?;
         Ok(&self.tables[slot])
     }
 
     /// Mutable counterpart to [`Self::by_name`].
     #[inline]
     fn by_name_mut(&mut self, table: &str) -> io::Result<&mut Table> {
-        let slot = *self.name_to_slot.get(table)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found")))?;
+        let slot = *self.name_to_slot.get(table).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("table '{table}' not found"),
+            )
+        })?;
         Ok(&mut self.tables[slot])
     }
 
@@ -431,7 +447,10 @@ impl Catalog {
             tx_id,
             WalRecordType::Insert,
             table,
-            RowId { page_id: 0, slot_index: 0 },
+            RowId {
+                page_id: 0,
+                slot_index: 0,
+            },
             &wal_bytes,
         )?;
         self.by_name_mut(table)?.insert(values)
@@ -517,7 +536,10 @@ impl Catalog {
         // hook closes over `&mut self.wal`, which can't coexist with a
         // `by_name_mut` borrow of `self.tables`.
         let slot = *self.name_to_slot.get(table).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found"))
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("table '{table}' not found"),
+            )
         })?;
         let tx_id = self.next_tx();
         // Split-borrow the catalog fields so the hook can write into
@@ -529,7 +551,8 @@ impl Catalog {
         // the only things we append inside the hook.
         let name_bytes = table.as_bytes();
         let count = tbl.scan_delete_matching_with_hook(pred, |rid, row_bytes| {
-            let mut payload: Vec<u8> = Vec::with_capacity(4 + name_bytes.len() + 10 + row_bytes.len());
+            let mut payload: Vec<u8> =
+                Vec::with_capacity(4 + name_bytes.len() + 10 + row_bytes.len());
             payload.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
             payload.extend_from_slice(name_bytes);
             payload.extend_from_slice(&rid.page_id.to_le_bytes());
@@ -568,20 +591,25 @@ impl Catalog {
         M: FnMut(&mut [u8]) -> Option<u16>,
     {
         if self.wal.is_off() {
-            return self.by_name_mut(table)?
-                .scan_patch_matching_with_hook(pred, try_mutate, |_, _| {});
+            return self.by_name_mut(table)?.scan_patch_matching_with_hook(
+                pred,
+                try_mutate,
+                |_, _| {},
+            );
         }
         let slot = *self.name_to_slot.get(table).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found"))
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("table '{table}' not found"),
+            )
         })?;
         let tx_id = self.next_tx();
         let Catalog { tables, wal, .. } = self;
         let tbl = &mut tables[slot];
         let name_bytes = table.as_bytes();
         let result = tbl.scan_patch_matching_with_hook(pred, try_mutate, |rid, row_bytes| {
-            let mut payload: Vec<u8> = Vec::with_capacity(
-                4 + name_bytes.len() + 10 + row_bytes.len(),
-            );
+            let mut payload: Vec<u8> =
+                Vec::with_capacity(4 + name_bytes.len() + 10 + row_bytes.len());
             payload.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
             payload.extend_from_slice(name_bytes);
             payload.extend_from_slice(&rid.page_id.to_le_bytes());
@@ -621,14 +649,17 @@ impl Catalog {
         // construction. The `update_by_filter` powql bench drives this
         // path tens of thousands of times per iteration.
         if self.wal.is_off() {
-            return self.by_name_mut(table)?.update_hinted(rid, values, changed_col_indices);
+            return self
+                .by_name_mut(table)?
+                .update_hinted(rid, values, changed_col_indices);
         }
         let tbl = self.by_name_mut(table)?;
         let mut wal_bytes: Vec<u8> = Vec::new();
         encode_row_into(&tbl.schema, values, &mut wal_bytes);
         let tx_id = self.next_tx();
         self.wal_log(tx_id, WalRecordType::Update, table, rid, &wal_bytes)?;
-        self.by_name_mut(table)?.update_hinted(rid, values, changed_col_indices)
+        self.by_name_mut(table)?
+            .update_hinted(rid, values, changed_col_indices)
     }
 
     /// Mission C Phase 4: fast-path update that patches a row's raw bytes
@@ -643,12 +674,7 @@ impl Catalog {
     /// itself and any future callers that can tolerate the non-durable
     /// contract.
     #[inline]
-    pub fn with_row_bytes_mut<F>(
-        &mut self,
-        table: &str,
-        rid: RowId,
-        f: F,
-    ) -> io::Result<bool>
+    pub fn with_row_bytes_mut<F>(&mut self, table: &str, rid: RowId, f: F) -> io::Result<bool>
     where
         F: FnOnce(&mut [u8]),
     {
@@ -669,17 +695,15 @@ impl Catalog {
     /// No hot-page eviction can happen between steps because this
     /// method holds the catalog's `&mut self` exclusively.
     #[inline]
-    pub fn update_row_bytes_logged<F>(
-        &mut self,
-        table: &str,
-        rid: RowId,
-        f: F,
-    ) -> io::Result<bool>
+    pub fn update_row_bytes_logged<F>(&mut self, table: &str, rid: RowId, f: F) -> io::Result<bool>
     where
         F: FnOnce(&mut [u8]),
     {
         let slot = *self.name_to_slot.get(table).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found"))
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("table '{table}' not found"),
+            )
         })?;
         self.update_row_bytes_logged_by_slot(slot, rid, f)
     }
@@ -745,7 +769,8 @@ impl Catalog {
         col_idx: usize,
         new_value: Option<&[u8]>,
     ) -> io::Result<bool> {
-        self.by_name_mut(table)?.patch_var_col_in_place(rid, col_idx, new_value)
+        self.by_name_mut(table)?
+            .patch_var_col_in_place(rid, col_idx, new_value)
     }
 
     /// Mission B2: WAL-logged variant of [`Self::patch_var_col_in_place`].
@@ -761,7 +786,10 @@ impl Catalog {
         new_value: Option<&[u8]>,
     ) -> io::Result<bool> {
         let slot = *self.name_to_slot.get(table).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("table '{table}' not found"))
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("table '{table}' not found"),
+            )
         })?;
         let tbl = &mut self.tables[slot];
         let ok = tbl.patch_var_col_in_place(rid, col_idx, new_value)?;
@@ -819,14 +847,20 @@ impl Catalog {
     }
 
     pub fn index_lookup(&self, table: &str, column: &str, key: &Value) -> io::Result<Option<Row>> {
-        Ok(self.by_name(table)?.index_lookup(column, key).map(|(_, row)| row))
+        Ok(self
+            .by_name(table)?
+            .index_lookup(column, key)
+            .map(|(_, row)| row))
     }
 
     pub fn list_tables(&self) -> Vec<&str> {
         // Phase 18: iterate the Vec directly — schema.table_name is
         // the source of truth, and Vec order is insertion order (more
         // deterministic than the old FxHashMap keys).
-        self.tables.iter().map(|t| t.schema.table_name.as_str()).collect()
+        self.tables
+            .iter()
+            .map(|t| t.schema.table_name.as_str())
+            .collect()
     }
 
     pub fn schema(&self, table: &str) -> Option<&Schema> {
@@ -838,11 +872,14 @@ impl Catalog {
     /// Returns `Err` if the table doesn't exist.
     // TODO(WAL): DDL is not replayed — track in follow-up
     pub fn drop_table(&mut self, name: &str) -> io::Result<()> {
-        let slot = *self.name_to_slot.get(name)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("table '{name}' not found")))?;
+        let slot = *self.name_to_slot.get(name).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("table '{name}' not found"))
+        })?;
         // Remove the data file.
         let table = &self.tables[slot];
-        let heap_path = self.data_dir.join(format!("{}.heap", table.schema.table_name));
+        let heap_path = self
+            .data_dir
+            .join(format!("{}.heap", table.schema.table_name));
         if heap_path.exists() {
             fs::remove_file(&heap_path)?;
         }
@@ -898,8 +935,10 @@ impl Catalog {
         let tbl = self.by_name_mut(table)?;
         // Check for duplicate column name.
         if tbl.schema.columns.iter().any(|c| c.name == col.name) {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists,
-                format!("column '{}' already exists in table '{table}'", col.name)));
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("column '{}' already exists in table '{table}'", col.name),
+            ));
         }
 
         // Snapshot the old schema so we can decode existing rows with
@@ -967,9 +1006,17 @@ impl Catalog {
     pub fn alter_table_drop_column(&mut self, table: &str, col_name: &str) -> io::Result<()> {
         let data_dir = self.data_dir.clone();
         let tbl = self.by_name_mut(table)?;
-        let idx = tbl.schema.columns.iter().position(|c| c.name == col_name)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound,
-                format!("column '{col_name}' not found in table '{table}'")))?;
+        let idx = tbl
+            .schema
+            .columns
+            .iter()
+            .position(|c| c.name == col_name)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("column '{col_name}' not found in table '{table}'"),
+                )
+            })?;
 
         // Snapshot for decoding old rows.
         let old_schema = tbl.schema.clone();
@@ -1044,22 +1091,39 @@ fn encode_wal_payload(table: &str, rid: RowId, row_bytes: &[u8]) -> Vec<u8> {
 
 fn decode_wal_payload(data: &[u8]) -> Option<(String, RowId, Vec<u8>)> {
     let mut pos = 0usize;
-    if data.len() < 4 { return None; }
+    if data.len() < 4 {
+        return None;
+    }
     let name_len = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
     pos += 4;
-    if pos + name_len > data.len() { return None; }
-    let name = std::str::from_utf8(&data[pos..pos + name_len]).ok()?.to_string();
+    if pos + name_len > data.len() {
+        return None;
+    }
+    let name = std::str::from_utf8(&data[pos..pos + name_len])
+        .ok()?
+        .to_string();
     pos += name_len;
-    if pos + 4 + 2 + 4 > data.len() { return None; }
+    if pos + 4 + 2 + 4 > data.len() {
+        return None;
+    }
     let page_id = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?);
     pos += 4;
     let slot_index = u16::from_le_bytes(data[pos..pos + 2].try_into().ok()?);
     pos += 2;
     let row_len = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
     pos += 4;
-    if pos + row_len > data.len() { return None; }
+    if pos + row_len > data.len() {
+        return None;
+    }
     let row_bytes = data[pos..pos + row_len].to_vec();
-    Some((name, RowId { page_id, slot_index }, row_bytes))
+    Some((
+        name,
+        RowId {
+            page_id,
+            slot_index,
+        },
+        row_bytes,
+    ))
 }
 
 // ─── Catalog file format ────────────────────────────────────────────────────
@@ -1131,7 +1195,9 @@ fn write_catalog_file(path: &Path, entries: &[CatalogEntryRef<'_>]) -> io::Resul
     }
 
     let mut f = fs::OpenOptions::new()
-        .create(true).write(true).truncate(true)
+        .create(true)
+        .write(true)
+        .truncate(true)
         .open(path)?;
     f.write_all(&buf)?;
     f.sync_data()?;
@@ -1145,10 +1211,13 @@ fn read_catalog_file(path: &Path) -> io::Result<Vec<CatalogEntry>> {
 
     let mut pos = 0usize;
     if buf.len() < 10 || &buf[0..4] != CATALOG_MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad catalog magic"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad catalog magic",
+        ));
     }
     pos += 4;
-    let version = u16::from_le_bytes(buf[pos..pos+2].try_into().unwrap());
+    let version = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap());
     pos += 2;
     // Mission 3: accept version 1 files for forward compatibility.
     // `create_index` was the only mutator that added indexes before, and
@@ -1156,9 +1225,12 @@ fn read_catalog_file(path: &Path) -> io::Result<Vec<CatalogEntry>> {
     // as absent and let the first `create_index` call repopulate the
     // metadata (and mint a version 2 file).
     if version != CATALOG_VERSION && version != 1 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unsupported catalog version: {version}")));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported catalog version: {version}"),
+        ));
     }
-    let n_tables = u32::from_le_bytes(buf[pos..pos+4].try_into().unwrap()) as usize;
+    let n_tables = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
 
     let mut entries = Vec::with_capacity(n_tables);
@@ -1175,7 +1247,12 @@ fn read_catalog_file(path: &Path) -> io::Result<Vec<CatalogEntry>> {
             let type_id = type_id_from_u8(type_id_raw)?;
             let required = read_u8(&buf, &mut pos)? != 0;
             let position = read_u16(&buf, &mut pos)?;
-            columns.push(ColumnDef { name, type_id, required, position });
+            columns.push(ColumnDef {
+                name,
+                type_id,
+                required,
+                position,
+            });
         }
 
         // Version 2 appends the indexed column list. Version 1 stops
@@ -1193,7 +1270,10 @@ fn read_catalog_file(path: &Path) -> io::Result<Vec<CatalogEntry>> {
         };
 
         entries.push(CatalogEntry {
-            schema: Schema { table_name, columns },
+            schema: Schema {
+                table_name,
+                columns,
+            },
             indexed_cols,
         });
     }
@@ -1202,26 +1282,46 @@ fn read_catalog_file(path: &Path) -> io::Result<Vec<CatalogEntry>> {
 }
 
 fn read_u8(buf: &[u8], pos: &mut usize) -> io::Result<u8> {
-    if *pos >= buf.len() { return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated catalog")); }
+    if *pos >= buf.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated catalog",
+        ));
+    }
     let v = buf[*pos];
     *pos += 1;
     Ok(v)
 }
 fn read_u16(buf: &[u8], pos: &mut usize) -> io::Result<u16> {
-    if *pos + 2 > buf.len() { return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated catalog")); }
-    let v = u16::from_le_bytes(buf[*pos..*pos+2].try_into().unwrap());
+    if *pos + 2 > buf.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated catalog",
+        ));
+    }
+    let v = u16::from_le_bytes(buf[*pos..*pos + 2].try_into().unwrap());
     *pos += 2;
     Ok(v)
 }
 fn read_u32(buf: &[u8], pos: &mut usize) -> io::Result<u32> {
-    if *pos + 4 > buf.len() { return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated catalog")); }
-    let v = u32::from_le_bytes(buf[*pos..*pos+4].try_into().unwrap());
+    if *pos + 4 > buf.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated catalog",
+        ));
+    }
+    let v = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap());
     *pos += 4;
     Ok(v)
 }
 fn read_string(buf: &[u8], pos: &mut usize, len: usize) -> io::Result<String> {
-    if *pos + len > buf.len() { return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated catalog string")); }
-    let s = std::str::from_utf8(&buf[*pos..*pos+len])
+    if *pos + len > buf.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated catalog string",
+        ));
+    }
+    let s = std::str::from_utf8(&buf[*pos..*pos + len])
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-utf8 in catalog"))?
         .to_string();
     *pos += len;
@@ -1237,7 +1337,10 @@ fn type_id_from_u8(v: u8) -> io::Result<TypeId> {
         5 => Ok(TypeId::DateTime),
         6 => Ok(TypeId::Uuid),
         7 => Ok(TypeId::Bytes),
-        _ => Err(io::Error::new(io::ErrorKind::InvalidData, format!("unknown type id: {v}"))),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown type id: {v}"),
+        )),
     }
 }
 
@@ -1255,8 +1358,18 @@ mod tests {
         let schema = Schema {
             table_name: "users".into(),
             columns: vec![
-                ColumnDef { name: "name".into(), type_id: TypeId::Str, required: true, position: 0 },
-                ColumnDef { name: "age".into(), type_id: TypeId::Int, required: false, position: 1 },
+                ColumnDef {
+                    name: "name".into(),
+                    type_id: TypeId::Str,
+                    required: true,
+                    position: 0,
+                },
+                ColumnDef {
+                    name: "age".into(),
+                    type_id: TypeId::Int,
+                    required: false,
+                    position: 1,
+                },
             ],
         };
         cat.create_table(schema).unwrap();
@@ -1275,17 +1388,31 @@ mod tests {
         let schema = Schema {
             table_name: "items".into(),
             columns: vec![
-                ColumnDef { name: "name".into(), type_id: TypeId::Str, required: true, position: 0 },
-                ColumnDef { name: "price".into(), type_id: TypeId::Float, required: true, position: 1 },
+                ColumnDef {
+                    name: "name".into(),
+                    type_id: TypeId::Str,
+                    required: true,
+                    position: 0,
+                },
+                ColumnDef {
+                    name: "price".into(),
+                    type_id: TypeId::Float,
+                    required: true,
+                    position: 1,
+                },
             ],
         };
         cat.create_table(schema).unwrap();
 
         for i in 0..50 {
-            cat.insert("items", &vec![
-                Value::Str(format!("item_{i}")),
-                Value::Float(i as f64 * 1.5),
-            ]).unwrap();
+            cat.insert(
+                "items",
+                &vec![
+                    Value::Str(format!("item_{i}")),
+                    Value::Float(i as f64 * 1.5),
+                ],
+            )
+            .unwrap();
         }
 
         let rows: Vec<_> = cat.scan("items").unwrap().collect();
@@ -1298,23 +1425,43 @@ mod tests {
         let schema = Schema {
             table_name: "users".into(),
             columns: vec![
-                ColumnDef { name: "email".into(), type_id: TypeId::Str, required: true, position: 0 },
-                ColumnDef { name: "name".into(), type_id: TypeId::Str, required: true, position: 1 },
+                ColumnDef {
+                    name: "email".into(),
+                    type_id: TypeId::Str,
+                    required: true,
+                    position: 0,
+                },
+                ColumnDef {
+                    name: "name".into(),
+                    type_id: TypeId::Str,
+                    required: true,
+                    position: 1,
+                },
             ],
         };
         cat.create_table(schema).unwrap();
         cat.create_index("users", "email").unwrap();
 
-        cat.insert("users", &vec![
-            Value::Str("alice@example.com".into()),
-            Value::Str("Alice".into()),
-        ]).unwrap();
-        cat.insert("users", &vec![
-            Value::Str("bob@example.com".into()),
-            Value::Str("Bob".into()),
-        ]).unwrap();
+        cat.insert(
+            "users",
+            &vec![
+                Value::Str("alice@example.com".into()),
+                Value::Str("Alice".into()),
+            ],
+        )
+        .unwrap();
+        cat.insert(
+            "users",
+            &vec![
+                Value::Str("bob@example.com".into()),
+                Value::Str("Bob".into()),
+            ],
+        )
+        .unwrap();
 
-        let result = cat.index_lookup("users", "email", &Value::Str("bob@example.com".into())).unwrap();
+        let result = cat
+            .index_lookup("users", "email", &Value::Str("bob@example.com".into()))
+            .unwrap();
         assert!(result.is_some());
         let row = result.unwrap();
         assert_eq!(row[1], Value::Str("Bob".into()));
@@ -1325,9 +1472,12 @@ mod tests {
         let mut cat = temp_catalog("delete");
         let schema = Schema {
             table_name: "t".into(),
-            columns: vec![
-                ColumnDef { name: "v".into(), type_id: TypeId::Int, required: true, position: 0 },
-            ],
+            columns: vec![ColumnDef {
+                name: "v".into(),
+                type_id: TypeId::Int,
+                required: true,
+                position: 0,
+            }],
         };
         cat.create_table(schema).unwrap();
         let r1 = cat.insert("t", &vec![Value::Int(1)]).unwrap();
@@ -1342,9 +1492,12 @@ mod tests {
         let mut cat = temp_catalog("update");
         let schema = Schema {
             table_name: "t".into(),
-            columns: vec![
-                ColumnDef { name: "v".into(), type_id: TypeId::Int, required: true, position: 0 },
-            ],
+            columns: vec![ColumnDef {
+                name: "v".into(),
+                type_id: TypeId::Int,
+                required: true,
+                position: 0,
+            }],
         };
         cat.create_table(schema).unwrap();
         let rid = cat.insert("t", &vec![Value::Int(1)]).unwrap();
@@ -1364,12 +1517,25 @@ mod tests {
             cat.create_table(Schema {
                 table_name: "users".into(),
                 columns: vec![
-                    ColumnDef { name: "name".into(), type_id: TypeId::Str, required: true, position: 0 },
-                    ColumnDef { name: "age".into(), type_id: TypeId::Int, required: false, position: 1 },
+                    ColumnDef {
+                        name: "name".into(),
+                        type_id: TypeId::Str,
+                        required: true,
+                        position: 0,
+                    },
+                    ColumnDef {
+                        name: "age".into(),
+                        type_id: TypeId::Int,
+                        required: false,
+                        position: 1,
+                    },
                 ],
-            }).unwrap();
-            cat.insert("users", &vec![Value::Str("Alice".into()), Value::Int(30)]).unwrap();
-            cat.insert("users", &vec![Value::Str("Bob".into()), Value::Int(25)]).unwrap();
+            })
+            .unwrap();
+            cat.insert("users", &vec![Value::Str("Alice".into()), Value::Int(30)])
+                .unwrap();
+            cat.insert("users", &vec![Value::Str("Bob".into()), Value::Int(25)])
+                .unwrap();
         }
 
         // Reopen — schema and rows should both still be there
@@ -1401,12 +1567,24 @@ mod tests {
         let mut cat = temp_catalog("list");
         cat.create_table(Schema {
             table_name: "a".into(),
-            columns: vec![ColumnDef { name: "x".into(), type_id: TypeId::Int, required: true, position: 0 }],
-        }).unwrap();
+            columns: vec![ColumnDef {
+                name: "x".into(),
+                type_id: TypeId::Int,
+                required: true,
+                position: 0,
+            }],
+        })
+        .unwrap();
         cat.create_table(Schema {
             table_name: "b".into(),
-            columns: vec![ColumnDef { name: "y".into(), type_id: TypeId::Int, required: true, position: 0 }],
-        }).unwrap();
+            columns: vec![ColumnDef {
+                name: "y".into(),
+                type_id: TypeId::Int,
+                required: true,
+                position: 0,
+            }],
+        })
+        .unwrap();
         let mut tables = cat.list_tables();
         tables.sort();
         assert_eq!(tables, vec!["a", "b"]);

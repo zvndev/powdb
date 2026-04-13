@@ -1,10 +1,10 @@
-pub mod token;
-pub mod lexer;
 pub mod ast;
+pub mod canonicalize;
+pub mod executor;
+pub mod lexer;
 pub mod parser;
 pub mod plan;
+pub mod plan_cache;
 pub mod planner;
 pub mod result;
-pub mod canonicalize;
-pub mod plan_cache;
-pub mod executor;
+pub mod token;

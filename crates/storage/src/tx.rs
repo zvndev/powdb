@@ -50,7 +50,11 @@ impl TxManager {
         let snapshot_id = id;
         let active_at_start = self.active_txs.clone();
         self.active_txs.insert(id);
-        Transaction { id, active_at_start, snapshot_id }
+        Transaction {
+            id,
+            active_at_start,
+            snapshot_id,
+        }
     }
 
     pub fn commit(&mut self, tx_id: u64) {

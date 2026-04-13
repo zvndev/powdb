@@ -10,7 +10,7 @@ fn encode_connect(db: &str) -> Vec<u8> {
     payload.extend_from_slice(&0u32.to_le_bytes());
     let mut frame = Vec::new();
     frame.push(0x01); // CONNECT
-    frame.push(0);    // flags
+    frame.push(0); // flags
     frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     frame.extend_from_slice(&payload);
     frame
@@ -56,7 +56,8 @@ async fn test_full_lifecycle() {
 
     // Start server in background
     let handle = tokio::spawn(async move {
-        let engine = powdb_query::executor::Engine::new(std::path::Path::new(&data_dir_str)).unwrap();
+        let engine =
+            powdb_query::executor::Engine::new(std::path::Path::new(&data_dir_str)).unwrap();
         let engine = std::sync::Arc::new(std::sync::RwLock::new(engine));
         let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
 
@@ -66,10 +67,14 @@ async fn test_full_lifecycle() {
             let (_, mut rx) = tokio::sync::watch::channel(false);
             tokio::spawn(async move {
                 powdb_server::handler::handle_connection(
-                    stream, eng, None, &mut rx,
+                    stream,
+                    eng,
+                    None,
+                    &mut rx,
                     Duration::from_secs(300),
                     Duration::from_secs(30),
-                ).await;
+                )
+                .await;
             });
         }
     });
@@ -84,17 +89,28 @@ async fn test_full_lifecycle() {
     assert_eq!(resp[0], 0x02, "expected CONNECT_OK");
 
     // Create table
-    stream.write_all(&encode_query("type User { required name: str, age: int }")).await.unwrap();
+    stream
+        .write_all(&encode_query("type User { required name: str, age: int }"))
+        .await
+        .unwrap();
     let resp = read_response(&mut stream).await;
     assert_eq!(resp[0], 0x09, "expected RESULT_OK for create type");
 
     // Insert row
-    stream.write_all(&encode_query(r#"insert User { name := "Alice", age := 30 }"#)).await.unwrap();
+    stream
+        .write_all(&encode_query(
+            r#"insert User { name := "Alice", age := 30 }"#,
+        ))
+        .await
+        .unwrap();
     let resp = read_response(&mut stream).await;
     assert_eq!(resp[0], 0x09, "expected RESULT_OK for insert");
 
     // Insert another row
-    stream.write_all(&encode_query(r#"insert User { name := "Bob", age := 25 }"#)).await.unwrap();
+    stream
+        .write_all(&encode_query(r#"insert User { name := "Bob", age := 25 }"#))
+        .await
+        .unwrap();
     let resp = read_response(&mut stream).await;
     assert_eq!(resp[0], 0x09, "expected RESULT_OK for second insert");
 
@@ -104,12 +120,18 @@ async fn test_full_lifecycle() {
     assert_eq!(resp[0], 0x07, "expected RESULT_ROWS");
 
     // Count
-    stream.write_all(&encode_query("count(User)")).await.unwrap();
+    stream
+        .write_all(&encode_query("count(User)"))
+        .await
+        .unwrap();
     let resp = read_response(&mut stream).await;
     assert_eq!(resp[0], 0x08, "expected RESULT_SCALAR for count");
 
     // Filter query
-    stream.write_all(&encode_query("User filter .age > 27")).await.unwrap();
+    stream
+        .write_all(&encode_query("User filter .age > 27"))
+        .await
+        .unwrap();
     let resp = read_response(&mut stream).await;
     assert_eq!(resp[0], 0x07, "expected RESULT_ROWS for filter");
 

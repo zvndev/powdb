@@ -3,7 +3,7 @@ use powdb_server::handler;
 use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tokio::sync::{watch, Semaphore};
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// Maximum number of concurrent connections.
@@ -25,8 +25,11 @@ fn parse_args() -> Args {
         .and_then(|s| s.parse().ok())
         .unwrap_or(5433);
     let mut bind: String = std::env::var("POWDB_BIND").unwrap_or_else(|_| "127.0.0.1".into());
-    let mut data_dir: String = std::env::var("POWDB_DATA").unwrap_or_else(|_| "./powdb_data".into());
-    let mut password: Option<String> = std::env::var("POWDB_PASSWORD").ok().filter(|s| !s.is_empty());
+    let mut data_dir: String =
+        std::env::var("POWDB_DATA").unwrap_or_else(|_| "./powdb_data".into());
+    let mut password: Option<String> = std::env::var("POWDB_PASSWORD")
+        .ok()
+        .filter(|s| !s.is_empty());
     let mut idle_timeout_secs: u64 = std::env::var("POWDB_IDLE_TIMEOUT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -42,33 +45,60 @@ fn parse_args() -> Args {
         match argv[i].as_str() {
             "--port" | "-p" => {
                 i += 1;
-                if i >= argv.len() { eprintln!("--port requires a value"); std::process::exit(2); }
-                port = argv[i].parse().unwrap_or_else(|_| { eprintln!("invalid port: {}", argv[i]); std::process::exit(2); });
+                if i >= argv.len() {
+                    eprintln!("--port requires a value");
+                    std::process::exit(2);
+                }
+                port = argv[i].parse().unwrap_or_else(|_| {
+                    eprintln!("invalid port: {}", argv[i]);
+                    std::process::exit(2);
+                });
             }
             "--data-dir" | "-d" => {
                 i += 1;
-                if i >= argv.len() { eprintln!("--data-dir requires a value"); std::process::exit(2); }
+                if i >= argv.len() {
+                    eprintln!("--data-dir requires a value");
+                    std::process::exit(2);
+                }
                 data_dir = argv[i].clone();
             }
             "--bind" | "-b" => {
                 i += 1;
-                if i >= argv.len() { eprintln!("--bind requires a value"); std::process::exit(2); }
+                if i >= argv.len() {
+                    eprintln!("--bind requires a value");
+                    std::process::exit(2);
+                }
                 bind = argv[i].clone();
             }
             "--password" => {
                 i += 1;
-                if i >= argv.len() { eprintln!("--password requires a value"); std::process::exit(2); }
+                if i >= argv.len() {
+                    eprintln!("--password requires a value");
+                    std::process::exit(2);
+                }
                 password = Some(argv[i].clone());
             }
             "--idle-timeout" => {
                 i += 1;
-                if i >= argv.len() { eprintln!("--idle-timeout requires a value"); std::process::exit(2); }
-                idle_timeout_secs = argv[i].parse().unwrap_or_else(|_| { eprintln!("invalid timeout: {}", argv[i]); std::process::exit(2); });
+                if i >= argv.len() {
+                    eprintln!("--idle-timeout requires a value");
+                    std::process::exit(2);
+                }
+                idle_timeout_secs = argv[i].parse().unwrap_or_else(|_| {
+                    eprintln!("invalid timeout: {}", argv[i]);
+                    std::process::exit(2);
+                });
             }
             "--query-timeout" => {
                 i += 1;
-                if i >= argv.len() { eprintln!("--query-timeout requires a value"); std::process::exit(2); }
-                query_timeout_secs = argv[i].parse().unwrap_or_else(|_| { eprintln!("invalid timeout: {}", argv[i]); std::process::exit(2); });
+                if i >= argv.len() {
+                    eprintln!("--query-timeout requires a value");
+                    std::process::exit(2);
+                }
+                query_timeout_secs = argv[i].parse().unwrap_or_else(|_| {
+                    eprintln!("invalid timeout: {}", argv[i]);
+                    std::process::exit(2);
+                });
             }
             "--help" | "-h" => {
                 println!("powdb-server — PowDB wire-protocol server");
@@ -82,7 +112,9 @@ fn parse_args() -> Args {
                 println!("    -d, --data-dir <PATH>      Data directory (default: ./powdb_data)");
                 println!("        --password <PW>        Require this password on CONNECT");
                 println!("        --idle-timeout <SECS>  Idle connection timeout (default: 300)");
-                println!("        --query-timeout <SECS> Per-query execution timeout (default: 30)");
+                println!(
+                    "        --query-timeout <SECS> Per-query execution timeout (default: 30)"
+                );
                 println!("    -h, --help                 Print this message");
                 println!();
                 println!("ENVIRONMENT:");
@@ -100,14 +132,23 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    Args { port, bind, data_dir, password, idle_timeout_secs, query_timeout_secs }
+    Args {
+        port,
+        bind,
+        data_dir,
+        password,
+        idle_timeout_secs,
+        query_timeout_secs,
+    }
 }
 
 #[tokio::main]
 async fn main() {
     // Initialize tracing. RUST_LOG overrides; default is info.
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_target(false)
         .init();
 
@@ -184,8 +225,10 @@ async fn main() {
     // Wait for all in-flight connections to finish. The semaphore starts
     // at MAX_CONNECTIONS; each active connection holds one permit. When
     // all connections have closed, we can acquire all permits back.
-    info!("waiting for {} active connection(s) to drain",
-        MAX_CONNECTIONS - semaphore.available_permits());
+    info!(
+        "waiting for {} active connection(s) to drain",
+        MAX_CONNECTIONS - semaphore.available_permits()
+    );
     let _ = semaphore.acquire_many(MAX_CONNECTIONS as u32).await;
     info!("all connections drained, shutting down");
 

@@ -24,7 +24,9 @@ impl Default for UndoLog {
 
 impl UndoLog {
     pub fn new() -> Self {
-        UndoLog { entries: Vec::new() }
+        UndoLog {
+            entries: Vec::new(),
+        }
     }
 
     pub fn push(&mut self, tx_id: u64, data: &[u8]) -> UndoPtr {

@@ -75,11 +75,7 @@ impl PlanCache {
     ///
     /// The substitution is done on a **clone** of the cached plan, not the
     /// stored copy. The cached plan stays pristine for the next call.
-    pub fn get_with_substitution(
-        &mut self,
-        hash: u64,
-        literals: &[Literal],
-    ) -> Option<PlanNode> {
+    pub fn get_with_substitution(&mut self, hash: u64, literals: &[Literal]) -> Option<PlanNode> {
         match self.cache.get(&hash) {
             Some(template) => {
                 self.hits += 1;
@@ -87,7 +83,8 @@ impl PlanCache {
                 let mut idx = 0usize;
                 substitute_plan(&mut plan, literals, &mut idx);
                 debug_assert_eq!(
-                    idx, literals.len(),
+                    idx,
+                    literals.len(),
                     "plan substitution consumed {idx} literals but query had {}",
                     literals.len(),
                 );
@@ -164,7 +161,11 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
             // to descend into Offset's own input (which holds the filter
             // literals), then visit Limit.count, then Offset.count, so
             // the literal stream stays in source order.
-            if let PlanNode::Offset { input: inner, count: off_count } = input.as_mut() {
+            if let PlanNode::Offset {
+                input: inner,
+                count: off_count,
+            } = input.as_mut()
+            {
                 substitute_plan(inner, literals, idx);
                 substitute_expr(count, literals, idx);
                 substitute_expr(off_count, literals, idx);
@@ -182,7 +183,9 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
         PlanNode::Aggregate { input, .. } => {
             substitute_plan(input, literals, idx);
         }
-        PlanNode::NestedLoopJoin { left, right, on, .. } => {
+        PlanNode::NestedLoopJoin {
+            left, right, on, ..
+        } => {
             // Walk order: left subtree → right subtree → on predicate.
             // Matches canonicalise's source-order literal collection for
             // joined queries: left source tokens come first, then right
@@ -205,11 +208,17 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
         PlanNode::Insert { assignments, .. } => {
             substitute_assignments(assignments, literals, idx);
         }
-        PlanNode::Upsert { assignments, on_conflict, .. } => {
+        PlanNode::Upsert {
+            assignments,
+            on_conflict,
+            ..
+        } => {
             substitute_assignments(assignments, literals, idx);
             substitute_assignments(on_conflict, literals, idx);
         }
-        PlanNode::Update { input, assignments, .. } => {
+        PlanNode::Update {
+            input, assignments, ..
+        } => {
             substitute_plan(input, literals, idx);
             substitute_assignments(assignments, literals, idx);
         }
@@ -238,11 +247,7 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
     }
 }
 
-fn substitute_assignments(
-    assignments: &mut [Assignment],
-    literals: &[Literal],
-    idx: &mut usize,
-) {
+fn substitute_assignments(assignments: &mut [Assignment], literals: &[Literal], idx: &mut usize) {
     for a in assignments {
         substitute_expr(&mut a.value, literals, idx);
     }
@@ -288,7 +293,11 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
             // into the offset's child first, then counts Limit.count,
             // then Offset.count. Source order is
             // [..., limit literal, offset literal].
-            if let PlanNode::Offset { input: inner, count: off_count } = input.as_ref() {
+            if let PlanNode::Offset {
+                input: inner,
+                count: off_count,
+            } = input.as_ref()
+            {
                 count_plan(inner, n);
                 count_expr(count, n);
                 count_expr(off_count, n);
@@ -302,7 +311,9 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
             count_expr(count, n);
         }
         PlanNode::Aggregate { input, .. } => count_plan(input, n),
-        PlanNode::NestedLoopJoin { left, right, on, .. } => {
+        PlanNode::NestedLoopJoin {
+            left, right, on, ..
+        } => {
             count_plan(left, n);
             count_plan(right, n);
             if let Some(pred) = on {
@@ -321,7 +332,11 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
                 count_expr(&a.value, n);
             }
         }
-        PlanNode::Upsert { assignments, on_conflict, .. } => {
+        PlanNode::Upsert {
+            assignments,
+            on_conflict,
+            ..
+        } => {
             for a in assignments {
                 count_expr(&a.value, n);
             }
@@ -329,7 +344,9 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
                 count_expr(&a.value, n);
             }
         }
-        PlanNode::Update { input, assignments, .. } => {
+        PlanNode::Update {
+            input, assignments, ..
+        } => {
             count_plan(input, n);
             for a in assignments {
                 count_expr(&a.value, n);
@@ -533,10 +550,10 @@ mod tests {
         // Walk the plan and pull out every literal — should be [50, "pending"].
         let mut found = Vec::new();
         collect_literals_for_test(&plan, &mut found);
-        assert_eq!(found, vec![
-            Literal::Int(50),
-            Literal::String("pending".into()),
-        ]);
+        assert_eq!(
+            found,
+            vec![Literal::Int(50), Literal::String("pending".into()),]
+        );
     }
 
     #[test]
@@ -568,11 +585,14 @@ mod tests {
 
         let mut found = Vec::new();
         collect_literals_for_test(&plan, &mut found);
-        assert_eq!(found, vec![
-            Literal::Int(2),
-            Literal::String("Bob".into()),
-            Literal::Int(30),
-        ]);
+        assert_eq!(
+            found,
+            vec![
+                Literal::Int(2),
+                Literal::String("Bob".into()),
+                Literal::Int(30),
+            ]
+        );
     }
 
     #[test]
@@ -632,7 +652,9 @@ mod tests {
                 collect_expr_literals(count, out);
             }
             PlanNode::Aggregate { input, .. } => collect_literals_for_test(input, out),
-            PlanNode::NestedLoopJoin { left, right, on, .. } => {
+            PlanNode::NestedLoopJoin {
+                left, right, on, ..
+            } => {
                 collect_literals_for_test(left, out);
                 collect_literals_for_test(right, out);
                 if let Some(pred) = on {
@@ -644,7 +666,11 @@ mod tests {
                     collect_expr_literals(&a.value, out);
                 }
             }
-            PlanNode::Upsert { assignments, on_conflict, .. } => {
+            PlanNode::Upsert {
+                assignments,
+                on_conflict,
+                ..
+            } => {
                 for a in assignments {
                     collect_expr_literals(&a.value, out);
                 }
@@ -652,7 +678,9 @@ mod tests {
                     collect_expr_literals(&a.value, out);
                 }
             }
-            PlanNode::Update { input, assignments, .. } => {
+            PlanNode::Update {
+                input, assignments, ..
+            } => {
                 collect_literals_for_test(input, out);
                 for a in assignments {
                     collect_expr_literals(&a.value, out);

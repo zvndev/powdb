@@ -51,9 +51,7 @@ fn setup_user_table(n: usize) -> (Engine, TempDir) {
             ];
             table.insert(&row).expect("insert row");
         }
-        table
-            .create_index("id", &data_dir)
-            .expect("build id index");
+        table.create_index("id", &data_dir).expect("build id index");
     }
 
     (engine, tmp)

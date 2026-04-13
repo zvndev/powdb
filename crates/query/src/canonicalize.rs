@@ -115,8 +115,14 @@ fn normalize_limit_offset_order(mut tokens: Vec<Token>) -> Vec<Token> {
         let mut i = start;
         while i < tokens.len() {
             match &tokens[i] {
-                Token::Limit | Token::Offset | Token::Filter | Token::Order
-                | Token::Group | Token::LBrace | Token::Update | Token::Delete
+                Token::Limit
+                | Token::Offset
+                | Token::Filter
+                | Token::Order
+                | Token::Group
+                | Token::LBrace
+                | Token::Update
+                | Token::Delete
                 | Token::Eof => return i,
                 _ => i += 1,
             }
@@ -185,112 +191,112 @@ fn hash_token(h: u64, tok: &Token, literals: &mut Vec<Literal>) -> u64 {
         }
 
         // Keywords. Each gets a unique tag in the 0x10..0x4F range.
-        Token::Type         => hash_byte(h, 0x10),
-        Token::Filter       => hash_byte(h, 0x11),
-        Token::Order        => hash_byte(h, 0x12),
-        Token::Limit        => hash_byte(h, 0x13),
-        Token::Offset       => hash_byte(h, 0x14),
-        Token::Insert       => hash_byte(h, 0x15),
-        Token::Update       => hash_byte(h, 0x16),
-        Token::Delete       => hash_byte(h, 0x17),
-        Token::Upsert       => hash_byte(h, 0x18),
-        Token::Select       => hash_byte(h, 0x19),
-        Token::Required     => hash_byte(h, 0x1A),
-        Token::Multi        => hash_byte(h, 0x1B),
-        Token::Link         => hash_byte(h, 0x1C),
-        Token::Index        => hash_byte(h, 0x1D),
-        Token::On           => hash_byte(h, 0x1E),
-        Token::Asc          => hash_byte(h, 0x1F),
-        Token::Desc         => hash_byte(h, 0x20),
-        Token::And          => hash_byte(h, 0x21),
-        Token::Or           => hash_byte(h, 0x22),
-        Token::Not          => hash_byte(h, 0x23),
-        Token::Exists       => hash_byte(h, 0x24),
-        Token::Let          => hash_byte(h, 0x25),
-        Token::As           => hash_byte(h, 0x26),
-        Token::Match        => hash_byte(h, 0x27),
-        Token::Group        => hash_byte(h, 0x28),
-        Token::Transaction  => hash_byte(h, 0x29),
-        Token::View         => hash_byte(h, 0x2A),
+        Token::Type => hash_byte(h, 0x10),
+        Token::Filter => hash_byte(h, 0x11),
+        Token::Order => hash_byte(h, 0x12),
+        Token::Limit => hash_byte(h, 0x13),
+        Token::Offset => hash_byte(h, 0x14),
+        Token::Insert => hash_byte(h, 0x15),
+        Token::Update => hash_byte(h, 0x16),
+        Token::Delete => hash_byte(h, 0x17),
+        Token::Upsert => hash_byte(h, 0x18),
+        Token::Select => hash_byte(h, 0x19),
+        Token::Required => hash_byte(h, 0x1A),
+        Token::Multi => hash_byte(h, 0x1B),
+        Token::Link => hash_byte(h, 0x1C),
+        Token::Index => hash_byte(h, 0x1D),
+        Token::On => hash_byte(h, 0x1E),
+        Token::Asc => hash_byte(h, 0x1F),
+        Token::Desc => hash_byte(h, 0x20),
+        Token::And => hash_byte(h, 0x21),
+        Token::Or => hash_byte(h, 0x22),
+        Token::Not => hash_byte(h, 0x23),
+        Token::Exists => hash_byte(h, 0x24),
+        Token::Let => hash_byte(h, 0x25),
+        Token::As => hash_byte(h, 0x26),
+        Token::Match => hash_byte(h, 0x27),
+        Token::Group => hash_byte(h, 0x28),
+        Token::Transaction => hash_byte(h, 0x29),
+        Token::View => hash_byte(h, 0x2A),
         Token::Materialized => hash_byte(h, 0x2B),
-        Token::Count        => hash_byte(h, 0x2C),
-        Token::Avg          => hash_byte(h, 0x2D),
-        Token::Sum          => hash_byte(h, 0x2E),
-        Token::Min          => hash_byte(h, 0x2F),
-        Token::Max          => hash_byte(h, 0x30),
-        Token::Join         => hash_byte(h, 0x31),
-        Token::Inner        => hash_byte(h, 0x32),
-        Token::LeftKw       => hash_byte(h, 0x33),
-        Token::RightKw      => hash_byte(h, 0x34),
-        Token::Outer        => hash_byte(h, 0x35),
-        Token::Cross        => hash_byte(h, 0x36),
-        Token::Distinct     => hash_byte(h, 0x37),
-        Token::In           => hash_byte(h, 0x38),
-        Token::Between      => hash_byte(h, 0x39),
-        Token::Like         => hash_byte(h, 0x3A),
-        Token::Having       => hash_byte(h, 0x3B),
-        Token::Is           => hash_byte(h, 0x3C),
-        Token::Null         => hash_byte(h, 0x3D),
-        Token::Upper        => hash_byte(h, 0x50),
-        Token::Lower        => hash_byte(h, 0x51),
-        Token::Length       => hash_byte(h, 0x52),
-        Token::Trim         => hash_byte(h, 0x53),
-        Token::Substring    => hash_byte(h, 0x54),
-        Token::Concat       => hash_byte(h, 0x55),
-        Token::Case         => hash_byte(h, 0x56),
-        Token::When         => hash_byte(h, 0x57),
-        Token::Then         => hash_byte(h, 0x58),
-        Token::Else         => hash_byte(h, 0x59),
-        Token::End          => hash_byte(h, 0x5A),
-        Token::Alter        => hash_byte(h, 0x5B),
-        Token::Drop         => hash_byte(h, 0x5C),
-        Token::Add          => hash_byte(h, 0x5D),
-        Token::Column       => hash_byte(h, 0x5E),
-        Token::Refresh      => hash_byte(h, 0x5F),
-        Token::Union        => hash_byte(h, 0x67),
-        Token::Over         => hash_byte(h, 0x68),
-        Token::Partition    => hash_byte(h, 0x69),
-        Token::RowNumber    => hash_byte(h, 0x6A),
-        Token::Rank         => hash_byte(h, 0x6B),
-        Token::DenseRank    => hash_byte(h, 0x6C),
-        Token::Explain      => hash_byte(h, 0x6D),
-        Token::Conflict     => hash_byte(h, 0x6E),
-        Token::Abs          => hash_byte(h, 0x70),
-        Token::Round        => hash_byte(h, 0x71),
-        Token::Ceil         => hash_byte(h, 0x72),
-        Token::Floor        => hash_byte(h, 0x73),
-        Token::Sqrt         => hash_byte(h, 0x74),
-        Token::Pow          => hash_byte(h, 0x75),
-        Token::Now          => hash_byte(h, 0x76),
-        Token::Extract      => hash_byte(h, 0x77),
-        Token::DateAdd      => hash_byte(h, 0x78),
-        Token::DateDiff     => hash_byte(h, 0x79),
-        Token::Cast         => hash_byte(h, 0x7A),
+        Token::Count => hash_byte(h, 0x2C),
+        Token::Avg => hash_byte(h, 0x2D),
+        Token::Sum => hash_byte(h, 0x2E),
+        Token::Min => hash_byte(h, 0x2F),
+        Token::Max => hash_byte(h, 0x30),
+        Token::Join => hash_byte(h, 0x31),
+        Token::Inner => hash_byte(h, 0x32),
+        Token::LeftKw => hash_byte(h, 0x33),
+        Token::RightKw => hash_byte(h, 0x34),
+        Token::Outer => hash_byte(h, 0x35),
+        Token::Cross => hash_byte(h, 0x36),
+        Token::Distinct => hash_byte(h, 0x37),
+        Token::In => hash_byte(h, 0x38),
+        Token::Between => hash_byte(h, 0x39),
+        Token::Like => hash_byte(h, 0x3A),
+        Token::Having => hash_byte(h, 0x3B),
+        Token::Is => hash_byte(h, 0x3C),
+        Token::Null => hash_byte(h, 0x3D),
+        Token::Upper => hash_byte(h, 0x50),
+        Token::Lower => hash_byte(h, 0x51),
+        Token::Length => hash_byte(h, 0x52),
+        Token::Trim => hash_byte(h, 0x53),
+        Token::Substring => hash_byte(h, 0x54),
+        Token::Concat => hash_byte(h, 0x55),
+        Token::Case => hash_byte(h, 0x56),
+        Token::When => hash_byte(h, 0x57),
+        Token::Then => hash_byte(h, 0x58),
+        Token::Else => hash_byte(h, 0x59),
+        Token::End => hash_byte(h, 0x5A),
+        Token::Alter => hash_byte(h, 0x5B),
+        Token::Drop => hash_byte(h, 0x5C),
+        Token::Add => hash_byte(h, 0x5D),
+        Token::Column => hash_byte(h, 0x5E),
+        Token::Refresh => hash_byte(h, 0x5F),
+        Token::Union => hash_byte(h, 0x67),
+        Token::Over => hash_byte(h, 0x68),
+        Token::Partition => hash_byte(h, 0x69),
+        Token::RowNumber => hash_byte(h, 0x6A),
+        Token::Rank => hash_byte(h, 0x6B),
+        Token::DenseRank => hash_byte(h, 0x6C),
+        Token::Explain => hash_byte(h, 0x6D),
+        Token::Conflict => hash_byte(h, 0x6E),
+        Token::Abs => hash_byte(h, 0x70),
+        Token::Round => hash_byte(h, 0x71),
+        Token::Ceil => hash_byte(h, 0x72),
+        Token::Floor => hash_byte(h, 0x73),
+        Token::Sqrt => hash_byte(h, 0x74),
+        Token::Pow => hash_byte(h, 0x75),
+        Token::Now => hash_byte(h, 0x76),
+        Token::Extract => hash_byte(h, 0x77),
+        Token::DateAdd => hash_byte(h, 0x78),
+        Token::DateDiff => hash_byte(h, 0x79),
+        Token::Cast => hash_byte(h, 0x7A),
 
         // Operators.
-        Token::Eq       => hash_byte(h, 0x40),
-        Token::Neq      => hash_byte(h, 0x41),
-        Token::Lt       => hash_byte(h, 0x42),
-        Token::Gt       => hash_byte(h, 0x43),
-        Token::Lte      => hash_byte(h, 0x44),
-        Token::Gte      => hash_byte(h, 0x45),
-        Token::Assign   => hash_byte(h, 0x46),
-        Token::Arrow    => hash_byte(h, 0x47),
-        Token::Pipe     => hash_byte(h, 0x48),
+        Token::Eq => hash_byte(h, 0x40),
+        Token::Neq => hash_byte(h, 0x41),
+        Token::Lt => hash_byte(h, 0x42),
+        Token::Gt => hash_byte(h, 0x43),
+        Token::Lte => hash_byte(h, 0x44),
+        Token::Gte => hash_byte(h, 0x45),
+        Token::Assign => hash_byte(h, 0x46),
+        Token::Arrow => hash_byte(h, 0x47),
+        Token::Pipe => hash_byte(h, 0x48),
         Token::Coalesce => hash_byte(h, 0x49),
-        Token::Plus     => hash_byte(h, 0x4A),
-        Token::Minus    => hash_byte(h, 0x4B),
-        Token::Star     => hash_byte(h, 0x4C),
-        Token::Slash    => hash_byte(h, 0x4D),
+        Token::Plus => hash_byte(h, 0x4A),
+        Token::Minus => hash_byte(h, 0x4B),
+        Token::Star => hash_byte(h, 0x4C),
+        Token::Slash => hash_byte(h, 0x4D),
 
         // Delimiters.
         Token::LBrace => hash_byte(h, 0x60),
         Token::RBrace => hash_byte(h, 0x61),
         Token::LParen => hash_byte(h, 0x62),
         Token::RParen => hash_byte(h, 0x63),
-        Token::Comma  => hash_byte(h, 0x64),
-        Token::Colon  => hash_byte(h, 0x65),
-        Token::Dot    => hash_byte(h, 0x66),
+        Token::Comma => hash_byte(h, 0x64),
+        Token::Colon => hash_byte(h, 0x65),
+        Token::Dot => hash_byte(h, 0x66),
 
         Token::Eof => hash_byte(h, 0x7F),
     }
@@ -359,32 +365,31 @@ mod tests {
 
     #[test]
     fn test_multi_literal_collected_in_source_order() {
-        let (_, lits) = canonicalize(
-            r#"User filter .age > 30 and .status = "active" { .name }"#,
-        ).unwrap();
-        assert_eq!(lits, vec![
-            Literal::Int(30),
-            Literal::String("active".into()),
-        ]);
+        let (_, lits) =
+            canonicalize(r#"User filter .age > 30 and .status = "active" { .name }"#).unwrap();
+        assert_eq!(
+            lits,
+            vec![Literal::Int(30), Literal::String("active".into()),]
+        );
     }
 
     #[test]
     fn test_insert_literals_in_assignment_order() {
-        let (_, lits) = canonicalize(
-            r#"insert User { id := 42, name := "Alice", age := 30 }"#,
-        ).unwrap();
-        assert_eq!(lits, vec![
-            Literal::Int(42),
-            Literal::String("Alice".into()),
-            Literal::Int(30),
-        ]);
+        let (_, lits) =
+            canonicalize(r#"insert User { id := 42, name := "Alice", age := 30 }"#).unwrap();
+        assert_eq!(
+            lits,
+            vec![
+                Literal::Int(42),
+                Literal::String("Alice".into()),
+                Literal::Int(30),
+            ]
+        );
     }
 
     #[test]
     fn test_update_by_pk_literals_in_source_order() {
-        let (_, lits) = canonicalize(
-            "User filter .id = 42 update { age := 31 }",
-        ).unwrap();
+        let (_, lits) = canonicalize("User filter .id = 42 update { age := 31 }").unwrap();
         assert_eq!(lits, vec![Literal::Int(42), Literal::Int(31)]);
     }
 }

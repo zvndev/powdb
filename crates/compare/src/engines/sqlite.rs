@@ -112,9 +112,7 @@ impl BenchEngine for SqliteEngine {
     fn scan_filter_project_top100(&self, age_threshold: i64) -> Vec<(String, String)> {
         let mut stmt = self
             .conn
-            .prepare_cached(
-                "SELECT name, email FROM user_table WHERE age > ?1 LIMIT 100",
-            )
+            .prepare_cached("SELECT name, email FROM user_table WHERE age > ?1 LIMIT 100")
             .expect("prepare scan_filter_project_top100");
         let rows = stmt
             .query_map(params![age_threshold], |row| {
@@ -179,9 +177,7 @@ impl BenchEngine for SqliteEngine {
     fn multi_col_and_filter(&self, age_threshold: i64, status: &str) -> Vec<(String, i64)> {
         let mut stmt = self
             .conn
-            .prepare_cached(
-                "SELECT name, age FROM user_table WHERE age > ?1 AND status = ?2",
-            )
+            .prepare_cached("SELECT name, age FROM user_table WHERE age > ?1 AND status = ?2")
             .expect("prepare multi_col_and_filter");
         let rows = stmt
             .query_map(params![age_threshold, status], |row| {
@@ -266,10 +262,7 @@ mod tests {
         let mut engine = SqliteEngine::new();
         engine.setup(1_000);
 
-        assert_eq!(
-            engine.point_lookup_indexed(42),
-            Some("user_42".to_string())
-        );
+        assert_eq!(engine.point_lookup_indexed(42), Some("user_42".to_string()));
         assert_eq!(engine.point_lookup_indexed(9999), None);
 
         // Rows with age > 30: (i % 60) > 12, so 47 out of every 60.

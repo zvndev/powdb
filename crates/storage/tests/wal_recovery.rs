@@ -161,7 +161,10 @@ fn test_crash_recovery_deletes_idempotent() {
         let mut all = Vec::new();
         for i in 0..20i64 {
             let rid = cat
-                .insert("users", &vec![Value::Int(i), Value::Str(format!("row_{i}"))])
+                .insert(
+                    "users",
+                    &vec![Value::Int(i), Value::Str(format!("row_{i}"))],
+                )
                 .unwrap();
             all.push(rid);
         }
