@@ -109,14 +109,14 @@ fn threshold_for(workload: &str) -> f64 {
         // GHA-variance-dominated workloads: back-to-back same-commit PR #9
         // runs showed scan_filter_sort_limit10 +11.9%, update_by_pk +86%,
         // delete_by_filter +17.7% — all with zero code change. Promoted
-        // from NOISY (10%) to VERY_NOISY (20%).
-        "scan_filter_sort_limit10" | "update_by_pk" | "delete_by_filter" => {
-            VERY_NOISY_ABSOLUTE_THRESHOLD
-        }
+        // from NOISY (10%) to VERY_NOISY (20%). update_by_filter promoted
+        // in PR #14 after +13.9% variance on identical code.
+        "scan_filter_sort_limit10" | "update_by_pk" | "delete_by_filter"
+        | "update_by_filter" => VERY_NOISY_ABSOLUTE_THRESHOLD,
 
         // Bulk writes: fixture growth, WAL sync, btree splits — naturally
         // more variance than point reads, but not as extreme as the above.
-        "insert_single" | "insert_batch_1k" | "update_by_filter" => NOISY_ABSOLUTE_THRESHOLD,
+        "insert_single" | "insert_batch_1k" => NOISY_ABSOLUTE_THRESHOLD,
         _ => DEFAULT_ABSOLUTE_THRESHOLD,
     }
 }
