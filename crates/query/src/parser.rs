@@ -7,14 +7,41 @@ use crate::token::Token;
 /// parentheses, subqueries, or CASE expressions.
 const MAX_NESTING_DEPTH: usize = 64;
 
+/// Discriminated parse error — callers can match on category.
 #[derive(Debug)]
-pub struct ParseError {
-    pub message: String,
+pub enum ParseError {
+    /// Lexer failed to tokenize the input.
+    Lex { message: String, position: usize },
+    /// Expected one token but found another.
+    UnexpectedToken { expected: String, got: String },
+    /// Recursive nesting exceeded the safety limit.
+    NestingDepthExceeded { max: usize },
+    /// Syntactically valid construct that the engine doesn't support yet.
+    Unsupported { feature: String },
+    /// Catch-all for other syntax errors.
+    Syntax { message: String },
+}
+
+impl ParseError {
+    /// Convenience: human-readable message for any variant.
+    pub fn message(&self) -> String {
+        self.to_string()
+    }
 }
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
+        match self {
+            Self::Lex { message, position } => write!(f, "at position {position}: {message}"),
+            Self::UnexpectedToken { expected, got } => {
+                write!(f, "expected {expected}, got {got}")
+            }
+            Self::NestingDepthExceeded { max } => {
+                write!(f, "query nesting depth exceeds maximum of {max}")
+            }
+            Self::Unsupported { feature } => write!(f, "{feature}"),
+            Self::Syntax { message } => write!(f, "{message}"),
+        }
     }
 }
 
@@ -49,7 +76,10 @@ struct Parser {
 }
 
 pub fn parse(input: &str) -> Result<Statement, ParseError> {
-    let tokens = lex(input).map_err(|e| ParseError { message: e.message })?;
+    let tokens = lex(input).map_err(|e| ParseError::Lex {
+        message: e.message,
+        position: e.position,
+    })?;
     let mut parser = Parser {
         tokens,
         pos: 0,
@@ -74,9 +104,18 @@ impl Parser {
         if &t == expected {
             Ok(())
         } else {
-            Err(ParseError {
-                message: format!("expected {expected:?}, got {t:?}"),
+            Err(ParseError::UnexpectedToken {
+                expected: format!("{expected:?}"),
+                got: format!("{t:?}"),
             })
+        }
+    }
+
+    /// Convenience: create an UnexpectedToken error.
+    fn unexpected(&self, expected: &str, got: &Token) -> ParseError {
+        ParseError::UnexpectedToken {
+            expected: expected.into(),
+            got: format!("{got:?}"),
         }
     }
 
@@ -84,8 +123,8 @@ impl Parser {
         self.depth += 1;
         if self.depth > MAX_NESTING_DEPTH {
             self.depth -= 1;
-            return Err(ParseError {
-                message: format!("query nesting depth exceeds maximum of {MAX_NESTING_DEPTH}"),
+            return Err(ParseError::NestingDepthExceeded {
+                max: MAX_NESTING_DEPTH,
             });
         }
         if matches!(self.peek(), Token::Explain) {
@@ -106,9 +145,7 @@ impl Parser {
                 self.parse_aggregate_query()
             }
             Token::Ident(_) => self.parse_query_or_mutation(),
-            _ => Err(ParseError {
-                message: format!("unexpected token: {:?}", self.peek()),
-            }),
+            _ => Err(self.unexpected("statement", self.peek())),
         }?;
         // Check for UNION chaining after any query-producing statement.
         let result = self.maybe_parse_union(stmt);
@@ -120,8 +157,9 @@ impl Parser {
         let source = match self.advance() {
             Token::Ident(name) => name,
             t => {
-                return Err(ParseError {
-                    message: format!("expected type name, got {t:?}"),
+                return Err(ParseError::UnexpectedToken {
+                    expected: "type name".into(),
+                    got: format!("{t:?}"),
                 })
             }
         };
@@ -170,8 +208,8 @@ impl Parser {
                 }
                 Token::Update => {
                     if !joins.is_empty() {
-                        return Err(ParseError {
-                            message: "update on a joined query is not supported".into(),
+                        return Err(ParseError::Unsupported {
+                            feature: "update on a joined query is not supported".into(),
                         });
                     }
                     self.advance();
@@ -184,8 +222,8 @@ impl Parser {
                 }
                 Token::Delete => {
                     if !joins.is_empty() {
-                        return Err(ParseError {
-                            message: "delete on a joined query is not supported".into(),
+                        return Err(ParseError::Unsupported {
+                            feature: "delete on a joined query is not supported".into(),
                         });
                     }
                     self.advance();
@@ -334,8 +372,9 @@ impl Parser {
             let source = match self.advance() {
                 Token::Ident(name) => name,
                 t => {
-                    return Err(ParseError {
-                        message: format!("expected type name after join, got {t:?}"),
+                    return Err(ParseError::UnexpectedToken {
+                        expected: "type name after join".into(),
+                        got: format!("{t:?}"),
                     });
                 }
             };
@@ -346,7 +385,7 @@ impl Parser {
                 self.advance();
                 Some(self.parse_expr()?)
             } else {
-                return Err(ParseError {
+                return Err(ParseError::Syntax {
                     message: format!("expected `on <expr>` after join {source}"),
                 });
             };
@@ -366,8 +405,9 @@ impl Parser {
         let target = match self.advance() {
             Token::Ident(name) => name,
             t => {
-                return Err(ParseError {
-                    message: format!("expected type name, got {t:?}"),
+                return Err(ParseError::UnexpectedToken {
+                    expected: "type name".into(),
+                    got: format!("{t:?}"),
                 })
             }
         };
@@ -384,8 +424,9 @@ impl Parser {
         let target = match self.advance() {
             Token::Ident(name) => name,
             t => {
-                return Err(ParseError {
-                    message: format!("expected type name, got {t:?}"),
+                return Err(ParseError::UnexpectedToken {
+                    expected: "type name".into(),
+                    got: format!("{t:?}"),
                 })
             }
         };
@@ -393,8 +434,9 @@ impl Parser {
         let key_column = match self.advance() {
             Token::DotIdent(name) => name,
             t => {
-                return Err(ParseError {
-                    message: format!("expected .key_column, got {t:?}"),
+                return Err(ParseError::UnexpectedToken {
+                    expected: ".key_column".into(),
+                    got: format!("{t:?}"),
                 })
             }
         };
@@ -421,8 +463,9 @@ impl Parser {
             let field = match self.advance() {
                 Token::Ident(name) => name,
                 t => {
-                    return Err(ParseError {
-                        message: format!("expected field name, got {t:?}"),
+                    return Err(ParseError::UnexpectedToken {
+                        expected: "field name".into(),
+                        got: format!("{t:?}"),
                     })
                 }
             };
@@ -448,7 +491,7 @@ impl Parser {
                 let alias = match first {
                     Token::Ident(name) => name,
                     _ => {
-                        return Err(ParseError {
+                        return Err(ParseError::Syntax {
                             message: "expected alias name".into(),
                         })
                     }
@@ -481,7 +524,7 @@ impl Parser {
                             Token::Rank => WindowFunc::Rank,
                             Token::DenseRank => WindowFunc::DenseRank,
                             _ => {
-                                return Err(ParseError {
+                                return Err(ParseError::Syntax {
                                     message: "unexpected window function token".into(),
                                 })
                             }
@@ -504,7 +547,7 @@ impl Parser {
                             Token::Min => AggFunc::Min,
                             Token::Max => AggFunc::Max,
                             _ => {
-                                return Err(ParseError {
+                                return Err(ParseError::Syntax {
                                     message: "unexpected aggregate token".into(),
                                 })
                             }
@@ -546,8 +589,8 @@ impl Parser {
                                         AggFunc::Sum => WindowFunc::Sum,
                                         AggFunc::Min => WindowFunc::Min,
                                         AggFunc::Max => WindowFunc::Max,
-                                        _ => return Err(ParseError {
-                                            message:
+                                        _ => return Err(ParseError::Unsupported {
+                                            feature:
                                                 "count(distinct ...) over (...) is not supported"
                                                     .into(),
                                         }),
@@ -619,8 +662,9 @@ impl Parser {
                         Expr::Case { whens, else_expr }
                     }
                     _ => {
-                        return Err(ParseError {
-                            message: format!("expected field, got {first:?}"),
+                        return Err(ParseError::UnexpectedToken {
+                            expected: "field".into(),
+                            got: format!("{first:?}"),
                         })
                     }
                 };
@@ -698,12 +742,13 @@ impl Parser {
                 "str" | "Str" | "STR" | "string" | "String" => Ok(CastType::Str),
                 "bool" | "Bool" | "BOOL" | "boolean" => Ok(CastType::Bool),
                 "datetime" | "DateTime" | "DATETIME" => Ok(CastType::DateTime),
-                other => Err(ParseError {
+                other => Err(ParseError::Syntax {
                     message: format!("invalid cast type: \"{other}\""),
                 }),
             },
-            t => Err(ParseError {
-                message: format!("expected string literal for cast type, got {t:?}"),
+            t => Err(ParseError::UnexpectedToken {
+                expected: "string literal for cast type".into(),
+                got: format!("{t:?}"),
             }),
         }
     }
@@ -714,8 +759,9 @@ impl Parser {
             let field = match self.advance() {
                 Token::DotIdent(name) => name,
                 t => {
-                    return Err(ParseError {
-                        message: format!("expected .field after order, got {t:?}"),
+                    return Err(ParseError::UnexpectedToken {
+                        expected: ".field after order".into(),
+                        got: format!("{t:?}"),
                     })
                 }
             };
@@ -748,8 +794,9 @@ impl Parser {
             Token::Min => AggFunc::Min,
             Token::Max => AggFunc::Max,
             t => {
-                return Err(ParseError {
-                    message: format!("expected aggregate function, got {t:?}"),
+                return Err(ParseError::UnexpectedToken {
+                    expected: "aggregate function".into(),
+                    got: format!("{t:?}"),
                 })
             }
         };
@@ -762,8 +809,9 @@ impl Parser {
         let source = match self.advance() {
             Token::Ident(name) => name,
             t => {
-                return Err(ParseError {
-                    message: format!("expected type name, got {t:?}"),
+                return Err(ParseError::UnexpectedToken {
+                    expected: "type name".into(),
+                    got: format!("{t:?}"),
                 })
             }
         };
@@ -803,8 +851,8 @@ impl Parser {
         self.depth += 1;
         if self.depth > MAX_NESTING_DEPTH {
             self.depth -= 1;
-            return Err(ParseError {
-                message: format!("query nesting depth exceeds maximum of {MAX_NESTING_DEPTH}"),
+            return Err(ParseError::NestingDepthExceeded {
+                max: MAX_NESTING_DEPTH,
             });
         }
         let result = self.parse_or_expr();
@@ -1026,7 +1074,7 @@ impl Parser {
             }
         }
         if keys.is_empty() {
-            return Err(ParseError {
+            return Err(ParseError::Syntax {
                 message: "expected at least one .field after group".into(),
             });
         }
@@ -1162,7 +1210,7 @@ impl Parser {
                     Token::Rank => WindowFunc::Rank,
                     Token::DenseRank => WindowFunc::DenseRank,
                     _ => {
-                        return Err(ParseError {
+                        return Err(ParseError::Syntax {
                             message: "unexpected window function token".into(),
                         })
                     }
@@ -1188,7 +1236,7 @@ impl Parser {
                     Token::Min => AggFunc::Min,
                     Token::Max => AggFunc::Max,
                     _ => {
-                        return Err(ParseError {
+                        return Err(ParseError::Syntax {
                             message: "unexpected aggregate token".into(),
                         })
                     }
@@ -1229,8 +1277,8 @@ impl Parser {
                         AggFunc::Min => WindowFunc::Min,
                         AggFunc::Max => WindowFunc::Max,
                         _ => {
-                            return Err(ParseError {
-                                message: "count(distinct ...) over (...) is not supported".into(),
+                            return Err(ParseError::Unsupported {
+                                feature: "count(distinct ...) over (...) is not supported".into(),
                             })
                         }
                     };
@@ -1301,7 +1349,7 @@ impl Parser {
                 self.expect(&Token::End)?;
                 Ok(Expr::Case { whens, else_expr })
             }
-            t => Err(ParseError {
+            t => Err(ParseError::Syntax {
                 message: format!("unexpected token in expression: {t:?}"),
             }),
         }
@@ -1314,8 +1362,9 @@ impl Parser {
         let table = match self.advance() {
             Token::Ident(name) => name,
             t => {
-                return Err(ParseError {
-                    message: format!("expected table name after alter, got {t:?}"),
+                return Err(ParseError::UnexpectedToken {
+                    expected: "table name after alter".into(),
+                    got: format!("{t:?}"),
                 })
             }
         };
@@ -1335,8 +1384,9 @@ impl Parser {
                 let name = match self.advance() {
                     Token::Ident(n) => n,
                     t => {
-                        return Err(ParseError {
-                            message: format!("expected column name, got {t:?}"),
+                        return Err(ParseError::UnexpectedToken {
+                            expected: "column name".into(),
+                            got: format!("{t:?}"),
                         })
                     }
                 };
@@ -1344,8 +1394,9 @@ impl Parser {
                 let type_name = match self.advance() {
                     Token::Ident(n) => n,
                     t => {
-                        return Err(ParseError {
-                            message: format!("expected type name, got {t:?}"),
+                        return Err(ParseError::UnexpectedToken {
+                            expected: "type name".into(),
+                            got: format!("{t:?}"),
                         })
                     }
                 };
@@ -1367,8 +1418,9 @@ impl Parser {
                 let name = match self.advance() {
                     Token::Ident(n) => n,
                     t => {
-                        return Err(ParseError {
-                            message: format!("expected column name, got {t:?}"),
+                        return Err(ParseError::UnexpectedToken {
+                            expected: "column name".into(),
+                            got: format!("{t:?}"),
                         })
                     }
                 };
@@ -1377,8 +1429,9 @@ impl Parser {
                     action: AlterAction::DropColumn { name },
                 }))
             }
-            t => Err(ParseError {
-                message: format!("expected add or drop after alter <table>, got {t:?}"),
+            t => Err(ParseError::UnexpectedToken {
+                expected: "add or drop after alter <table>".into(),
+                got: format!("{t:?}"),
             }),
         }
     }
@@ -1391,8 +1444,9 @@ impl Parser {
             let name = match self.advance() {
                 Token::Ident(name) => name,
                 t => {
-                    return Err(ParseError {
-                        message: format!("expected view name after drop view, got {t:?}"),
+                    return Err(ParseError::UnexpectedToken {
+                        expected: "view name after drop view".into(),
+                        got: format!("{t:?}"),
                     })
                 }
             };
@@ -1401,8 +1455,9 @@ impl Parser {
         let table = match self.advance() {
             Token::Ident(name) => name,
             t => {
-                return Err(ParseError {
-                    message: format!("expected table name after drop, got {t:?}"),
+                return Err(ParseError::UnexpectedToken {
+                    expected: "table name after drop".into(),
+                    got: format!("{t:?}"),
                 })
             }
         };
@@ -1418,8 +1473,9 @@ impl Parser {
         let name = match self.advance() {
             Token::Ident(name) => name,
             t => {
-                return Err(ParseError {
-                    message: format!("expected view name after materialize, got {t:?}"),
+                return Err(ParseError::UnexpectedToken {
+                    expected: "view name after materialize".into(),
+                    got: format!("{t:?}"),
                 })
             }
         };
@@ -1429,8 +1485,9 @@ impl Parser {
         let source = match self.advance() {
             Token::Ident(s) => s,
             t => {
-                return Err(ParseError {
-                    message: format!("expected source table name, got {t:?}"),
+                return Err(ParseError::UnexpectedToken {
+                    expected: "source table name".into(),
+                    got: format!("{t:?}"),
                 })
             }
         };
@@ -1451,7 +1508,7 @@ impl Parser {
             return Ok(left);
         }
         if !matches!(left, Statement::Query(_) | Statement::Union(_)) {
-            return Err(ParseError {
+            return Err(ParseError::Syntax {
                 message: "UNION requires a query on the left side".into(),
             });
         }
@@ -1484,7 +1541,7 @@ impl Parser {
                 self.parse_aggregate_query()
             }
             Token::Ident(_) => self.parse_query_or_mutation(),
-            _ => Err(ParseError {
+            _ => Err(ParseError::Syntax {
                 message: format!("expected query after UNION, got {:?}", self.peek()),
             }),
         }
@@ -1496,8 +1553,9 @@ impl Parser {
         let name = match self.advance() {
             Token::Ident(name) => name,
             t => {
-                return Err(ParseError {
-                    message: format!("expected view name after refresh, got {t:?}"),
+                return Err(ParseError::UnexpectedToken {
+                    expected: "view name after refresh".into(),
+                    got: format!("{t:?}"),
                 })
             }
         };
@@ -1509,8 +1567,9 @@ impl Parser {
         let name = match self.advance() {
             Token::Ident(n) => n,
             t => {
-                return Err(ParseError {
-                    message: format!("expected type name, got {t:?}"),
+                return Err(ParseError::UnexpectedToken {
+                    expected: "type name".into(),
+                    got: format!("{t:?}"),
                 })
             }
         };
@@ -1526,8 +1585,9 @@ impl Parser {
             let field_name = match self.advance() {
                 Token::Ident(n) => n,
                 t => {
-                    return Err(ParseError {
-                        message: format!("expected field name, got {t:?}"),
+                    return Err(ParseError::UnexpectedToken {
+                        expected: "field name".into(),
+                        got: format!("{t:?}"),
                     })
                 }
             };
@@ -1535,8 +1595,9 @@ impl Parser {
             let type_name = match self.advance() {
                 Token::Ident(n) => n,
                 t => {
-                    return Err(ParseError {
-                        message: format!("expected type name, got {t:?}"),
+                    return Err(ParseError::UnexpectedToken {
+                        expected: "type name".into(),
+                        got: format!("{t:?}"),
                     })
                 }
             };
@@ -2055,9 +2116,9 @@ mod tests {
         // Non-cross joins require `on <expr>`. Missing `on` is a parse error.
         let err = parse("User join Order").unwrap_err();
         assert!(
-            err.message.contains("on"),
+            err.message().contains("on"),
             "expected on-clause error, got {:?}",
-            err.message
+            err.message()
         );
     }
 
@@ -2067,13 +2128,13 @@ mod tests {
         // semantics here are messy and we're not implementing them yet.
         let err =
             parse("User as u join Order as o on u.id = o.user_id update { age := 1 }").unwrap_err();
-        assert!(err.message.contains("update"));
+        assert!(err.message().contains("update"));
     }
 
     #[test]
     fn test_parse_delete_on_joined_query_errors() {
         let err = parse("User as u join Order as o on u.id = o.user_id delete").unwrap_err();
-        assert!(err.message.contains("delete"));
+        assert!(err.message().contains("delete"));
     }
 
     // ---- Mission E2a: DISTINCT + IN-list + BETWEEN + LIKE -----------------
@@ -2980,9 +3041,9 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            err.message.contains("nesting depth"),
+            err.message().contains("nesting depth"),
             "expected nesting depth error, got: {}",
-            err.message
+            err.message()
         );
     }
 

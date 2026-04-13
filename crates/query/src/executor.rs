@@ -366,7 +366,7 @@ impl Engine {
                         self.catalog.sync_wal().map_err(|e| e.to_string())?;
                         result
                     }
-                    Err(e) => Err(e.message),
+                    Err(e) => Err(e.to_string()),
                 };
             }
             // Lex error — fall through to the planner so the caller gets a
@@ -378,7 +378,7 @@ impl Engine {
                     self.catalog.sync_wal().map_err(|e| e.to_string())?;
                     result
                 }
-                Err(e) => Err(e.message),
+                Err(e) => Err(e.to_string()),
             };
         }
 
@@ -386,8 +386,8 @@ impl Engine {
         let total_start = Instant::now();
         let plan_start = Instant::now();
         let plan = planner::plan(input).map_err(|e| {
-            error!(query = %input, error = %e.message, "query plan failed");
-            e.message
+            error!(query = %input, error = %e.to_string(), "query plan failed");
+            e.to_string()
         })?;
         let plan_us = plan_start.elapsed().as_micros();
 
@@ -448,7 +448,7 @@ impl Engine {
         // Parse the statement first so we can classify read vs. write
         // without touching the catalog. This is the same lex+parse cost
         // the hot path would pay anyway.
-        let stmt = crate::parser::parse(input).map_err(|e| e.message)?;
+        let stmt = crate::parser::parse(input).map_err(|e| e.to_string())?;
         if !is_read_only_statement(&stmt) {
             return Err(READONLY_NEEDS_WRITE.to_string());
         }
@@ -468,14 +468,14 @@ impl Engine {
             }
             // Miss: plan + insert + execute. The planner is pure, so this
             // is safe from `&self`.
-            let plan = crate::planner::plan_statement(stmt).map_err(|e| e.message)?;
+            let plan = crate::planner::plan_statement(stmt).map_err(|e| e.to_string())?;
             self.plan_cache.lock().unwrap().insert(hash, plan.clone());
             let plan = lower_unindexed_range_scans(&self.catalog, &plan);
             return self.execute_plan_readonly(&plan);
         }
         // Lex error — fall through to the planner for a consistent error
         // shape (though `parse` above would usually have caught it).
-        let plan = crate::planner::plan_statement(stmt).map_err(|e| e.message)?;
+        let plan = crate::planner::plan_statement(stmt).map_err(|e| e.to_string())?;
         let plan = lower_unindexed_range_scans(&self.catalog, &plan);
         self.execute_plan_readonly(&plan)
     }
@@ -1482,7 +1482,7 @@ impl Engine {
                 }
                 let inner = self.materialize_subqueries_readonly(inner)?;
                 let sub_plan = crate::planner::plan_statement(Statement::Query(*subquery.clone()))
-                    .map_err(|e| e.message)?;
+                    .map_err(|e| e.to_string())?;
                 let result = self.execute_plan_readonly(&sub_plan)?;
                 let values = match result {
                     QueryResult::Rows { rows, .. } => rows
@@ -1508,7 +1508,7 @@ impl Engine {
                     return Ok(expr.clone());
                 }
                 let sub_plan = crate::planner::plan_statement(Statement::Query(*subquery.clone()))
-                    .map_err(|e| e.message)?;
+                    .map_err(|e| e.to_string())?;
                 let result = self.execute_plan_readonly(&sub_plan)?;
                 let has_rows = match result {
                     QueryResult::Rows { rows, .. } => !rows.is_empty(),
@@ -1573,8 +1573,8 @@ impl Engine {
                         outer_columns,
                     ));
                 }
-                let sub_plan =
-                    crate::planner::plan_statement(Statement::Query(sub)).map_err(|e| e.message)?;
+                let sub_plan = crate::planner::plan_statement(Statement::Query(sub))
+                    .map_err(|e| e.to_string())?;
                 let result = self.execute_plan_readonly(&sub_plan)?;
                 let values = match result {
                     QueryResult::Rows { rows, .. } => rows
@@ -1606,8 +1606,8 @@ impl Engine {
                         outer_columns,
                     ));
                 }
-                let sub_plan =
-                    crate::planner::plan_statement(Statement::Query(sub)).map_err(|e| e.message)?;
+                let sub_plan = crate::planner::plan_statement(Statement::Query(sub))
+                    .map_err(|e| e.to_string())?;
                 let result = self.execute_plan_readonly(&sub_plan)?;
                 let has_rows = match result {
                     QueryResult::Rows { rows, .. } => !rows.is_empty(),
@@ -1654,7 +1654,7 @@ impl Engine {
     /// exactly that many literals to `execute_prepared`, in the same order
     /// they appear in the source text.
     pub fn prepare(&mut self, query: &str) -> Result<PreparedQuery, String> {
-        let plan = planner::plan(query).map_err(|e| e.message)?;
+        let plan = planner::plan(query).map_err(|e| e.to_string())?;
         let param_count = crate::plan_cache::count_literal_slots(&plan);
 
         // Insert fast path: if the template is Insert and every assignment
@@ -2049,7 +2049,7 @@ impl Engine {
                 let inner = self.materialize_subqueries(inner)?;
                 // Plan and execute the subquery.
                 let sub_plan = crate::planner::plan_statement(Statement::Query(*subquery.clone()))
-                    .map_err(|e| e.message)?;
+                    .map_err(|e| e.to_string())?;
                 let result = self.execute_plan(&sub_plan)?;
                 let values = match result {
                     QueryResult::Rows { rows, .. } => rows
@@ -2077,7 +2077,7 @@ impl Engine {
                 // Uncorrelated EXISTS: run the subquery once and collapse
                 // into a Bool literal.
                 let sub_plan = crate::planner::plan_statement(Statement::Query(*subquery.clone()))
-                    .map_err(|e| e.message)?;
+                    .map_err(|e| e.to_string())?;
                 let result = self.execute_plan(&sub_plan)?;
                 let has_rows = match result {
                     QueryResult::Rows { rows, .. } => !rows.is_empty(),
@@ -2139,8 +2139,8 @@ impl Engine {
                         outer_columns,
                     ));
                 }
-                let sub_plan =
-                    crate::planner::plan_statement(Statement::Query(sub)).map_err(|e| e.message)?;
+                let sub_plan = crate::planner::plan_statement(Statement::Query(sub))
+                    .map_err(|e| e.to_string())?;
                 let result = self.execute_plan(&sub_plan)?;
                 let values = match result {
                     QueryResult::Rows { rows, .. } => rows
@@ -2172,8 +2172,8 @@ impl Engine {
                         outer_columns,
                     ));
                 }
-                let sub_plan =
-                    crate::planner::plan_statement(Statement::Query(sub)).map_err(|e| e.message)?;
+                let sub_plan = crate::planner::plan_statement(Statement::Query(sub))
+                    .map_err(|e| e.to_string())?;
                 let result = self.execute_plan(&sub_plan)?;
                 let has_rows = match result {
                     QueryResult::Rows { rows, .. } => !rows.is_empty(),

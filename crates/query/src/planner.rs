@@ -5,22 +5,39 @@ use crate::plan::*;
 /// (column_name, lower_bound, upper_bound) — used by range-index extraction.
 type RangeBound = (String, Option<(Expr, bool)>, Option<(Expr, bool)>);
 
+/// Plan-phase error — wraps ParseError for the full lex→parse→plan chain.
 #[derive(Debug)]
-pub struct PlanError {
-    pub message: String,
+pub enum PlanError {
+    /// Error originated in the parser (or lexer, via ParseError::Lex).
+    Parse(ParseError),
+}
+
+impl PlanError {
+    /// Convenience: human-readable message for any variant.
+    pub fn message(&self) -> String {
+        self.to_string()
+    }
 }
 
 impl std::fmt::Display for PlanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
+        match self {
+            Self::Parse(e) => write!(f, "{e}"),
+        }
     }
 }
 
-impl std::error::Error for PlanError {}
+impl std::error::Error for PlanError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Parse(e) => Some(e),
+        }
+    }
+}
 
 impl From<ParseError> for PlanError {
     fn from(e: ParseError) -> Self {
-        PlanError { message: e.message }
+        PlanError::Parse(e)
     }
 }
 
