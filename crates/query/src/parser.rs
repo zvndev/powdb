@@ -85,9 +85,7 @@ impl Parser {
         if self.depth > MAX_NESTING_DEPTH {
             self.depth -= 1;
             return Err(ParseError {
-                message: format!(
-                    "query nesting depth exceeds maximum of {MAX_NESTING_DEPTH}"
-                ),
+                message: format!("query nesting depth exceeds maximum of {MAX_NESTING_DEPTH}"),
             });
         }
         if matches!(self.peek(), Token::Explain) {
@@ -806,9 +804,7 @@ impl Parser {
         if self.depth > MAX_NESTING_DEPTH {
             self.depth -= 1;
             return Err(ParseError {
-                message: format!(
-                    "query nesting depth exceeds maximum of {MAX_NESTING_DEPTH}"
-                ),
+                message: format!("query nesting depth exceeds maximum of {MAX_NESTING_DEPTH}"),
             });
         }
         let result = self.parse_or_expr();
