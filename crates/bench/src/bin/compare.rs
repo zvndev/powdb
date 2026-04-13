@@ -115,9 +115,12 @@ fn threshold_for(workload: &str) -> f64 {
             VERY_NOISY_ABSOLUTE_THRESHOLD
         }
 
-        // Bulk writes: fixture growth, WAL sync, btree splits — naturally
-        // more variance than point reads, but not as extreme as the above.
-        "insert_single" | "insert_batch_1k" => NOISY_ABSOLUTE_THRESHOLD,
+        // Bulk writes and multi-column scans: fixture growth, WAL sync,
+        // btree splits — naturally more variance than point reads, but not
+        // as extreme as the above. multi_col_and_filter promoted in PR #15
+        // after +10.14% variance on identical code (four same-code runs
+        // showed 2.89%–10.14% spread).
+        "insert_single" | "insert_batch_1k" | "multi_col_and_filter" => NOISY_ABSOLUTE_THRESHOLD,
         _ => DEFAULT_ABSOLUTE_THRESHOLD,
     }
 }
