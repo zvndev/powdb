@@ -2,10 +2,23 @@ use crate::ast::*;
 use crate::lexer::lex;
 use crate::token::Token;
 
+/// Maximum nesting depth for recursive descent parsing.
+/// Prevents stack exhaustion from crafted inputs with deeply nested
+/// parentheses, subqueries, or CASE expressions.
+const MAX_NESTING_DEPTH: usize = 64;
+
 #[derive(Debug)]
 pub struct ParseError {
     pub message: String,
 }
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for ParseError {}
 
 fn token_to_scalar_fn(tok: &Token) -> ScalarFn {
     match tok {
@@ -32,11 +45,16 @@ fn token_to_scalar_fn(tok: &Token) -> ScalarFn {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    depth: usize,
 }
 
 pub fn parse(input: &str) -> Result<Statement, ParseError> {
     let tokens = lex(input).map_err(|e| ParseError { message: e.message })?;
-    let mut parser = Parser { tokens, pos: 0 };
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        depth: 0,
+    };
     parser.parse_statement()
 }
 
@@ -63,9 +81,19 @@ impl Parser {
     }
 
     fn parse_statement(&mut self) -> Result<Statement, ParseError> {
+        self.depth += 1;
+        if self.depth > MAX_NESTING_DEPTH {
+            self.depth -= 1;
+            return Err(ParseError {
+                message: format!(
+                    "query nesting depth exceeds maximum of {MAX_NESTING_DEPTH}"
+                ),
+            });
+        }
         if matches!(self.peek(), Token::Explain) {
             self.advance();
             let inner = self.parse_statement()?;
+            self.depth -= 1;
             return Ok(Statement::Explain(Box::new(inner)));
         }
         let stmt = match self.peek() {
@@ -85,7 +113,9 @@ impl Parser {
             }),
         }?;
         // Check for UNION chaining after any query-producing statement.
-        self.maybe_parse_union(stmt)
+        let result = self.maybe_parse_union(stmt);
+        self.depth -= 1;
+        result
     }
 
     fn parse_query_or_mutation(&mut self) -> Result<Statement, ParseError> {
@@ -772,7 +802,18 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
-        self.parse_or_expr()
+        self.depth += 1;
+        if self.depth > MAX_NESTING_DEPTH {
+            self.depth -= 1;
+            return Err(ParseError {
+                message: format!(
+                    "query nesting depth exceeds maximum of {MAX_NESTING_DEPTH}"
+                ),
+            });
+        }
+        let result = self.parse_or_expr();
+        self.depth -= 1;
+        result
     }
 
     fn parse_or_expr(&mut self) -> Result<Expr, ParseError> {
@@ -2926,5 +2967,40 @@ mod tests {
             }
             _ => panic!("expected query"),
         }
+    }
+
+    #[test]
+    fn test_nesting_depth_limit() {
+        // Build a deeply nested parenthesized expression that exceeds MAX_NESTING_DEPTH.
+        let mut query = String::from("User filter ");
+        for _ in 0..70 {
+            query.push('(');
+        }
+        query.push_str(".age > 1");
+        for _ in 0..70 {
+            query.push(')');
+        }
+        let result = parse(&query);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("nesting depth"),
+            "expected nesting depth error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_moderate_nesting_succeeds() {
+        // 10 levels of nesting should be fine.
+        let mut query = String::from("User filter ");
+        for _ in 0..10 {
+            query.push('(');
+        }
+        query.push_str(".age > 1");
+        for _ in 0..10 {
+            query.push(')');
+        }
+        assert!(parse(&query).is_ok());
     }
 }

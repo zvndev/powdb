@@ -6,6 +6,14 @@ pub struct LexError {
     pub position: usize,
 }
 
+impl std::fmt::Display for LexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "at position {}: {}", self.position, self.message)
+    }
+}
+
+impl std::error::Error for LexError {}
+
 pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
     let mut tokens = Vec::new();
     let chars: Vec<char> = input.chars().collect();
