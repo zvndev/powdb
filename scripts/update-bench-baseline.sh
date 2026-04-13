@@ -35,6 +35,19 @@ WORKLOADS=(
   powql_filter_only
   powql_filter_projection
   powql_aggregation
+  point_lookup_nonindexed
+  scan_filter_project_top100
+  scan_filter_sort_limit10
+  agg_sum
+  agg_avg
+  agg_min
+  agg_max
+  multi_col_and_filter
+  insert_single
+  insert_batch_1k
+  update_by_pk
+  update_by_filter
+  delete_by_filter
 )
 
 if ! command -v jq >/dev/null 2>&1; then

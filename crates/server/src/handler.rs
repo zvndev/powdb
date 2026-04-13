@@ -60,7 +60,7 @@ fn sanitize_error(e: &str) -> String {
 /// statements acquire `.read()` so concurrent SELECTs can scan in
 /// parallel; mutations acquire `.write()`.
 fn dispatch_query(engine: &Arc<RwLock<Engine>>, query: &str) -> Result<QueryResult, String> {
-    let stmt_result = parser::parse(query).map_err(|e| e.message);
+    let stmt_result = parser::parse(query).map_err(|e| e.to_string());
 
     let can_try_read = matches!(&stmt_result, Ok(s) if is_read_only_statement(s));
     if can_try_read {

@@ -1,31 +1,89 @@
 {
   "schema": 1,
   "runner": "ubuntu-24.04",
-  "rustc": "stable",
-  "updated": "2026-04-12",
-  "commit": "fe9f99c (Sprint B complete + clippy 1.94 fixes)",
-  "captured_from": "Null-reset for full recapture. Prior baseline (ce862ca) was recorded on a fast GHA runner; Sprint B PR runs landed on slow runners with 10-100x variance on scan/agg workloads. No code changes touch existing hot paths — only new features (CAST, math, datetime, upsert, range scan, shutdown, timeouts). Next GHA run will establish a fresh baseline on the actual runner pool.",
-  "note": "Per-workload absolute gate is +/-7% default (storage + legacy PowQL), +/-10% for noisy write/sort workloads, and +/-20% for the six Azure-pool-variance-dominated aggregation/point workloads (see compare.rs::threshold_for).",
+  "rustc": "1.89.0",
+  "updated": "2026-04-13",
+  "commit": "1d0eada",
   "workloads": {
-    "insert_10k":                 null,
-    "btree_lookup":               null,
-    "seq_scan_filter":            null,
-    "powql_point":                null,
-    "powql_filter_only":          null,
-    "powql_filter_projection":    null,
-    "powql_aggregation":          null,
-    "point_lookup_nonindexed":    null,
-    "scan_filter_project_top100": null,
-    "scan_filter_sort_limit10":   null,
-    "agg_sum":                    null,
-    "agg_avg":                    null,
-    "agg_min":                    null,
-    "agg_max":                    null,
-    "multi_col_and_filter":       null,
-    "insert_single":              null,
-    "insert_batch_1k":            null,
-    "update_by_pk":               null,
-    "update_by_filter":           null,
-    "delete_by_filter":           null
+    "insert_10k": {
+      "ns_per_iter": 2879532,
+      "ops_per_sec": 347
+    },
+    "btree_lookup": {
+      "ns_per_iter": 264,
+      "ops_per_sec": 3787878
+    },
+    "seq_scan_filter": {
+      "ns_per_iter": 6330156,
+      "ops_per_sec": 158
+    },
+    "powql_point": {
+      "ns_per_iter": 1554,
+      "ops_per_sec": 643500
+    },
+    "powql_filter_only": {
+      "ns_per_iter": 15818775,
+      "ops_per_sec": 63
+    },
+    "powql_filter_projection": {
+      "ns_per_iter": 8648751,
+      "ops_per_sec": 116
+    },
+    "powql_aggregation": {
+      "ns_per_iter": 527996,
+      "ops_per_sec": 1894
+    },
+    "point_lookup_nonindexed": {
+      "ns_per_iter": 509581,
+      "ops_per_sec": 1962
+    },
+    "scan_filter_project_top100": {
+      "ns_per_iter": 20380,
+      "ops_per_sec": 49067
+    },
+    "scan_filter_sort_limit10": {
+      "ns_per_iter": 4269728,
+      "ops_per_sec": 234
+    },
+    "agg_sum": {
+      "ns_per_iter": 307430,
+      "ops_per_sec": 3253
+    },
+    "agg_avg": {
+      "ns_per_iter": 604749,
+      "ops_per_sec": 1654
+    },
+    "agg_min": {
+      "ns_per_iter": 301339,
+      "ops_per_sec": 3319
+    },
+    "agg_max": {
+      "ns_per_iter": 301654,
+      "ops_per_sec": 3315
+    },
+    "multi_col_and_filter": {
+      "ns_per_iter": 2966357,
+      "ops_per_sec": 337
+    },
+    "insert_single": {
+      "ns_per_iter": 3468,
+      "ops_per_sec": 288350
+    },
+    "insert_batch_1k": {
+      "ns_per_iter": 3428656,
+      "ops_per_sec": 292
+    },
+    "update_by_pk": {
+      "ns_per_iter": 1753,
+      "ops_per_sec": 570451
+    },
+    "update_by_filter": {
+      "ns_per_iter": 1582737,
+      "ops_per_sec": 632
+    },
+    "delete_by_filter": {
+      "ns_per_iter": 160609,
+      "ops_per_sec": 6226
+    }
   }
 }
