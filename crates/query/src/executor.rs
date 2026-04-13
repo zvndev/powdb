@@ -326,6 +326,7 @@ impl Engine {
                 let cached = self.plan_cache.lock().unwrap()
                     .get_with_substitution(hash, &literals);
                 if let Some(plan) = cached {
+                    let plan = lower_unindexed_range_scans(&self.catalog, &plan);
                     let result = self.execute_plan(&plan);
                     // Mission B (post-review): statement-boundary WAL
                     // group commit. Catalog::wal_log now only appends;
@@ -339,6 +340,7 @@ impl Engine {
                 return match planner::plan(input) {
                     Ok(plan) => {
                         self.plan_cache.lock().unwrap().insert(hash, plan.clone());
+                        let plan = lower_unindexed_range_scans(&self.catalog, &plan);
                         let result = self.execute_plan(&plan);
                         self.catalog.sync_wal().map_err(|e| e.to_string())?;
                         result
@@ -350,6 +352,7 @@ impl Engine {
             // consistent error shape.
             return match planner::plan(input) {
                 Ok(plan) => {
+                    let plan = lower_unindexed_range_scans(&self.catalog, &plan);
                     let result = self.execute_plan(&plan);
                     self.catalog.sync_wal().map_err(|e| e.to_string())?;
                     result
@@ -368,6 +371,7 @@ impl Engine {
         let plan_us = plan_start.elapsed().as_micros();
 
         let exec_start = Instant::now();
+        let plan = lower_unindexed_range_scans(&self.catalog, &plan);
         let result = self.execute_plan(&plan);
         // Mission B (post-review): statement-boundary WAL flush.
         let _ = self.catalog.sync_wal();
@@ -435,17 +439,20 @@ impl Engine {
             let cached = self.plan_cache.lock().unwrap()
                 .get_with_substitution(hash, &literals);
             if let Some(plan) = cached {
+                let plan = lower_unindexed_range_scans(&self.catalog, &plan);
                 return self.execute_plan_readonly(&plan);
             }
             // Miss: plan + insert + execute. The planner is pure, so this
             // is safe from `&self`.
             let plan = crate::planner::plan_statement(stmt).map_err(|e| e.message)?;
             self.plan_cache.lock().unwrap().insert(hash, plan.clone());
+            let plan = lower_unindexed_range_scans(&self.catalog, &plan);
             return self.execute_plan_readonly(&plan);
         }
         // Lex error — fall through to the planner for a consistent error
         // shape (though `parse` above would usually have caught it).
         let plan = crate::planner::plan_statement(stmt).map_err(|e| e.message)?;
+        let plan = lower_unindexed_range_scans(&self.catalog, &plan);
         self.execute_plan_readonly(&plan)
     }
 
@@ -5163,6 +5170,98 @@ fn hash_join(
     QueryResult::Rows { columns, rows }
 }
 
+/// Lower unindexed `RangeScan` nodes to `Filter(SeqScan)` so that all
+/// downstream fast paths (count, project+limit, sort+limit, agg, update,
+/// delete) continue to fire.
+///
+/// The planner emits `RangeScan` speculatively for every range inequality
+/// (`.age > 30`) because it has no catalog access. When the column has a
+/// B-tree index, `RangeScan` is the correct plan. When it doesn't, the
+/// executor's `RangeScan` fallback materialises every matching row with
+/// full `decode_row` — bypassing the compiled-predicate fast paths that
+/// `Filter(SeqScan)` would trigger.
+///
+/// This pass runs once per query, before execution.
+fn lower_unindexed_range_scans(catalog: &Catalog, plan: &PlanNode) -> PlanNode {
+    match plan {
+        PlanNode::RangeScan { table, column, start, end } => {
+            if let Some(tbl) = catalog.get_table(table) {
+                if tbl.index(column).is_some() {
+                    return plan.clone();
+                }
+            }
+            let pred = synthesize_range_predicate(column, start, end);
+            PlanNode::Filter {
+                input: Box::new(PlanNode::SeqScan { table: table.clone() }),
+                predicate: pred,
+            }
+        }
+        PlanNode::Filter { input, predicate } => PlanNode::Filter {
+            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            predicate: predicate.clone(),
+        },
+        PlanNode::Project { input, fields } => PlanNode::Project {
+            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            fields: fields.clone(),
+        },
+        PlanNode::Sort { input, keys } => PlanNode::Sort {
+            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            keys: keys.clone(),
+        },
+        PlanNode::Limit { input, count } => PlanNode::Limit {
+            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            count: count.clone(),
+        },
+        PlanNode::Offset { input, count } => PlanNode::Offset {
+            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            count: count.clone(),
+        },
+        PlanNode::Aggregate { input, function, field } => PlanNode::Aggregate {
+            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            function: *function,
+            field: field.clone(),
+        },
+        PlanNode::Distinct { input } => PlanNode::Distinct {
+            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+        },
+        PlanNode::GroupBy { input, keys, aggregates, having } => PlanNode::GroupBy {
+            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            keys: keys.clone(),
+            aggregates: aggregates.clone(),
+            having: having.clone(),
+        },
+        PlanNode::Update { input, table, assignments } => PlanNode::Update {
+            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            table: table.clone(),
+            assignments: assignments.clone(),
+        },
+        PlanNode::Delete { input, table } => PlanNode::Delete {
+            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            table: table.clone(),
+        },
+        PlanNode::Window { input, windows } => PlanNode::Window {
+            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            windows: windows.clone(),
+        },
+        PlanNode::Union { left, right, all } => PlanNode::Union {
+            left: Box::new(lower_unindexed_range_scans(catalog, left)),
+            right: Box::new(lower_unindexed_range_scans(catalog, right)),
+            all: *all,
+        },
+        PlanNode::Explain { input } => PlanNode::Explain {
+            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+        },
+        PlanNode::NestedLoopJoin { left, right, on, kind } => PlanNode::NestedLoopJoin {
+            left: Box::new(lower_unindexed_range_scans(catalog, left)),
+            right: Box::new(lower_unindexed_range_scans(catalog, right)),
+            on: on.clone(),
+            kind: *kind,
+        },
+        // Leaf nodes: no children to recurse into.
+        _ => plan.clone(),
+    }
+}
+
 /// Synthesize a range predicate from RangeScan bounds for the fallback path.
 fn synthesize_range_predicate(column: &str, start: &Option<(Expr, bool)>, end: &Option<(Expr, bool)>) -> Expr {
     let lower = start.as_ref().map(|(expr, inclusive)| {
@@ -8575,7 +8674,7 @@ mod tests {
                     .map(|r| match &r[0] { Value::Str(s) => s.as_str(), _ => "" })
                     .collect::<Vec<_>>()
                     .join("\n");
-                assert!(plan_text.contains("RangeScan"), "plan should show RangeScan node");
+                assert!(plan_text.contains("Filter"), "plan should show Filter(SeqScan) after lowering unindexed RangeScan");
             }
             _ => panic!("expected rows"),
         }
