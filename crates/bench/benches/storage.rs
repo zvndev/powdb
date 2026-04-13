@@ -117,7 +117,7 @@ fn bench_btree_lookup(c: &mut Criterion) {
 
     // Pre-generate 100 keys so the timed loop isn't measuring Int() construction.
     let keys: Vec<Value> = (0..100)
-        .map(|i| Value::Int((i * 491 % N_ROWS as i64) as i64))
+        .map(|i| Value::Int(i * 491 % N_ROWS as i64))
         .collect();
 
     let mut idx: usize = 0;

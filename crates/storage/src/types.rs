@@ -212,7 +212,7 @@ mod tests {
     fn test_value_type_id() {
         assert_eq!(Value::Int(42).type_id(), TypeId::Int);
         assert_eq!(Value::Str("hello".into()).type_id(), TypeId::Str);
-        assert_eq!(Value::Float(3.14).type_id(), TypeId::Float);
+        assert_eq!(Value::Float(2.78).type_id(), TypeId::Float);
         assert_eq!(Value::Bool(true).type_id(), TypeId::Bool);
         assert_eq!(Value::Empty.type_id(), TypeId::Empty);
     }

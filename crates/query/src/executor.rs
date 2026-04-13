@@ -10274,14 +10274,14 @@ mod tests {
             .execute_powql("type Floats { required val: float }")
             .unwrap();
         engine
-            .execute_powql("insert Floats { val := 3.14159 }")
+            .execute_powql("insert Floats { val := 7.56789 }")
             .unwrap();
         let result = engine
             .execute_powql("Floats { r: round(.val, 2) }")
             .unwrap();
         match result {
             QueryResult::Rows { rows, .. } => {
-                assert_eq!(rows[0][0], Value::Float(3.14));
+                assert_eq!(rows[0][0], Value::Float(7.57));
             }
             _ => panic!("expected rows"),
         }

@@ -1349,13 +1349,13 @@ mod tests {
         let r1 = heap
             .insert(&encode_row(
                 &schema,
-                &vec![Value::Str("A".into()), Value::Int(1)],
+                &[Value::Str("A".into()), Value::Int(1)],
             ))
             .unwrap();
         let r2 = heap
             .insert(&encode_row(
                 &schema,
-                &vec![Value::Str("B".into()), Value::Int(2)],
+                &[Value::Str("B".into()), Value::Int(2)],
             ))
             .unwrap();
         heap.delete(r1).unwrap();

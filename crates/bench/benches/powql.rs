@@ -568,7 +568,7 @@ fn bench_update_by_filter(c: &mut Criterion) {
     let (mut engine, _tmp) = setup_user_fixture_n(N_ROWS_UPDATE_FILTER);
 
     let q = "User filter .age > 50 update { status := \"senior\" }".to_string();
-    warm_plan_cache(&mut engine, &[q.clone()]);
+    warm_plan_cache(&mut engine, std::slice::from_ref(&q));
 
     c.bench_function("update_by_filter", |b| {
         b.iter(|| black_box(engine.execute_powql(&q).expect("update failed")));

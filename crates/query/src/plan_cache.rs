@@ -600,7 +600,7 @@ mod tests {
         let mut cache = PlanCache::new(2);
         let q1 = "User";
         let q2 = "User filter .age > 1";
-        let q3 = "User filter .age > 2";
+        let _q3 = "User filter .age > 2";
         // q3 has same canonical as q2 — won't trigger eviction.
         // Use a different shape to force eviction.
         let q3_distinct = "User filter .id = 5";

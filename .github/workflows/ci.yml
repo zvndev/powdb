@@ -44,31 +44,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy lints
-        # -D warnings promotes all warnings to errors.
-        # -A flags below silence pre-existing lints in source files that
-        # predate this CI workflow. New lint categories will still fail.
-        run: >-
-          cargo clippy --workspace --all-targets --
-          -D warnings
-          -A clippy::approx_constant
-          -A clippy::manual_div_ceil
-          -A clippy::needless_range_loop
-          -A clippy::question_mark
-          -A clippy::new_without_default
-          -A clippy::while_let_loop
-          -A clippy::map_clone
-          -A clippy::unnecessary_map_or
-          -A clippy::useless_vec
-          -A clippy::doc_lazy_continuation
-          -A clippy::io_other_error
-          -A clippy::ineffective_open_options
-          -A clippy::identity_op
-          -A clippy::expect_fun_call
-          -A clippy::needless_borrow
-          -A clippy::ptr_arg
-          -A clippy::unnecessary_cast
-          -A clippy::cloned_ref_to_slice_refs
-          -A unused-variables
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run tests
         run: cargo test --workspace
