@@ -5,14 +5,14 @@ use std::hash::{Hash, Hasher};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum TypeId {
-    Empty    = 0,
-    Int      = 1,
-    Float    = 2,
-    Bool     = 3,
-    Str      = 4,
+    Empty = 0,
+    Int = 1,
+    Float = 2,
+    Bool = 3,
+    Str = 4,
     DateTime = 5,
-    Uuid     = 6,
-    Bytes    = 7,
+    Uuid = 6,
+    Bytes = 7,
 }
 
 /// A single scalar value. Optional fields use `Empty` (set-based nullability).
@@ -22,37 +22,37 @@ pub enum Value {
     Float(f64),
     Bool(bool),
     Str(String),
-    DateTime(i64),   // microseconds since Unix epoch
+    DateTime(i64), // microseconds since Unix epoch
     Uuid([u8; 16]),
     Bytes(Vec<u8>),
-    Empty,           // {} — the empty set, not NULL
+    Empty, // {} — the empty set, not NULL
 }
 
 impl Value {
     pub fn type_id(&self) -> TypeId {
         match self {
-            Value::Int(_)      => TypeId::Int,
-            Value::Float(_)    => TypeId::Float,
-            Value::Bool(_)     => TypeId::Bool,
-            Value::Str(_)      => TypeId::Str,
+            Value::Int(_) => TypeId::Int,
+            Value::Float(_) => TypeId::Float,
+            Value::Bool(_) => TypeId::Bool,
+            Value::Str(_) => TypeId::Str,
             Value::DateTime(_) => TypeId::DateTime,
-            Value::Uuid(_)     => TypeId::Uuid,
-            Value::Bytes(_)    => TypeId::Bytes,
-            Value::Empty       => TypeId::Empty,
+            Value::Uuid(_) => TypeId::Uuid,
+            Value::Bytes(_) => TypeId::Bytes,
+            Value::Empty => TypeId::Empty,
         }
     }
 
     /// Number of bytes this value occupies when encoded in a row.
     pub fn encoded_size(&self) -> usize {
         match self {
-            Value::Int(_)      => 8,
-            Value::Float(_)    => 8,
-            Value::Bool(_)     => 1,
-            Value::Str(s)      => 4 + s.len(),      // u32 length prefix + UTF-8 bytes
+            Value::Int(_) => 8,
+            Value::Float(_) => 8,
+            Value::Bool(_) => 1,
+            Value::Str(s) => 4 + s.len(), // u32 length prefix + UTF-8 bytes
             Value::DateTime(_) => 8,
-            Value::Uuid(_)     => 16,
-            Value::Bytes(b)    => 4 + b.len(),       // u32 length prefix + raw bytes
-            Value::Empty       => 0,
+            Value::Uuid(_) => 16,
+            Value::Bytes(b) => 4 + b.len(), // u32 length prefix + raw bytes
+            Value::Empty => 0,
         }
     }
 
@@ -72,14 +72,14 @@ impl Value {
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Value::Int(a), Value::Int(b))           => a == b,
-            (Value::Float(a), Value::Float(b))       => a.total_cmp(b) == Ordering::Equal,
-            (Value::Bool(a), Value::Bool(b))         => a == b,
-            (Value::Str(a), Value::Str(b))           => a == b,
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a.total_cmp(b) == Ordering::Equal,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
             (Value::DateTime(a), Value::DateTime(b)) => a == b,
-            (Value::Uuid(a), Value::Uuid(b))         => a == b,
-            (Value::Bytes(a), Value::Bytes(b))       => a == b,
-            (Value::Empty, Value::Empty)             => true,
+            (Value::Uuid(a), Value::Uuid(b)) => a == b,
+            (Value::Bytes(a), Value::Bytes(b)) => a == b,
+            (Value::Empty, Value::Empty) => true,
             _ => false,
         }
     }
@@ -93,17 +93,17 @@ impl Hash for Value {
         // representations (e.g. Int(0) vs Bool(false)) can't collide.
         std::mem::discriminant(self).hash(state);
         match self {
-            Value::Int(v)      => v.hash(state),
+            Value::Int(v) => v.hash(state),
             // f64 has no Hash impl. Use the IEEE bit pattern, but canonicalise
             // via total_cmp so NaN hashes stably (and matches our PartialEq,
             // which also uses total_cmp for equality).
-            Value::Float(v)    => v.to_bits().hash(state),
-            Value::Bool(v)     => v.hash(state),
-            Value::Str(v)      => v.hash(state),
+            Value::Float(v) => v.to_bits().hash(state),
+            Value::Bool(v) => v.hash(state),
+            Value::Str(v) => v.hash(state),
             Value::DateTime(v) => v.hash(state),
-            Value::Uuid(v)     => v.hash(state),
-            Value::Bytes(v)    => v.hash(state),
-            Value::Empty       => {} // discriminant already hashed
+            Value::Uuid(v) => v.hash(state),
+            Value::Bytes(v) => v.hash(state),
+            Value::Empty => {} // discriminant already hashed
         }
     }
 }
@@ -117,21 +117,21 @@ impl PartialOrd for Value {
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
-            (Value::Int(a), Value::Int(b))           => a.cmp(b),
-            (Value::Float(a), Value::Float(b))       => a.total_cmp(b),
+            (Value::Int(a), Value::Int(b)) => a.cmp(b),
+            (Value::Float(a), Value::Float(b)) => a.total_cmp(b),
             // Cross-type numeric comparison: promote Int -> f64 and use
             // total_cmp so BETWEEN / ORDER BY / range predicates work on
             // mixed Int literals vs Float columns (and vice versa).
             // `i64 as f64` can lose precision above 2^53, but the result is
             // still monotonic, which is what comparison needs.
-            (Value::Int(a), Value::Float(b))         => (*a as f64).total_cmp(b),
-            (Value::Float(a), Value::Int(b))         => a.total_cmp(&(*b as f64)),
-            (Value::Bool(a), Value::Bool(b))         => a.cmp(b),
-            (Value::Str(a), Value::Str(b))           => a.cmp(b),
+            (Value::Int(a), Value::Float(b)) => (*a as f64).total_cmp(b),
+            (Value::Float(a), Value::Int(b)) => a.total_cmp(&(*b as f64)),
+            (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+            (Value::Str(a), Value::Str(b)) => a.cmp(b),
             (Value::DateTime(a), Value::DateTime(b)) => a.cmp(b),
-            (Value::Uuid(a), Value::Uuid(b))         => a.cmp(b),
-            (Value::Bytes(a), Value::Bytes(b))       => a.cmp(b),
-            (Value::Empty, Value::Empty)             => Ordering::Equal,
+            (Value::Uuid(a), Value::Uuid(b)) => a.cmp(b),
+            (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
+            (Value::Empty, Value::Empty) => Ordering::Equal,
             (Value::Empty, _) => Ordering::Less,
             (_, Value::Empty) => Ordering::Greater,
             _ => (self.type_id() as u8).cmp(&(other.type_id() as u8)),
@@ -176,17 +176,20 @@ impl Schema {
 
 /// Whether a type has a fixed encoded size.
 pub fn is_fixed_size(type_id: TypeId) -> bool {
-    matches!(type_id, TypeId::Int | TypeId::Float | TypeId::Bool | TypeId::DateTime | TypeId::Uuid)
+    matches!(
+        type_id,
+        TypeId::Int | TypeId::Float | TypeId::Bool | TypeId::DateTime | TypeId::Uuid
+    )
 }
 
 /// Fixed encoded size for fixed-size types.
 pub fn fixed_size(type_id: TypeId) -> Option<usize> {
     match type_id {
-        TypeId::Int      => Some(8),
-        TypeId::Float    => Some(8),
-        TypeId::Bool     => Some(1),
+        TypeId::Int => Some(8),
+        TypeId::Float => Some(8),
+        TypeId::Bool => Some(1),
         TypeId::DateTime => Some(8),
-        TypeId::Uuid     => Some(16),
+        TypeId::Uuid => Some(16),
         _ => None,
     }
 }
@@ -209,7 +212,7 @@ mod tests {
     fn test_value_type_id() {
         assert_eq!(Value::Int(42).type_id(), TypeId::Int);
         assert_eq!(Value::Str("hello".into()).type_id(), TypeId::Str);
-        assert_eq!(Value::Float(3.14).type_id(), TypeId::Float);
+        assert_eq!(Value::Float(2.78).type_id(), TypeId::Float);
         assert_eq!(Value::Bool(true).type_id(), TypeId::Bool);
         assert_eq!(Value::Empty.type_id(), TypeId::Empty);
     }
@@ -302,8 +305,18 @@ mod tests {
         let schema = Schema {
             table_name: "test".into(),
             columns: vec![
-                ColumnDef { name: "a".into(), type_id: TypeId::Int, required: true, position: 0 },
-                ColumnDef { name: "b".into(), type_id: TypeId::Str, required: false, position: 1 },
+                ColumnDef {
+                    name: "a".into(),
+                    type_id: TypeId::Int,
+                    required: true,
+                    position: 0,
+                },
+                ColumnDef {
+                    name: "b".into(),
+                    type_id: TypeId::Str,
+                    required: false,
+                    position: 1,
+                },
             ],
         };
         assert_eq!(schema.column_index("a"), Some(0));

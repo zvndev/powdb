@@ -108,18 +108,20 @@ fn concurrent_readers_make_progress_in_parallel() {
     // measuring overlapped scan time, not thread-spawn latency.
     let barrier = Arc::new(Barrier::new(n_threads));
     let conc_start = Instant::now();
-    let handles: Vec<_> = (0..n_threads).map(|_| {
-        let eng = engine.clone();
-        let bar = barrier.clone();
-        let q = query.to_string();
-        thread::spawn(move || {
-            bar.wait();
-            for _ in 0..iters_per_thread {
-                let guard = eng.read().unwrap();
-                let _ = guard.execute_powql_readonly(&q).unwrap();
-            }
+    let handles: Vec<_> = (0..n_threads)
+        .map(|_| {
+            let eng = engine.clone();
+            let bar = barrier.clone();
+            let q = query.to_string();
+            thread::spawn(move || {
+                bar.wait();
+                for _ in 0..iters_per_thread {
+                    let guard = eng.read().unwrap();
+                    let _ = guard.execute_powql_readonly(&q).unwrap();
+                }
+            })
         })
-    }).collect();
+        .collect();
     for h in handles {
         h.join().unwrap();
     }
@@ -175,8 +177,7 @@ fn concurrent_readers_see_uncorrupted_rows() {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir()
-            .join(format!("powdb_conc_read_corr_{test_id}_{ts}"));
+        let dir = std::env::temp_dir().join(format!("powdb_conc_read_corr_{test_id}_{ts}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -193,10 +194,8 @@ fn concurrent_readers_see_uncorrupted_rows() {
 
     {
         let mut eng = engine.write().unwrap();
-        eng.execute_powql(
-            "type Row { required id: int, required payload: str }",
-        )
-        .unwrap();
+        eng.execute_powql("type Row { required id: int, required payload: str }")
+            .unwrap();
         // Seed via the prepared-insert fast path — parse + plan once,
         // bind new literals per row. Without this, seeding N=100K rows
         // through `execute_powql` format!() strings takes ~10 minutes
@@ -205,10 +204,7 @@ fn concurrent_readers_see_uncorrupted_rows() {
             .prepare(r#"insert Row { id := 0, payload := "x" }"#)
             .unwrap();
         for i in 0..N {
-            let literals = [
-                Literal::Int(i as i64),
-                Literal::String(format!("p_{i}")),
-            ];
+            let literals = [Literal::Int(i as i64), Literal::String(format!("p_{i}"))];
             eng.execute_prepared(&prep, &literals).unwrap();
         }
 
@@ -220,8 +216,7 @@ fn concurrent_readers_see_uncorrupted_rows() {
             .catalog_mut()
             .get_table_mut("Row")
             .expect("Row table exists");
-        tbl.create_index("id", &data_dir)
-            .expect("build id index");
+        tbl.create_index("id", &data_dir).expect("build id index");
 
         // Force every dirty page out of `HeapFile`'s write-back buffer
         // and onto disk. Without this, `heap.get` short-circuits every
@@ -290,36 +285,25 @@ fn concurrent_readers_see_uncorrupted_rows() {
                 // iteration is just btree lookup + heap.get, no
                 // parser/planner frames in between.
                 let guard = eng.read().unwrap();
-                let tbl = guard
-                    .catalog()
-                    .get_table("Row")
-                    .expect("Row table");
+                let tbl = guard.catalog().get_table("Row").expect("Row table");
                 for _ in 0..LOOKUPS_PER_THREAD {
                     k = (k + stride) % N;
                     let key = Value::Int(k as i64);
-                    let (_rid, row) = tbl
-                        .index_lookup("id", &key)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "index_lookup for id {k} returned None \
+                    let (_rid, row) = tbl.index_lookup("id", &key).unwrap_or_else(|| {
+                        panic!(
+                            "index_lookup for id {k} returned None \
                                  — btree/heap disagreement, likely a \
                                  torn read from a racing seek+read"
-                            )
-                        });
-                    assert_eq!(
-                        row.len(),
-                        2,
-                        "expected 2 columns per row"
-                    );
+                        )
+                    });
+                    assert_eq!(row.len(), 2, "expected 2 columns per row");
                     let got_id = match &row[0] {
                         Value::Int(n) => *n,
                         other => panic!("expected Int id, got {other:?}"),
                     };
                     let got_payload = match &row[1] {
                         Value::Str(s) => s.as_str(),
-                        other => panic!(
-                            "expected Str payload, got {other:?}"
-                        ),
+                        other => panic!("expected Str payload, got {other:?}"),
                     };
                     assert_eq!(
                         got_id, k as i64,
@@ -354,9 +338,12 @@ fn write_lock_excludes_readers_correctness() {
     let engine = fresh_engine();
     {
         let mut eng = engine.write().unwrap();
-        eng.execute_powql("type Item { required id: int, required name: str }").unwrap();
-        eng.execute_powql(r#"insert Item { id := 1, name := "apple" }"#).unwrap();
-        eng.execute_powql(r#"insert Item { id := 2, name := "banana" }"#).unwrap();
+        eng.execute_powql("type Item { required id: int, required name: str }")
+            .unwrap();
+        eng.execute_powql(r#"insert Item { id := 1, name := "apple" }"#)
+            .unwrap();
+        eng.execute_powql(r#"insert Item { id := 2, name := "banana" }"#)
+            .unwrap();
     }
     {
         let eng = engine.read().unwrap();
@@ -371,7 +358,8 @@ fn write_lock_excludes_readers_correctness() {
     // Now add a third item and verify the read-lock path sees it.
     {
         let mut eng = engine.write().unwrap();
-        eng.execute_powql(r#"insert Item { id := 3, name := "cherry" }"#).unwrap();
+        eng.execute_powql(r#"insert Item { id := 3, name := "cherry" }"#)
+            .unwrap();
     }
     {
         let eng = engine.read().unwrap();
@@ -394,6 +382,8 @@ fn readonly_rejects_mutations_with_escalation_sentinel() {
         eng.execute_powql("type T { required id: int }").unwrap();
     }
     let eng = engine.read().unwrap();
-    let err = eng.execute_powql_readonly(r#"insert T { id := 1 }"#).unwrap_err();
+    let err = eng
+        .execute_powql_readonly(r#"insert T { id := 1 }"#)
+        .unwrap_err();
     assert_eq!(err, READONLY_NEEDS_WRITE);
 }

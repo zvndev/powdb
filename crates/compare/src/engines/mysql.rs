@@ -49,7 +49,9 @@ impl MysqlEngine {
         )
         .ok()?;
 
-        Some(Self { conn: RefCell::new(conn) })
+        Some(Self {
+            conn: RefCell::new(conn),
+        })
     }
 }
 
@@ -109,10 +111,7 @@ impl BenchEngine for MysqlEngine {
     fn point_lookup_indexed(&self, id: i64) -> Option<String> {
         self.conn
             .borrow_mut()
-            .exec_first::<String, _, _>(
-                "SELECT name FROM bench_users WHERE id = ?",
-                (id,),
-            )
+            .exec_first::<String, _, _>("SELECT name FROM bench_users WHERE id = ?", (id,))
             .expect("point_lookup_indexed query failed")
     }
 
@@ -240,16 +239,17 @@ impl BenchEngine for MysqlEngine {
         tx.exec_batch(
             "INSERT INTO bench_users (id, name, age, status, email, created_at) \
              VALUES (?, ?, ?, ?, ?, ?)",
-            rows.iter().map(|(id, name, age, status, email, created_at)| {
-                Params::Positional(vec![
-                    (*id).into(),
-                    name.as_str().into(),
-                    (*age).into(),
-                    status.as_str().into(),
-                    email.as_str().into(),
-                    (*created_at).into(),
-                ])
-            }),
+            rows.iter()
+                .map(|(id, name, age, status, email, created_at)| {
+                    Params::Positional(vec![
+                        (*id).into(),
+                        name.as_str().into(),
+                        (*age).into(),
+                        status.as_str().into(),
+                        email.as_str().into(),
+                        (*created_at).into(),
+                    ])
+                }),
         )
         .expect("insert_batch exec_batch failed");
 
@@ -258,11 +258,8 @@ impl BenchEngine for MysqlEngine {
 
     fn update_by_pk(&mut self, id: i64, new_age: i64) -> u64 {
         let conn = self.conn.get_mut();
-        conn.exec_drop(
-            "UPDATE bench_users SET age = ? WHERE id = ?",
-            (new_age, id),
-        )
-        .expect("update_by_pk query failed");
+        conn.exec_drop("UPDATE bench_users SET age = ? WHERE id = ?", (new_age, id))
+            .expect("update_by_pk query failed");
         conn.affected_rows()
     }
 
@@ -278,11 +275,8 @@ impl BenchEngine for MysqlEngine {
 
     fn delete_by_filter(&mut self, age_threshold: i64) -> u64 {
         let conn = self.conn.get_mut();
-        conn.exec_drop(
-            "DELETE FROM bench_users WHERE age < ?",
-            (age_threshold,),
-        )
-        .expect("delete_by_filter query failed");
+        conn.exec_drop("DELETE FROM bench_users WHERE age < ?", (age_threshold,))
+            .expect("delete_by_filter query failed");
         conn.affected_rows()
     }
 }

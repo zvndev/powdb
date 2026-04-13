@@ -133,18 +133,13 @@ fn test_crash_recovery_var_col_update() {
         for i in 0..10i64 {
             exec(
                 &mut engine,
-                &format!(
-                    "insert users {{ id := {i}, name := \"original_name_{i}\", age := {i} }}",
-                ),
+                &format!("insert users {{ id := {i}, name := \"original_name_{i}\", age := {i} }}",),
             );
         }
         // Shrink row 5's name to a single char. No index on name, single
         // var column assignment → this is the exact shape that hits the
         // `patch_var_col_in_place` fast path (now `patch_var_col_logged`).
-        exec(
-            &mut engine,
-            "users filter .id = 5 update { name := \"x\" }",
-        );
+        exec(&mut engine, "users filter .id = 5 update { name := \"x\" }");
         std::mem::forget(engine);
     }
 
@@ -188,9 +183,7 @@ fn test_crash_recovery_delete_by_filter() {
         for i in 0..100i64 {
             exec(
                 &mut engine,
-                &format!(
-                    "insert users {{ id := {i}, name := \"user_{i}\", age := {i} }}",
-                ),
+                &format!("insert users {{ id := {i}, name := \"user_{i}\", age := {i} }}",),
             );
         }
         // 49 matches: ages 51..=99 inclusive.

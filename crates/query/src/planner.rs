@@ -10,6 +10,14 @@ pub struct PlanError {
     pub message: String,
 }
 
+impl std::fmt::Display for PlanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for PlanError {}
+
 impl From<ParseError> for PlanError {
     fn from(e: ParseError) -> Self {
         PlanError { message: e.message }
@@ -28,7 +36,10 @@ pub fn plan_statement(stmt: Statement) -> Result<PlanNode, PlanError> {
         Statement::UpdateQuery(upd) => plan_update(upd),
         Statement::DeleteQuery(del) => plan_delete(del),
         Statement::CreateType(ct) => plan_create_type(ct),
-        Statement::AlterTable(at) => Ok(PlanNode::AlterTable { table: at.table, action: at.action }),
+        Statement::AlterTable(at) => Ok(PlanNode::AlterTable {
+            table: at.table,
+            action: at.action,
+        }),
         Statement::DropTable(dt) => Ok(PlanNode::DropTable { name: dt.table }),
         Statement::CreateView(cv) => Ok(PlanNode::CreateView {
             name: cv.name,
@@ -48,7 +59,9 @@ pub fn plan_statement(stmt: Statement) -> Result<PlanNode, PlanError> {
         Statement::Upsert(ups) => plan_upsert(ups),
         Statement::Explain(inner) => {
             let inner_plan = plan_statement(*inner)?;
-            Ok(PlanNode::Explain { input: Box::new(inner_plan) })
+            Ok(PlanNode::Explain {
+                input: Box::new(inner_plan),
+            })
         }
     }
 }
@@ -75,22 +88,43 @@ fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
             Some(index_scan) => (index_scan, None),
             None => match try_extract_range_index_keys(&q.source, &pred) {
                 Some(range_scan) => (range_scan, None),
-                None => (PlanNode::SeqScan { table: q.source.clone() }, Some(pred)),
+                None => (
+                    PlanNode::SeqScan {
+                        table: q.source.clone(),
+                    },
+                    Some(pred),
+                ),
             },
         },
-        None => (PlanNode::SeqScan { table: q.source.clone() }, None),
+        None => (
+            PlanNode::SeqScan {
+                table: q.source.clone(),
+            },
+            None,
+        ),
     };
     let mut node = source;
 
     if let Some(pred) = filter {
-        node = PlanNode::Filter { input: Box::new(node), predicate: pred };
+        node = PlanNode::Filter {
+            input: Box::new(node),
+            predicate: pred,
+        };
     }
 
     // Mission E2b: GROUP BY path — insert GroupBy + Project before
     // order/limit/offset/distinct.
     if let Some(group) = q.group_by {
-        let mut proj_fields: Vec<ProjectField> = q.projection
-            .map(|proj| proj.into_iter().map(|pf| ProjectField { alias: pf.alias, expr: pf.expr }).collect())
+        let mut proj_fields: Vec<ProjectField> = q
+            .projection
+            .map(|proj| {
+                proj.into_iter()
+                    .map(|pf| ProjectField {
+                        alias: pf.alias,
+                        expr: pf.expr,
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         let mut having = group.having;
         let aggregates = extract_aggregates(&mut proj_fields, &mut having);
@@ -103,23 +137,44 @@ fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
         };
 
         if !proj_fields.is_empty() {
-            node = PlanNode::Project { input: Box::new(node), fields: proj_fields };
+            node = PlanNode::Project {
+                input: Box::new(node),
+                fields: proj_fields,
+            };
         }
 
         if let Some(order) = q.order {
-            node = PlanNode::Sort { input: Box::new(node), keys: order.keys.into_iter().map(|k| SortKey { field: k.field, descending: k.descending }).collect() };
+            node = PlanNode::Sort {
+                input: Box::new(node),
+                keys: order
+                    .keys
+                    .into_iter()
+                    .map(|k| SortKey {
+                        field: k.field,
+                        descending: k.descending,
+                    })
+                    .collect(),
+            };
         }
         // Offset must be applied *before* Limit: skip M rows, then take N.
         // Plan shape is Limit(Offset(...)), so Offset is built first (inner)
         // and Limit wraps it (outer).
         if let Some(off) = q.offset {
-            node = PlanNode::Offset { input: Box::new(node), count: off };
+            node = PlanNode::Offset {
+                input: Box::new(node),
+                count: off,
+            };
         }
         if let Some(lim) = q.limit {
-            node = PlanNode::Limit { input: Box::new(node), count: lim };
+            node = PlanNode::Limit {
+                input: Box::new(node),
+                count: lim,
+            };
         }
         if q.distinct {
-            node = PlanNode::Distinct { input: Box::new(node) };
+            node = PlanNode::Distinct {
+                input: Box::new(node),
+            };
         }
         return Ok(node);
     }
@@ -127,7 +182,14 @@ fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
     if let Some(order) = q.order {
         node = PlanNode::Sort {
             input: Box::new(node),
-            keys: order.keys.into_iter().map(|k| SortKey { field: k.field, descending: k.descending }).collect(),
+            keys: order
+                .keys
+                .into_iter()
+                .map(|k| SortKey {
+                    field: k.field,
+                    descending: k.descending,
+                })
+                .collect(),
         };
     }
 
@@ -135,27 +197,44 @@ fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
     // Plan shape is Limit(Offset(...)), so Offset is built first (inner)
     // and Limit wraps it (outer).
     if let Some(off) = q.offset {
-        node = PlanNode::Offset { input: Box::new(node), count: off };
+        node = PlanNode::Offset {
+            input: Box::new(node),
+            count: off,
+        };
     }
 
     if let Some(lim) = q.limit {
-        node = PlanNode::Limit { input: Box::new(node), count: lim };
+        node = PlanNode::Limit {
+            input: Box::new(node),
+            count: lim,
+        };
     }
 
     if let Some(proj) = q.projection {
-        let mut fields: Vec<ProjectField> = proj.into_iter().map(|pf| ProjectField {
-            alias: pf.alias,
-            expr: pf.expr,
-        }).collect();
+        let mut fields: Vec<ProjectField> = proj
+            .into_iter()
+            .map(|pf| ProjectField {
+                alias: pf.alias,
+                expr: pf.expr,
+            })
+            .collect();
         let windows = extract_windows(&mut fields);
         if !windows.is_empty() {
-            node = PlanNode::Window { input: Box::new(node), windows };
+            node = PlanNode::Window {
+                input: Box::new(node),
+                windows,
+            };
         }
-        node = PlanNode::Project { input: Box::new(node), fields };
+        node = PlanNode::Project {
+            input: Box::new(node),
+            fields,
+        };
     }
 
     if q.distinct {
-        node = PlanNode::Distinct { input: Box::new(node) };
+        node = PlanNode::Distinct {
+            input: Box::new(node),
+        };
     }
 
     if let Some(agg) = q.aggregation {
@@ -234,7 +313,14 @@ fn plan_joined_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
     if let Some(order) = q.order {
         node = PlanNode::Sort {
             input: Box::new(node),
-            keys: order.keys.into_iter().map(|k| SortKey { field: k.field, descending: k.descending }).collect(),
+            keys: order
+                .keys
+                .into_iter()
+                .map(|k| SortKey {
+                    field: k.field,
+                    descending: k.descending,
+                })
+                .collect(),
         };
     }
 
@@ -242,17 +328,31 @@ fn plan_joined_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
     // Plan shape is Limit(Offset(...)), so Offset is built first (inner)
     // and Limit wraps it (outer).
     if let Some(off) = q.offset {
-        node = PlanNode::Offset { input: Box::new(node), count: off };
+        node = PlanNode::Offset {
+            input: Box::new(node),
+            count: off,
+        };
     }
 
     if let Some(lim) = q.limit {
-        node = PlanNode::Limit { input: Box::new(node), count: lim };
+        node = PlanNode::Limit {
+            input: Box::new(node),
+            count: lim,
+        };
     }
 
     // Mission E2b: GROUP BY path for joined queries.
     if let Some(group) = q.group_by {
-        let mut proj_fields: Vec<ProjectField> = q.projection
-            .map(|proj| proj.into_iter().map(|pf| ProjectField { alias: pf.alias, expr: pf.expr }).collect())
+        let mut proj_fields: Vec<ProjectField> = q
+            .projection
+            .map(|proj| {
+                proj.into_iter()
+                    .map(|pf| ProjectField {
+                        alias: pf.alias,
+                        expr: pf.expr,
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         let mut having = group.having;
         let aggregates = extract_aggregates(&mut proj_fields, &mut having);
@@ -265,28 +365,44 @@ fn plan_joined_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
         };
 
         if !proj_fields.is_empty() {
-            node = PlanNode::Project { input: Box::new(node), fields: proj_fields };
+            node = PlanNode::Project {
+                input: Box::new(node),
+                fields: proj_fields,
+            };
         }
         if q.distinct {
-            node = PlanNode::Distinct { input: Box::new(node) };
+            node = PlanNode::Distinct {
+                input: Box::new(node),
+            };
         }
         return Ok(node);
     }
 
     if let Some(proj) = q.projection {
-        let mut fields: Vec<ProjectField> = proj.into_iter().map(|pf| ProjectField {
-            alias: pf.alias,
-            expr: pf.expr,
-        }).collect();
+        let mut fields: Vec<ProjectField> = proj
+            .into_iter()
+            .map(|pf| ProjectField {
+                alias: pf.alias,
+                expr: pf.expr,
+            })
+            .collect();
         let windows = extract_windows(&mut fields);
         if !windows.is_empty() {
-            node = PlanNode::Window { input: Box::new(node), windows };
+            node = PlanNode::Window {
+                input: Box::new(node),
+                windows,
+            };
         }
-        node = PlanNode::Project { input: Box::new(node), fields };
+        node = PlanNode::Project {
+            input: Box::new(node),
+            fields,
+        };
     }
 
     if q.distinct {
-        node = PlanNode::Distinct { input: Box::new(node) };
+        node = PlanNode::Distinct {
+            input: Box::new(node),
+        };
     }
 
     if let Some(agg) = q.aggregation {
@@ -318,12 +434,16 @@ fn plan_update(upd: UpdateExpr) -> Result<PlanNode, PlanError> {
             None => match try_extract_range_index_keys(&upd.source, &pred) {
                 Some(range_scan) => range_scan,
                 None => PlanNode::Filter {
-                    input: Box::new(PlanNode::SeqScan { table: upd.source.clone() }),
+                    input: Box::new(PlanNode::SeqScan {
+                        table: upd.source.clone(),
+                    }),
                     predicate: pred,
                 },
             },
         },
-        None => PlanNode::SeqScan { table: upd.source.clone() },
+        None => PlanNode::SeqScan {
+            table: upd.source.clone(),
+        },
     };
     Ok(PlanNode::Update {
         input: Box::new(source),
@@ -339,12 +459,16 @@ fn plan_delete(del: DeleteExpr) -> Result<PlanNode, PlanError> {
             None => match try_extract_range_index_keys(&del.source, &pred) {
                 Some(range_scan) => range_scan,
                 None => PlanNode::Filter {
-                    input: Box::new(PlanNode::SeqScan { table: del.source.clone() }),
+                    input: Box::new(PlanNode::SeqScan {
+                        table: del.source.clone(),
+                    }),
                     predicate: pred,
                 },
             },
         },
-        None => PlanNode::SeqScan { table: del.source.clone() },
+        None => PlanNode::SeqScan {
+            table: del.source.clone(),
+        },
     };
     Ok(PlanNode::Delete {
         input: Box::new(source),
@@ -362,8 +486,15 @@ fn plan_upsert(ups: UpsertExpr) -> Result<PlanNode, PlanError> {
 }
 
 fn plan_create_type(ct: CreateTypeExpr) -> Result<PlanNode, PlanError> {
-    let fields = ct.fields.into_iter().map(|f| (f.name, f.type_name, f.required)).collect();
-    Ok(PlanNode::CreateTable { name: ct.name, fields })
+    let fields = ct
+        .fields
+        .into_iter()
+        .map(|f| (f.name, f.type_name, f.required))
+        .collect();
+    Ok(PlanNode::CreateTable {
+        name: ct.name,
+        fields,
+    })
 }
 
 /// If the predicate is a simple `.field = literal` (or `literal = .field`),
@@ -494,13 +625,25 @@ fn extract_windows(proj_fields: &mut [ProjectField]) -> Vec<WindowDef> {
     let mut defs = Vec::new();
     let mut counter = 0usize;
     for f in proj_fields.iter_mut() {
-        if let Expr::Window { function, args, partition_by, order_by } = &f.expr {
+        if let Expr::Window {
+            function,
+            args,
+            partition_by,
+            order_by,
+        } = &f.expr
+        {
             let output_name = format!("__win_{counter}");
             defs.push(WindowDef {
                 function: *function,
                 args: args.clone(),
                 partition_by: partition_by.clone(),
-                order_by: order_by.iter().map(|k| SortKey { field: k.field.clone(), descending: k.descending }).collect(),
+                order_by: order_by
+                    .iter()
+                    .map(|k| SortKey {
+                        field: k.field.clone(),
+                        descending: k.descending,
+                    })
+                    .collect(),
                 output_name: output_name.clone(),
             });
             f.expr = Expr::Field(output_name);
@@ -654,7 +797,9 @@ mod tests {
         // `>` now emits a RangeScan instead of SeqScan+Filter.
         let plan = plan("User filter .age > 30").unwrap();
         match plan {
-            PlanNode::RangeScan { column, start, end, .. } => {
+            PlanNode::RangeScan {
+                column, start, end, ..
+            } => {
                 assert_eq!(column, "age");
                 assert!(start.is_some(), "expected lower bound");
                 assert!(end.is_none(), "expected no upper bound");
@@ -684,8 +829,10 @@ mod tests {
         let plan = plan("User filter .id = 42 update { age := 31 }").unwrap();
         match plan {
             PlanNode::Update { input, .. } => {
-                assert!(matches!(*input, PlanNode::IndexScan { .. }),
-                    "expected Update(IndexScan), got {input:?}");
+                assert!(
+                    matches!(*input, PlanNode::IndexScan { .. }),
+                    "expected Update(IndexScan), got {input:?}"
+                );
             }
             other => panic!("expected Update, got {other:?}"),
         }
@@ -696,8 +843,10 @@ mod tests {
         let plan = plan("User filter .age > 30 update { age := 31 }").unwrap();
         match plan {
             PlanNode::Update { input, .. } => {
-                assert!(matches!(*input, PlanNode::RangeScan { .. }),
-                    "expected Update(RangeScan), got {input:?}");
+                assert!(
+                    matches!(*input, PlanNode::RangeScan { .. }),
+                    "expected Update(RangeScan), got {input:?}"
+                );
             }
             other => panic!("expected Update, got {other:?}"),
         }
@@ -720,7 +869,12 @@ mod tests {
         // AliasScan leaves on both sides.
         let plan = plan("User as u join Order as o on u.id = o.user_id").unwrap();
         match plan {
-            PlanNode::NestedLoopJoin { left, right, on, kind } => {
+            PlanNode::NestedLoopJoin {
+                left,
+                right,
+                on,
+                kind,
+            } => {
                 assert_eq!(kind, JoinKind::Inner);
                 assert!(on.is_some());
                 assert!(matches!(*left, PlanNode::AliasScan { .. }));
@@ -734,7 +888,9 @@ mod tests {
     fn test_plan_right_join_rewritten_as_left_with_swapped_inputs() {
         let plan = plan("User as u right join Order as o on u.id = o.user_id").unwrap();
         match plan {
-            PlanNode::NestedLoopJoin { left, right, kind, .. } => {
+            PlanNode::NestedLoopJoin {
+                left, right, kind, ..
+            } => {
                 assert_eq!(kind, JoinKind::LeftOuter);
                 // Swapped: Order is now on the left, User on the right.
                 match *left {
@@ -774,10 +930,8 @@ mod tests {
 
     #[test]
     fn test_plan_join_with_filter_tail_wraps_filter_on_top() {
-        let plan = plan(
-            "User as u join Order as o on u.id = o.user_id filter o.total > 100",
-        )
-        .unwrap();
+        let plan =
+            plan("User as u join Order as o on u.id = o.user_id filter o.total > 100").unwrap();
         match plan {
             PlanNode::Filter { input, .. } => {
                 assert!(matches!(*input, PlanNode::NestedLoopJoin { .. }));
@@ -794,7 +948,12 @@ mod tests {
             PlanNode::Project { input, fields } => {
                 assert_eq!(fields.len(), 2);
                 match *input {
-                    PlanNode::GroupBy { input: inner, keys, aggregates, having } => {
+                    PlanNode::GroupBy {
+                        input: inner,
+                        keys,
+                        aggregates,
+                        having,
+                    } => {
                         assert!(matches!(*inner, PlanNode::SeqScan { .. }));
                         assert_eq!(keys, vec!["status"]);
                         assert_eq!(aggregates.len(), 1);
@@ -815,7 +974,9 @@ mod tests {
         match plan {
             PlanNode::Project { input, .. } => {
                 match *input {
-                    PlanNode::GroupBy { having, aggregates, .. } => {
+                    PlanNode::GroupBy {
+                        having, aggregates, ..
+                    } => {
                         // The planner should have extracted count(.name) into
                         // aggregates and rewritten the HAVING to reference __agg_0.
                         assert_eq!(aggregates.len(), 1);
@@ -823,8 +984,10 @@ mod tests {
                         let h = having.expect("having should be Some");
                         match h {
                             Expr::BinaryOp(l, BinOp::Gt, _) => {
-                                assert!(matches!(*l, Expr::Field(ref name) if name == "__agg_0"),
-                                    "expected Field(__agg_0), got {l:?}");
+                                assert!(
+                                    matches!(*l, Expr::Field(ref name) if name == "__agg_0"),
+                                    "expected Field(__agg_0), got {l:?}"
+                                );
                             }
                             other => panic!("expected BinaryOp, got {other:?}"),
                         }
@@ -844,10 +1007,16 @@ mod tests {
             PlanNode::Project { input, fields } => {
                 assert_eq!(fields.len(), 2);
                 // The window expr should have been replaced with Field("__win_0")
-                assert!(matches!(&fields[1].expr, Expr::Field(name) if name == "__win_0"),
-                    "expected Field(__win_0), got {:?}", fields[1].expr);
+                assert!(
+                    matches!(&fields[1].expr, Expr::Field(name) if name == "__win_0"),
+                    "expected Field(__win_0), got {:?}",
+                    fields[1].expr
+                );
                 match *input {
-                    PlanNode::Window { input: inner, windows } => {
+                    PlanNode::Window {
+                        input: inner,
+                        windows,
+                    } => {
                         assert_eq!(windows.len(), 1);
                         assert_eq!(windows[0].output_name, "__win_0");
                         assert!(matches!(*inner, PlanNode::SeqScan { .. }));
@@ -889,8 +1058,11 @@ mod tests {
         match plan {
             PlanNode::Project { input, .. } => {
                 // Input should be GroupBy, not Window.
-                assert!(matches!(*input, PlanNode::GroupBy { .. }),
-                    "expected GroupBy under Project, got {:?}", input);
+                assert!(
+                    matches!(*input, PlanNode::GroupBy { .. }),
+                    "expected GroupBy under Project, got {:?}",
+                    input
+                );
             }
             other => panic!("expected Project, got {other:?}"),
         }
@@ -901,8 +1073,11 @@ mod tests {
         let plan = plan("explain User filter .age > 30").unwrap();
         match plan {
             PlanNode::Explain { input } => {
-                assert!(matches!(*input, PlanNode::RangeScan { .. }),
-                    "expected Explain(RangeScan), got {:?}", input);
+                assert!(
+                    matches!(*input, PlanNode::RangeScan { .. }),
+                    "expected Explain(RangeScan), got {:?}",
+                    input
+                );
             }
             other => panic!("expected Explain, got {other:?}"),
         }

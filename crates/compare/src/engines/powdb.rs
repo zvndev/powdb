@@ -81,10 +81,9 @@ impl PowdbEngine {
             let borrow = self.insert_prep.borrow();
             if borrow.is_some() {
                 drop(borrow);
-                return std::cell::RefMut::map(
-                    self.insert_prep.borrow_mut(),
-                    |o| o.as_mut().unwrap(),
-                );
+                return std::cell::RefMut::map(self.insert_prep.borrow_mut(), |o| {
+                    o.as_mut().unwrap()
+                });
             }
         }
         let prep = self.engine
@@ -103,13 +102,13 @@ impl PowdbEngine {
             let borrow = self.update_pk_prep.borrow();
             if borrow.is_some() {
                 drop(borrow);
-                return std::cell::RefMut::map(
-                    self.update_pk_prep.borrow_mut(),
-                    |o| o.as_mut().unwrap(),
-                );
+                return std::cell::RefMut::map(self.update_pk_prep.borrow_mut(), |o| {
+                    o.as_mut().unwrap()
+                });
             }
         }
-        let prep = self.engine
+        let prep = self
+            .engine
             .borrow_mut()
             .prepare("User filter .id = 0 update { age := 0 }")
             .expect("prepare update-by-pk template");
@@ -150,12 +149,7 @@ impl PowdbEngine {
     /// This bypasses the parser and planner entirely but still exercises the
     /// full executor — a fair representation of a "compiled plan" access
     /// pattern until the parser catches up.
-    fn exec_agg_with_field(
-        &self,
-        func: AggFunc,
-        field: &str,
-        filter: Option<Expr>,
-    ) -> QueryResult {
+    fn exec_agg_with_field(&self, func: AggFunc, field: &str, filter: Option<Expr>) -> QueryResult {
         let mut input = PlanNode::SeqScan {
             table: "User".to_string(),
         };
@@ -215,7 +209,9 @@ impl BenchEngine for PowdbEngine {
             let fresh_tmp = TempDir::new().expect("create tempdir");
             let mut fresh_engine = Engine::new(fresh_tmp.path()).expect("engine reset");
             // Re-apply the bench-only sync-off mode (see `new()`).
-            fresh_engine.catalog_mut().set_wal_sync_mode(WalSyncMode::Off);
+            fresh_engine
+                .catalog_mut()
+                .set_wal_sync_mode(WalSyncMode::Off);
             self.engine = RefCell::new(fresh_engine);
             self.layout = None;
             // Mission C Phase 5: a fresh engine means a fresh catalog,
@@ -267,9 +263,7 @@ impl BenchEngine for PowdbEngine {
             // path into a linear scan and tanks the headline ratio.
             // `create_index` is safe to call again; the table rebuilds the
             // index from current row contents.
-            table
-                .create_index("id", &data_dir)
-                .expect("build id index");
+            table.create_index("id", &data_dir).expect("build id index");
 
             self.layout = Some(RowLayout::new(&table.schema));
 
@@ -303,9 +297,7 @@ impl BenchEngine for PowdbEngine {
     fn point_lookup_nonindexed(&self, created_at: i64) -> Option<String> {
         // Fair comparison with SQLite's `LIMIT 1` — stop scanning as soon
         // as the first (and usually only) match is found.
-        let query = format!(
-            "User filter .created_at = {created_at} limit 1 {{ .name }}"
-        );
+        let query = format!("User filter .created_at = {created_at} limit 1 {{ .name }}");
         self.powql_first_string(&query)
     }
 
@@ -323,9 +315,7 @@ impl BenchEngine for PowdbEngine {
     }
 
     fn scan_filter_project_top100(&self, age_threshold: i64) -> Vec<(String, String)> {
-        let query = format!(
-            "User filter .age > {age_threshold} limit 100 {{ .name, .email }}"
-        );
+        let query = format!("User filter .age > {age_threshold} limit 100 {{ .name, .email }}");
         let result = self
             .engine
             .borrow_mut()
@@ -450,14 +440,17 @@ impl BenchEngine for PowdbEngine {
         let prep = self.insert_prepared();
         self.engine
             .borrow_mut()
-            .execute_prepared(&prep, &[
-                Literal::Int(id),
-                Literal::String(name.to_string()),
-                Literal::Int(age),
-                Literal::String(status.to_string()),
-                Literal::String(email.to_string()),
-                Literal::Int(created_at),
-            ])
+            .execute_prepared(
+                &prep,
+                &[
+                    Literal::Int(id),
+                    Literal::String(name.to_string()),
+                    Literal::Int(age),
+                    Literal::String(status.to_string()),
+                    Literal::String(email.to_string()),
+                    Literal::Int(created_at),
+                ],
+            )
             .expect("insert_single failed");
     }
 
@@ -505,10 +498,7 @@ impl BenchEngine for PowdbEngine {
         let result = self
             .engine
             .borrow_mut()
-            .execute_prepared(&prep, &[
-                Literal::Int(id),
-                Literal::Int(new_age),
-            ])
+            .execute_prepared(&prep, &[Literal::Int(id), Literal::Int(new_age)])
             .expect("update_by_pk failed");
         match result {
             QueryResult::Modified(n) => n,
@@ -517,9 +507,8 @@ impl BenchEngine for PowdbEngine {
     }
 
     fn update_by_filter(&mut self, age_threshold: i64, new_status: &str) -> u64 {
-        let query = format!(
-            "User filter .age > {age_threshold} update {{ status := \"{new_status}\" }}"
-        );
+        let query =
+            format!("User filter .age > {age_threshold} update {{ status := \"{new_status}\" }}");
         let result = self
             .engine
             .get_mut()

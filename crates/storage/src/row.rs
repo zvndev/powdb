@@ -269,15 +269,11 @@ pub fn decode_column(schema: &Schema, layout: &RowLayout, data: &[u8], col_idx: 
     if let Some(offset) = layout.fixed_offsets[col_idx] {
         let pos = fixed_start + offset;
         match col.type_id {
-            TypeId::Int => {
-                Value::Int(i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()))
-            }
+            TypeId::Int => Value::Int(i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap())),
             TypeId::Float => {
                 Value::Float(f64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()))
             }
-            TypeId::Bool => {
-                Value::Bool(data[pos] != 0)
-            }
+            TypeId::Bool => Value::Bool(data[pos] != 0),
             TypeId::DateTime => {
                 Value::DateTime(i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()))
             }
@@ -293,8 +289,10 @@ pub fn decode_column(schema: &Schema, layout: &RowLayout, data: &[u8], col_idx: 
         let offset_table_start = fixed_start + layout.fixed_region_size;
         let off_pos = offset_table_start + vi * 2;
         let next_off_pos = offset_table_start + (vi + 1) * 2;
-        let var_offset = u16::from_le_bytes(data[off_pos..off_pos + 2].try_into().unwrap()) as usize;
-        let var_next = u16::from_le_bytes(data[next_off_pos..next_off_pos + 2].try_into().unwrap()) as usize;
+        let var_offset =
+            u16::from_le_bytes(data[off_pos..off_pos + 2].try_into().unwrap()) as usize;
+        let var_next =
+            u16::from_le_bytes(data[next_off_pos..next_off_pos + 2].try_into().unwrap()) as usize;
 
         let var_data_start = offset_table_start + (layout.n_var + 1) * 2;
         let start = var_data_start + var_offset;
@@ -308,9 +306,7 @@ pub fn decode_column(schema: &Schema, layout: &RowLayout, data: &[u8], col_idx: 
             // so the bytes are guaranteed to be valid UTF-8. Skipping the UTF-8
             // check saves ~5-15ns per projected string, which is measurable on
             // string-heavy workloads like `multi_col_and_filter` (30K strings).
-            TypeId::Str => {
-                Value::Str(unsafe { std::str::from_utf8_unchecked(bytes) }.to_owned())
-            }
+            TypeId::Str => Value::Str(unsafe { std::str::from_utf8_unchecked(bytes) }.to_owned()),
             TypeId::Bytes => Value::Bytes(bytes.to_vec()),
             _ => unreachable!(),
         }
@@ -440,7 +436,7 @@ pub fn decode_row(schema: &Schema, data: &[u8]) -> Row {
 
         if is_null {
             pos += sz; // skip placeholder
-            // values[i] is already Empty
+                       // values[i] is already Empty
         } else {
             values[i] = match col.type_id {
                 TypeId::Int => {
@@ -451,9 +447,7 @@ pub fn decode_row(schema: &Schema, data: &[u8]) -> Row {
                     let v = f64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
                     Value::Float(v)
                 }
-                TypeId::Bool => {
-                    Value::Bool(data[pos] != 0)
-                }
+                TypeId::Bool => Value::Bool(data[pos] != 0),
                 TypeId::DateTime => {
                     let v = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
                     Value::DateTime(v)
@@ -470,7 +464,10 @@ pub fn decode_row(schema: &Schema, data: &[u8]) -> Row {
     }
 
     // Read variable-length columns
-    let var_col_indices: Vec<usize> = schema.columns.iter().enumerate()
+    let var_col_indices: Vec<usize> = schema
+        .columns
+        .iter()
+        .enumerate()
         .filter(|(_, c)| !is_fixed_size(c.type_id))
         .map(|(i, _)| i)
         .collect();
@@ -499,9 +496,7 @@ pub fn decode_row(schema: &Schema, data: &[u8]) -> Row {
         values[col_idx] = match schema.columns[col_idx].type_id {
             // SAFETY: see `decode_column` — the encoder is the only writer
             // and always writes valid UTF-8 for `TypeId::Str` columns.
-            TypeId::Str => {
-                Value::Str(unsafe { std::str::from_utf8_unchecked(bytes) }.to_owned())
-            }
+            TypeId::Str => Value::Str(unsafe { std::str::from_utf8_unchecked(bytes) }.to_owned()),
             TypeId::Bytes => Value::Bytes(bytes.to_vec()),
             _ => unreachable!(),
         };
@@ -518,10 +513,30 @@ mod tests {
         Schema {
             table_name: "users".into(),
             columns: vec![
-                ColumnDef { name: "name".into(),  type_id: TypeId::Str,  required: true,  position: 0 },
-                ColumnDef { name: "email".into(), type_id: TypeId::Str,  required: true,  position: 1 },
-                ColumnDef { name: "age".into(),   type_id: TypeId::Int,  required: false, position: 2 },
-                ColumnDef { name: "active".into(),type_id: TypeId::Bool, required: true,  position: 3 },
+                ColumnDef {
+                    name: "name".into(),
+                    type_id: TypeId::Str,
+                    required: true,
+                    position: 0,
+                },
+                ColumnDef {
+                    name: "email".into(),
+                    type_id: TypeId::Str,
+                    required: true,
+                    position: 1,
+                },
+                ColumnDef {
+                    name: "age".into(),
+                    type_id: TypeId::Int,
+                    required: false,
+                    position: 2,
+                },
+                ColumnDef {
+                    name: "active".into(),
+                    type_id: TypeId::Bool,
+                    required: true,
+                    position: 3,
+                },
             ],
         }
     }
@@ -565,8 +580,18 @@ mod tests {
         let schema = Schema {
             table_name: "t".into(),
             columns: vec![
-                ColumnDef { name: "a".into(), type_id: TypeId::Int, required: false, position: 0 },
-                ColumnDef { name: "b".into(), type_id: TypeId::Str, required: false, position: 1 },
+                ColumnDef {
+                    name: "a".into(),
+                    type_id: TypeId::Int,
+                    required: false,
+                    position: 0,
+                },
+                ColumnDef {
+                    name: "b".into(),
+                    type_id: TypeId::Str,
+                    required: false,
+                    position: 1,
+                },
             ],
         };
         let row = vec![Value::Empty, Value::Empty];
@@ -597,18 +622,46 @@ mod tests {
         let schema = Schema {
             table_name: "t".into(),
             columns: vec![
-                ColumnDef { name: "id".into(), type_id: TypeId::Int, required: true, position: 0 },
-                ColumnDef { name: "name".into(), type_id: TypeId::Str, required: true, position: 1 },
-                ColumnDef { name: "score".into(), type_id: TypeId::Float, required: false, position: 2 },
-                ColumnDef { name: "uuid".into(), type_id: TypeId::Uuid, required: false, position: 3 },
+                ColumnDef {
+                    name: "id".into(),
+                    type_id: TypeId::Int,
+                    required: true,
+                    position: 0,
+                },
+                ColumnDef {
+                    name: "name".into(),
+                    type_id: TypeId::Str,
+                    required: true,
+                    position: 1,
+                },
+                ColumnDef {
+                    name: "score".into(),
+                    type_id: TypeId::Float,
+                    required: false,
+                    position: 2,
+                },
+                ColumnDef {
+                    name: "uuid".into(),
+                    type_id: TypeId::Uuid,
+                    required: false,
+                    position: 3,
+                },
             ],
         };
         for i in 0..100 {
             let row = vec![
                 Value::Int(i),
                 Value::Str(format!("name_{i}")),
-                if i % 3 == 0 { Value::Empty } else { Value::Float(i as f64 * 1.5) },
-                if i % 5 == 0 { Value::Uuid([i as u8; 16]) } else { Value::Empty },
+                if i % 3 == 0 {
+                    Value::Empty
+                } else {
+                    Value::Float(i as f64 * 1.5)
+                },
+                if i % 5 == 0 {
+                    Value::Uuid([i as u8; 16])
+                } else {
+                    Value::Empty
+                },
             ];
             let encoded = encode_row(&schema, &row);
             let decoded = decode_row(&schema, &encoded);
@@ -641,7 +694,7 @@ mod tests {
     fn test_patch_var_column_shrink_first() {
         let schema = user_schema();
         let row = vec![
-            Value::Str("Alexandra".into()),              // 9 bytes
+            Value::Str("Alexandra".into()), // 9 bytes
             Value::Str("alice@example.com".into()),
             Value::Int(42),
             Value::Bool(false),
@@ -665,15 +718,35 @@ mod tests {
         let schema = Schema {
             table_name: "U".into(),
             columns: vec![
-                ColumnDef { name: "name".into(),   type_id: TypeId::Str, required: true,  position: 0 },
-                ColumnDef { name: "status".into(), type_id: TypeId::Str, required: true,  position: 1 },
-                ColumnDef { name: "email".into(),  type_id: TypeId::Str, required: true,  position: 2 },
-                ColumnDef { name: "age".into(),    type_id: TypeId::Int, required: false, position: 3 },
+                ColumnDef {
+                    name: "name".into(),
+                    type_id: TypeId::Str,
+                    required: true,
+                    position: 0,
+                },
+                ColumnDef {
+                    name: "status".into(),
+                    type_id: TypeId::Str,
+                    required: true,
+                    position: 1,
+                },
+                ColumnDef {
+                    name: "email".into(),
+                    type_id: TypeId::Str,
+                    required: true,
+                    position: 2,
+                },
+                ColumnDef {
+                    name: "age".into(),
+                    type_id: TypeId::Int,
+                    required: false,
+                    position: 3,
+                },
             ],
         };
         let row = vec![
             Value::Str("user_42".into()),
-            Value::Str("inactive".into()),              // 8 bytes
+            Value::Str("inactive".into()), // 8 bytes
             Value::Str("user_42@example.com".into()),
             Value::Int(55),
         ];
@@ -692,7 +765,7 @@ mod tests {
     fn test_patch_var_column_grow_rejects() {
         let schema = user_schema();
         let row = vec![
-            Value::Str("Al".into()),                    // 2 bytes
+            Value::Str("Al".into()), // 2 bytes
             Value::Str("alice@example.com".into()),
             Value::Int(30),
             Value::Bool(true),
@@ -726,8 +799,18 @@ mod tests {
         let schema = Schema {
             table_name: "U".into(),
             columns: vec![
-                ColumnDef { name: "label".into(), type_id: TypeId::Str, required: false, position: 0 },
-                ColumnDef { name: "fill".into(),  type_id: TypeId::Str, required: false, position: 1 },
+                ColumnDef {
+                    name: "label".into(),
+                    type_id: TypeId::Str,
+                    required: false,
+                    position: 0,
+                },
+                ColumnDef {
+                    name: "fill".into(),
+                    type_id: TypeId::Str,
+                    required: false,
+                    position: 1,
+                },
             ],
         };
         // Start with label = null; we need enough room in the (currently
@@ -745,9 +828,12 @@ mod tests {
     fn test_empty_string_vs_empty_set() {
         let schema = Schema {
             table_name: "t".into(),
-            columns: vec![
-                ColumnDef { name: "s".into(), type_id: TypeId::Str, required: false, position: 0 },
-            ],
+            columns: vec![ColumnDef {
+                name: "s".into(),
+                type_id: TypeId::Str,
+                required: false,
+                position: 0,
+            }],
         };
         // Empty string is a real value, not Empty
         let row_str = vec![Value::Str("".into())];

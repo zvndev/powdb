@@ -68,25 +68,25 @@ const WORKLOADS: &[&str] = &[
     "btree_lookup",
     "seq_scan_filter",
     // ── Legacy PowQL guards + Mission A workloads 1 & 3 ──
-    "powql_point",               // MA#1 point_lookup_indexed
-    "powql_filter_only",         // legacy 5a
-    "powql_filter_projection",   // legacy 5b
-    "powql_aggregation",         // MA#3 scan_filter_count
+    "powql_point",             // MA#1 point_lookup_indexed
+    "powql_filter_only",       // legacy 5a
+    "powql_filter_projection", // legacy 5b
+    "powql_aggregation",       // MA#3 scan_filter_count
     // ── Mission A reads (workloads 2, 4-10) ──
-    "point_lookup_nonindexed",   // MA#2
-    "scan_filter_project_top100",// MA#4
-    "scan_filter_sort_limit10",  // MA#5
-    "agg_sum",                   // MA#6
-    "agg_avg",                   // MA#7
-    "agg_min",                   // MA#8
-    "agg_max",                   // MA#9
-    "multi_col_and_filter",      // MA#10
+    "point_lookup_nonindexed",    // MA#2
+    "scan_filter_project_top100", // MA#4
+    "scan_filter_sort_limit10",   // MA#5
+    "agg_sum",                    // MA#6
+    "agg_avg",                    // MA#7
+    "agg_min",                    // MA#8
+    "agg_max",                    // MA#9
+    "multi_col_and_filter",       // MA#10
     // ── Mission A writes (workloads 11-15) ──
-    "insert_single",             // MA#11
-    "insert_batch_1k",           // MA#12
-    "update_by_pk",              // MA#13
-    "update_by_filter",          // MA#14
-    "delete_by_filter",          // MA#15
+    "insert_single",    // MA#11
+    "insert_batch_1k",  // MA#12
+    "update_by_pk",     // MA#13
+    "update_by_filter", // MA#14
+    "delete_by_filter", // MA#15
 ];
 
 /// Return the absolute-threshold that applies to a workload. Most workloads
@@ -110,15 +110,13 @@ fn threshold_for(workload: &str) -> f64 {
         // runs showed scan_filter_sort_limit10 +11.9%, update_by_pk +86%,
         // delete_by_filter +17.7% — all with zero code change. Promoted
         // from NOISY (10%) to VERY_NOISY (20%).
-        "scan_filter_sort_limit10"
-        | "update_by_pk"
-        | "delete_by_filter" => VERY_NOISY_ABSOLUTE_THRESHOLD,
+        "scan_filter_sort_limit10" | "update_by_pk" | "delete_by_filter" => {
+            VERY_NOISY_ABSOLUTE_THRESHOLD
+        }
 
         // Bulk writes: fixture growth, WAL sync, btree splits — naturally
         // more variance than point reads, but not as extreme as the above.
-        "insert_single"
-        | "insert_batch_1k"
-        | "update_by_filter" => NOISY_ABSOLUTE_THRESHOLD,
+        "insert_single" | "insert_batch_1k" | "update_by_filter" => NOISY_ABSOLUTE_THRESHOLD,
         _ => DEFAULT_ABSOLUTE_THRESHOLD,
     }
 }
@@ -179,7 +177,10 @@ fn main() -> ExitCode {
 
     if !missing.is_empty() {
         eprintln!();
-        eprintln!("error: {} workload(s) missing from criterion output", missing.len());
+        eprintln!(
+            "error: {} workload(s) missing from criterion output",
+            missing.len()
+        );
         eprintln!("       did `cargo bench -p powdb-bench` run all benches?");
         return ExitCode::from(1);
     }
@@ -300,7 +301,11 @@ fn main() -> ExitCode {
                     }
                 }
                 Some(_) => {
-                    if check.enforced { "PASS" } else { "CAPTURE" }
+                    if check.enforced {
+                        "PASS"
+                    } else {
+                        "CAPTURE"
+                    }
                 }
                 None => "—",
             };
@@ -308,10 +313,7 @@ fn main() -> ExitCode {
                 "{:<36} {:>9.3}x {:>12} {:>10}",
                 check.name, check.ceiling, observed_str, gate_str
             );
-            println!(
-                "  ({} / {})",
-                check.numerator, check.denominator
-            );
+            println!("  ({} / {})", check.numerator, check.denominator);
         }
         println!();
     }
@@ -368,7 +370,12 @@ fn read_estimate_median(criterion_dir: &Path, workload: &str) -> Result<f64, Str
     json.get("median")
         .and_then(|m| m.get("point_estimate"))
         .and_then(Json::as_f64)
-        .ok_or_else(|| format!("missing median.point_estimate in {}", estimates_path.display()))
+        .ok_or_else(|| {
+            format!(
+                "missing median.point_estimate in {}",
+                estimates_path.display()
+            )
+        })
 }
 
 fn parse_ratios(
@@ -399,14 +406,8 @@ fn parse_ratios(
             // PLAN-MISSION-A.md §4: pre-FASTPATH, ratios with null endpoints
             // CAPTURE rather than FAIL, and the rebaseline commit flips them
             // to enforcing mode by populating the baseline values.
-            let num_baseline = baseline_ns_map
-                .get(&numerator)
-                .copied()
-                .unwrap_or(None);
-            let den_baseline = baseline_ns_map
-                .get(&denominator)
-                .copied()
-                .unwrap_or(None);
+            let num_baseline = baseline_ns_map.get(&numerator).copied().unwrap_or(None);
+            let den_baseline = baseline_ns_map.get(&denominator).copied().unwrap_or(None);
             let enforced = num_baseline.is_some() && den_baseline.is_some();
 
             Some(RatioCheck {

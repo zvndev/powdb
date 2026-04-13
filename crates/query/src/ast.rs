@@ -26,8 +26,14 @@ pub struct AlterTableExpr {
 /// An individual ALTER TABLE action.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlterAction {
-    AddColumn { name: String, type_name: String, required: bool },
-    DropColumn { name: String },
+    AddColumn {
+        name: String,
+        type_name: String,
+        required: bool,
+    },
+    DropColumn {
+        name: String,
+    },
 }
 
 /// `drop User`
@@ -218,20 +224,20 @@ pub enum ScalarFn {
     Lower,
     Length,
     Trim,
-    Substring,  // substring(expr, start, len) — 1-indexed
-    Concat,     // concat(expr, expr, ...) — variadic
+    Substring, // substring(expr, start, len) — 1-indexed
+    Concat,    // concat(expr, expr, ...) — variadic
     // Math
     Abs,
-    Round,      // round(expr) or round(expr, decimals)
+    Round, // round(expr) or round(expr, decimals)
     Ceil,
     Floor,
     Sqrt,
-    Pow,        // pow(base, exponent)
+    Pow, // pow(base, exponent)
     // Date/time
-    Now,        // now() — returns current unix timestamp in microseconds
-    Extract,    // extract("year"|"month"|..., datetime_expr)
-    DateAdd,    // date_add(datetime_expr, amount, "unit")
-    DateDiff,   // date_diff(dt1, dt2, "unit")
+    Now,      // now() — returns current unix timestamp in microseconds
+    Extract,  // extract("year"|"month"|..., datetime_expr)
+    DateAdd,  // date_add(datetime_expr, amount, "unit")
+    DateDiff, // date_diff(dt1, dt2, "unit")
 }
 
 /// Target type for CAST expressions.
@@ -252,7 +258,10 @@ pub enum Expr {
     /// Used by join queries to disambiguate columns that appear in multiple
     /// sources. The single-table read path never emits this variant, so
     /// existing fast paths keep matching `Expr::Field` unchanged.
-    QualifiedField { qualifier: String, field: String },
+    QualifiedField {
+        qualifier: String,
+        field: String,
+    },
     Literal(Literal),
     Param(String),
     BinaryOp(Box<Expr>, BinOp, Box<Expr>),
@@ -262,14 +271,25 @@ pub enum Expr {
     ScalarFunc(ScalarFn, Vec<Expr>),
     Coalesce(Box<Expr>, Box<Expr>),
     /// `expr in (val1, val2, ...)` or `expr not in (val1, val2, ...)`
-    InList { expr: Box<Expr>, list: Vec<Expr>, negated: bool },
+    InList {
+        expr: Box<Expr>,
+        list: Vec<Expr>,
+        negated: bool,
+    },
     /// `expr [not] in (subquery)` — the subquery is a full QueryExpr
     /// that produces a single column.
-    InSubquery { expr: Box<Expr>, subquery: Box<QueryExpr>, negated: bool },
+    InSubquery {
+        expr: Box<Expr>,
+        subquery: Box<QueryExpr>,
+        negated: bool,
+    },
     /// `[not] exists (subquery)` — the subquery is a full QueryExpr.
     /// Currently uncorrelated only: the executor runs the subquery once
     /// before the scan loop and replaces this node with a Bool literal.
-    ExistsSubquery { subquery: Box<QueryExpr>, negated: bool },
+    ExistsSubquery {
+        subquery: Box<QueryExpr>,
+        negated: bool,
+    },
     /// CASE WHEN ... THEN ... [ELSE ...] END
     Case {
         whens: Vec<(Box<Expr>, Box<Expr>)>,
@@ -296,9 +316,18 @@ pub enum Literal {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BinOp {
-    Eq, Neq, Lt, Gt, Lte, Gte,
-    And, Or,
-    Add, Sub, Mul, Div,
+    Eq,
+    Neq,
+    Lt,
+    Gt,
+    Lte,
+    Gte,
+    And,
+    Or,
+    Add,
+    Sub,
+    Mul,
+    Div,
     Like,
 }
 

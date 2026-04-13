@@ -107,9 +107,7 @@ fn setup_user_fixture_n(n: usize) -> (Engine, TempDir) {
     // disable WAL fsync inside the bench. The WAL is still appended +
     // recovered on process crash; only the machine-crash guarantee is
     // dropped. Production code uses the default Full mode.
-    engine
-        .catalog_mut()
-        .set_wal_sync_mode(WalSyncMode::Off);
+    engine.catalog_mut().set_wal_sync_mode(WalSyncMode::Off);
 
     engine
         .execute_powql(
@@ -141,9 +139,7 @@ fn setup_user_fixture_n(n: usize) -> (Engine, TempDir) {
             ];
             table.insert(&row).expect("insert row");
         }
-        table
-            .create_index("id", &data_dir)
-            .expect("build id index");
+        table.create_index("id", &data_dir).expect("build id index");
     }
 
     (engine, tmp)
@@ -199,9 +195,7 @@ fn try_execute(engine: &mut Engine, q: &str) {
 fn bench_powql_point(c: &mut Criterion) {
     let (mut engine, _tmp) = setup_user_fixture();
 
-    let queries = gen_queries(|i| {
-        format!("User filter .id = {} {{ .name }}", (i * 491) % N_ROWS)
-    });
+    let queries = gen_queries(|i| format!("User filter .id = {} {{ .name }}", (i * 491) % N_ROWS));
     warm_plan_cache(&mut engine, &queries);
 
     let mut idx: usize = 0;
@@ -221,9 +215,7 @@ fn bench_powql_point(c: &mut Criterion) {
 fn bench_powql_filter_only(c: &mut Criterion) {
     let (mut engine, _tmp) = setup_user_fixture();
 
-    let queries = gen_queries(|i| {
-        format!("User filter .age > {}", 20 + (i % 40))
-    });
+    let queries = gen_queries(|i| format!("User filter .age > {}", 20 + (i % 40)));
     warm_plan_cache(&mut engine, &queries);
 
     let mut idx: usize = 0;
@@ -243,12 +235,8 @@ fn bench_powql_filter_only(c: &mut Criterion) {
 fn bench_powql_filter_projection(c: &mut Criterion) {
     let (mut engine, _tmp) = setup_user_fixture();
 
-    let queries = gen_queries(|i| {
-        format!(
-            "User filter .age > {} {{ .name, .email }}",
-            20 + (i % 40)
-        )
-    });
+    let queries =
+        gen_queries(|i| format!("User filter .age > {} {{ .name, .email }}", 20 + (i % 40)));
     warm_plan_cache(&mut engine, &queries);
 
     let mut idx: usize = 0;
@@ -268,9 +256,7 @@ fn bench_powql_filter_projection(c: &mut Criterion) {
 fn bench_powql_aggregation(c: &mut Criterion) {
     let (mut engine, _tmp) = setup_user_fixture();
 
-    let queries = gen_queries(|i| {
-        format!("count(User filter .age > {})", 20 + (i % 40))
-    });
+    let queries = gen_queries(|i| format!("count(User filter .age > {})", 20 + (i % 40)));
     warm_plan_cache(&mut engine, &queries);
 
     let mut idx: usize = 0;
@@ -392,9 +378,7 @@ fn bench_agg_sum(c: &mut Criterion) {
 fn bench_agg_avg(c: &mut Criterion) {
     let (mut engine, _tmp) = setup_user_fixture();
 
-    let queries = gen_queries(|i| {
-        format!("avg(User filter .age > {} {{ .age }})", 20 + (i % 40))
-    });
+    let queries = gen_queries(|i| format!("avg(User filter .age > {} {{ .age }})", 20 + (i % 40)));
     for q in queries.iter().take(10) {
         try_execute(&mut engine, q);
     }
@@ -584,12 +568,10 @@ fn bench_update_by_filter(c: &mut Criterion) {
     let (mut engine, _tmp) = setup_user_fixture_n(N_ROWS_UPDATE_FILTER);
 
     let q = "User filter .age > 50 update { status := \"senior\" }".to_string();
-    warm_plan_cache(&mut engine, &[q.clone()]);
+    warm_plan_cache(&mut engine, std::slice::from_ref(&q));
 
     c.bench_function("update_by_filter", |b| {
-        b.iter(|| {
-            black_box(engine.execute_powql(&q).expect("update failed"))
-        });
+        b.iter(|| black_box(engine.execute_powql(&q).expect("update failed")));
     });
 }
 

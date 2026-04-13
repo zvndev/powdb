@@ -1,5 +1,5 @@
 use crate::disk::DiskManager;
-use crate::page::{Page, PageType, PAGE_SIZE, iter_page_slots};
+use crate::page::{iter_page_slots, Page, PageType, PAGE_SIZE};
 use crate::types::RowId;
 use rustc_hash::FxHashMap;
 use std::io;
@@ -214,7 +214,11 @@ impl HeapFile {
         // delete/update workloads — we re-visit the same pages via the
         // index lookups and don't want to re-read them from disk.
         if let Some(page) = self.dirty_buffer.remove(&page_id) {
-            self.hot_page = Some(HotPage { page_id, page, dirty: true });
+            self.hot_page = Some(HotPage {
+                page_id,
+                page,
+                dirty: true,
+            });
             return Ok(());
         }
 
@@ -226,11 +230,13 @@ impl HeapFile {
         if let Some((ptr, len)) = self.mmap_ptr {
             let offset = page_id as usize * PAGE_SIZE;
             if offset + PAGE_SIZE <= len {
-                let page_bytes = unsafe {
-                    std::slice::from_raw_parts(ptr.add(offset), PAGE_SIZE)
-                };
+                let page_bytes = unsafe { std::slice::from_raw_parts(ptr.add(offset), PAGE_SIZE) };
                 if let Some(page) = Page::from_bytes(page_bytes) {
-                    self.hot_page = Some(HotPage { page_id, page, dirty: false });
+                    self.hot_page = Some(HotPage {
+                        page_id,
+                        page,
+                        dirty: false,
+                    });
                     return Ok(());
                 }
             }
@@ -239,7 +245,11 @@ impl HeapFile {
         let buf = self.disk.read_page(page_id)?;
         let page = Page::from_bytes(&buf)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "corrupt page"))?;
-        self.hot_page = Some(HotPage { page_id, page, dirty: false });
+        self.hot_page = Some(HotPage {
+            page_id,
+            page,
+            dirty: false,
+        });
         Ok(())
     }
 
@@ -247,7 +257,11 @@ impl HeapFile {
     /// The previous hot page, if any, is parked into the dirty buffer.
     fn install_fresh_hot(&mut self, page_id: u32, page: Page) -> io::Result<()> {
         self.park_hot_page();
-        self.hot_page = Some(HotPage { page_id, page, dirty: true });
+        self.hot_page = Some(HotPage {
+            page_id,
+            page,
+            dirty: true,
+        });
         Ok(())
     }
 
@@ -325,7 +339,10 @@ impl HeapFile {
                     }
                     self.mark_not_free(page_id);
                 }
-                return Ok(RowId { page_id, slot_index: slot });
+                return Ok(RowId {
+                    page_id,
+                    slot_index: slot,
+                });
             }
             // Hot page is full — fall through to pages_with_space. The
             // flush will happen inside `ensure_hot` when we load a
@@ -343,7 +360,10 @@ impl HeapFile {
                     self.pages_with_space.swap_remove(idx);
                     self.mark_not_free(page_id);
                 }
-                return Ok(RowId { page_id, slot_index: slot });
+                return Ok(RowId {
+                    page_id,
+                    slot_index: slot,
+                });
             }
             // Page doesn't fit this row; try the next one on the list.
         }
@@ -351,14 +371,16 @@ impl HeapFile {
         // Allocate a new page.
         let page_id = self.disk.allocate_page()?;
         let mut page = Page::new(page_id, PageType::Data);
-        let slot = page.insert(row_data)
-            .expect("row too large for empty page");
+        let slot = page.insert(row_data).expect("row too large for empty page");
         if page.free_space() >= 64 {
             self.pages_with_space.push(page_id);
             self.mark_free(page_id);
         }
         self.install_fresh_hot(page_id, page)?;
-        Ok(RowId { page_id, slot_index: slot })
+        Ok(RowId {
+            page_id,
+            slot_index: slot,
+        })
     }
 
     /// Read row data by RowId.
@@ -390,13 +412,10 @@ impl HeapFile {
         if let Some((ptr, len)) = self.mmap_ptr {
             let offset = rid.page_id as usize * PAGE_SIZE;
             if offset + PAGE_SIZE <= len {
-                let page_bytes = unsafe {
-                    std::slice::from_raw_parts(ptr.add(offset), PAGE_SIZE)
-                };
+                let page_bytes = unsafe { std::slice::from_raw_parts(ptr.add(offset), PAGE_SIZE) };
                 let entry_off = PAGE_SIZE - 2 - ((rid.slot_index as usize + 1) * 4);
-                let slot_offset = u16::from_le_bytes(
-                    page_bytes[entry_off..entry_off + 2].try_into().unwrap(),
-                );
+                let slot_offset =
+                    u16::from_le_bytes(page_bytes[entry_off..entry_off + 2].try_into().unwrap());
                 let slot_length = u16::from_le_bytes(
                     page_bytes[entry_off + 2..entry_off + 4].try_into().unwrap(),
                 );
@@ -588,11 +607,7 @@ impl HeapFile {
     /// query. This primitive does exactly one `ensure_hot` per page and
     /// mutates in place under the single pinned borrow.
     #[inline]
-    pub fn scan_delete_matching<P, H>(
-        &mut self,
-        mut pred: P,
-        mut hook: H,
-    ) -> io::Result<u64>
+    pub fn scan_delete_matching<P, H>(&mut self, mut pred: P, mut hook: H) -> io::Result<u64>
     where
         P: FnMut(&[u8]) -> bool,
         H: FnMut(RowId, &[u8]),
@@ -620,7 +635,13 @@ impl HeapFile {
                                 // catalog's WAL-logged wrapper can emit one
                                 // Delete record per matched row in the same
                                 // single-pass scan.
-                                hook(RowId { page_id, slot_index: slot }, bytes);
+                                hook(
+                                    RowId {
+                                        page_id,
+                                        slot_index: slot,
+                                    },
+                                    bytes,
+                                );
                                 true
                             } else {
                                 false
@@ -692,7 +713,10 @@ impl HeapFile {
                     None => false,
                 };
                 if matches {
-                    let rid = RowId { page_id, slot_index: slot };
+                    let rid = RowId {
+                        page_id,
+                        slot_index: slot,
+                    };
                     if let Some(bytes) = hot.page.slot_bytes_mut(slot) {
                         let old_len = bytes.len() as u16;
                         if let Some(new_len) = try_mutate(bytes) {
@@ -745,27 +769,56 @@ impl HeapFile {
     /// (same as before — the returned type was already an owned flat_map),
     /// so copying the hot page bytes into the result costs nothing extra.
     pub fn scan(&self) -> impl Iterator<Item = (RowId, Vec<u8>)> + '_ {
-        let hot_view = self.hot_page.as_ref().map(|hot| (hot.page_id, *hot.page.as_bytes()));
+        let hot_view = self
+            .hot_page
+            .as_ref()
+            .map(|hot| (hot.page_id, *hot.page.as_bytes()));
         (0..self.disk.num_pages()).flat_map(move |page_id| {
             // Mission C Phase 9: parked dirty pages override disk.
             if let Some(page) = self.dirty_buffer.get(&page_id) {
-                let entries: Vec<_> = page.iter()
-                    .map(|(slot, data)| (RowId { page_id, slot_index: slot }, data.to_vec()))
+                let entries: Vec<_> = page
+                    .iter()
+                    .map(|(slot, data)| {
+                        (
+                            RowId {
+                                page_id,
+                                slot_index: slot,
+                            },
+                            data.to_vec(),
+                        )
+                    })
                     .collect();
                 return entries.into_iter();
             }
             let entries: Vec<_> = match &hot_view {
-                Some((hid, hbytes)) if *hid == page_id => {
-                    iter_page_slots(hbytes.as_slice())
-                        .map(|(slot, data)| (RowId { page_id, slot_index: slot }, data.to_vec()))
-                        .collect()
-                }
-                _ => self.disk.read_page(page_id).ok()
+                Some((hid, hbytes)) if *hid == page_id => iter_page_slots(hbytes.as_slice())
+                    .map(|(slot, data)| {
+                        (
+                            RowId {
+                                page_id,
+                                slot_index: slot,
+                            },
+                            data.to_vec(),
+                        )
+                    })
+                    .collect(),
+                _ => self
+                    .disk
+                    .read_page(page_id)
+                    .ok()
                     .and_then(|buf| Page::from_bytes(&buf))
                     .map(|page| {
-                        page.iter().map(|(slot, data)| {
-                            (RowId { page_id, slot_index: slot }, data.to_vec())
-                        }).collect()
+                        page.iter()
+                            .map(|(slot, data)| {
+                                (
+                                    RowId {
+                                        page_id,
+                                        slot_index: slot,
+                                    },
+                                    data.to_vec(),
+                                )
+                            })
+                            .collect()
                     })
                     .unwrap_or_default(),
             };
@@ -817,7 +870,13 @@ impl HeapFile {
                 // Mission C Phase 9: dirty buffer > hot page > mmap.
                 if let Some(page) = self.dirty_buffer.get(&page_id) {
                     for (slot, data) in iter_page_slots(page.as_bytes()) {
-                        if let ControlFlow::Break(()) = f(RowId { page_id, slot_index: slot }, data) {
+                        if let ControlFlow::Break(()) = f(
+                            RowId {
+                                page_id,
+                                slot_index: slot,
+                            },
+                            data,
+                        ) {
                             break 'outer;
                         }
                     }
@@ -831,7 +890,13 @@ impl HeapFile {
                     }
                 };
                 for (slot, data) in iter_page_slots(page_bytes) {
-                    if let ControlFlow::Break(()) = f(RowId { page_id, slot_index: slot }, data) {
+                    if let ControlFlow::Break(()) = f(
+                        RowId {
+                            page_id,
+                            slot_index: slot,
+                        },
+                        data,
+                    ) {
                         break 'outer;
                     }
                 }
@@ -842,7 +907,13 @@ impl HeapFile {
             if let Some((hid, hbytes)) = hot_view {
                 if hid >= limit && hid < num_pages && !self.dirty_buffer.contains_key(&hid) {
                     for (slot, data) in iter_page_slots(hbytes) {
-                        if let ControlFlow::Break(()) = f(RowId { page_id: hid, slot_index: slot }, data) {
+                        if let ControlFlow::Break(()) = f(
+                            RowId {
+                                page_id: hid,
+                                slot_index: slot,
+                            },
+                            data,
+                        ) {
                             return;
                         }
                     }
@@ -854,7 +925,13 @@ impl HeapFile {
             for page_id in limit..num_pages {
                 if let Some(page) = self.dirty_buffer.get(&page_id) {
                     for (slot, data) in iter_page_slots(page.as_bytes()) {
-                        if let ControlFlow::Break(()) = f(RowId { page_id, slot_index: slot }, data) {
+                        if let ControlFlow::Break(()) = f(
+                            RowId {
+                                page_id,
+                                slot_index: slot,
+                            },
+                            data,
+                        ) {
                             return;
                         }
                     }
@@ -884,7 +961,13 @@ impl HeapFile {
                 // Mission C Phase 9: dirty buffer has priority.
                 if let Some(page) = self.dirty_buffer.get(&page_id) {
                     for (slot, data) in iter_page_slots(page.as_bytes()) {
-                        if let ControlFlow::Break(()) = f(RowId { page_id, slot_index: slot }, data) {
+                        if let ControlFlow::Break(()) = f(
+                            RowId {
+                                page_id,
+                                slot_index: slot,
+                            },
+                            data,
+                        ) {
                             break 'outer;
                         }
                     }
@@ -898,18 +981,32 @@ impl HeapFile {
                     }
                 };
                 for (slot, data) in iter_page_slots(page_bytes) {
-                    if let ControlFlow::Break(()) = f(RowId { page_id, slot_index: slot }, data) {
+                    if let ControlFlow::Break(()) = f(
+                        RowId {
+                            page_id,
+                            slot_index: slot,
+                        },
+                        data,
+                    ) {
                         break 'outer;
                     }
                 }
             }
-            unsafe { libc::munmap(ptr, file_len); }
+            unsafe {
+                libc::munmap(ptr, file_len);
+            }
         } else {
             // Fallback: per-page read.
             'outer: for page_id in 0..num_pages {
                 if let Some(page) = self.dirty_buffer.get(&page_id) {
                     for (slot, data) in iter_page_slots(page.as_bytes()) {
-                        if let ControlFlow::Break(()) = f(RowId { page_id, slot_index: slot }, data) {
+                        if let ControlFlow::Break(()) = f(
+                            RowId {
+                                page_id,
+                                slot_index: slot,
+                            },
+                            data,
+                        ) {
                             break 'outer;
                         }
                     }
@@ -918,7 +1015,13 @@ impl HeapFile {
                 if let Some((hid, hbytes)) = hot_view {
                     if hid == page_id {
                         for (slot, data) in iter_page_slots(hbytes) {
-                            if let ControlFlow::Break(()) = f(RowId { page_id, slot_index: slot }, data) {
+                            if let ControlFlow::Break(()) = f(
+                                RowId {
+                                    page_id,
+                                    slot_index: slot,
+                                },
+                                data,
+                            ) {
                                 break 'outer;
                             }
                         }
@@ -931,7 +1034,13 @@ impl HeapFile {
                 };
                 if let Some(page) = Page::from_bytes(&buf) {
                     for (slot, data) in page.iter() {
-                        if let ControlFlow::Break(()) = f(RowId { page_id, slot_index: slot }, data) {
+                        if let ControlFlow::Break(()) = f(
+                            RowId {
+                                page_id,
+                                slot_index: slot,
+                            },
+                            data,
+                        ) {
                             break 'outer;
                         }
                     }
@@ -973,7 +1082,13 @@ impl HeapFile {
             for page_id in 0..limit {
                 if let Some(page) = self.dirty_buffer.get(&page_id) {
                     for (slot, data) in iter_page_slots(page.as_bytes()) {
-                        f(RowId { page_id, slot_index: slot }, data);
+                        f(
+                            RowId {
+                                page_id,
+                                slot_index: slot,
+                            },
+                            data,
+                        );
                     }
                     continue;
                 }
@@ -985,21 +1100,39 @@ impl HeapFile {
                     }
                 };
                 for (slot, data) in iter_page_slots(page_bytes) {
-                    f(RowId { page_id, slot_index: slot }, data);
+                    f(
+                        RowId {
+                            page_id,
+                            slot_index: slot,
+                        },
+                        data,
+                    );
                 }
             }
             // Hot page allocated after enable_mmap — visit it explicitly.
             if let Some((hid, hbytes)) = hot_view {
                 if hid >= limit && hid < num_pages && !self.dirty_buffer.contains_key(&hid) {
                     for (slot, data) in iter_page_slots(hbytes) {
-                        f(RowId { page_id: hid, slot_index: slot }, data);
+                        f(
+                            RowId {
+                                page_id: hid,
+                                slot_index: slot,
+                            },
+                            data,
+                        );
                     }
                 }
             }
             for page_id in limit..num_pages {
                 if let Some(page) = self.dirty_buffer.get(&page_id) {
                     for (slot, data) in iter_page_slots(page.as_bytes()) {
-                        f(RowId { page_id, slot_index: slot }, data);
+                        f(
+                            RowId {
+                                page_id,
+                                slot_index: slot,
+                            },
+                            data,
+                        );
                     }
                 }
             }
@@ -1026,7 +1159,13 @@ impl HeapFile {
             for page_id in 0..num_pages {
                 if let Some(page) = self.dirty_buffer.get(&page_id) {
                     for (slot, data) in iter_page_slots(page.as_bytes()) {
-                        f(RowId { page_id, slot_index: slot }, data);
+                        f(
+                            RowId {
+                                page_id,
+                                slot_index: slot,
+                            },
+                            data,
+                        );
                     }
                     continue;
                 }
@@ -1038,23 +1177,43 @@ impl HeapFile {
                     }
                 };
                 for (slot, data) in iter_page_slots(page_bytes) {
-                    f(RowId { page_id, slot_index: slot }, data);
+                    f(
+                        RowId {
+                            page_id,
+                            slot_index: slot,
+                        },
+                        data,
+                    );
                 }
             }
-            unsafe { libc::munmap(ptr, file_len); }
+            unsafe {
+                libc::munmap(ptr, file_len);
+            }
         } else {
             // Fallback: per-page read
             for page_id in 0..num_pages {
                 if let Some(page) = self.dirty_buffer.get(&page_id) {
                     for (slot, data) in iter_page_slots(page.as_bytes()) {
-                        f(RowId { page_id, slot_index: slot }, data);
+                        f(
+                            RowId {
+                                page_id,
+                                slot_index: slot,
+                            },
+                            data,
+                        );
                     }
                     continue;
                 }
                 if let Some((hid, hbytes)) = hot_view {
                     if hid == page_id {
                         for (slot, data) in iter_page_slots(hbytes) {
-                            f(RowId { page_id, slot_index: slot }, data);
+                            f(
+                                RowId {
+                                    page_id,
+                                    slot_index: slot,
+                                },
+                                data,
+                            );
                         }
                         continue;
                     }
@@ -1065,7 +1224,13 @@ impl HeapFile {
                 };
                 if let Some(page) = Page::from_bytes(&buf) {
                     for (slot, data) in page.iter() {
-                        f(RowId { page_id, slot_index: slot }, data);
+                        f(
+                            RowId {
+                                page_id,
+                                slot_index: slot,
+                            },
+                            data,
+                        );
                     }
                 }
             }
@@ -1119,15 +1284,25 @@ unsafe impl Sync for HeapFile {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::row::{decode_row, encode_row};
     use crate::types::*;
-    use crate::row::{encode_row, decode_row};
 
     fn user_schema() -> Schema {
         Schema {
             table_name: "users".into(),
             columns: vec![
-                ColumnDef { name: "name".into(),  type_id: TypeId::Str, required: true,  position: 0 },
-                ColumnDef { name: "age".into(),    type_id: TypeId::Int, required: false, position: 1 },
+                ColumnDef {
+                    name: "name".into(),
+                    type_id: TypeId::Str,
+                    required: true,
+                    position: 0,
+                },
+                ColumnDef {
+                    name: "age".into(),
+                    type_id: TypeId::Int,
+                    required: false,
+                    position: 1,
+                },
             ],
         }
     }
@@ -1171,8 +1346,18 @@ mod tests {
     fn test_delete_row() {
         let (mut heap, path) = temp_heap("del");
         let schema = user_schema();
-        let r1 = heap.insert(&encode_row(&schema, &vec![Value::Str("A".into()), Value::Int(1)])).unwrap();
-        let r2 = heap.insert(&encode_row(&schema, &vec![Value::Str("B".into()), Value::Int(2)])).unwrap();
+        let r1 = heap
+            .insert(&encode_row(
+                &schema,
+                &[Value::Str("A".into()), Value::Int(1)],
+            ))
+            .unwrap();
+        let r2 = heap
+            .insert(&encode_row(
+                &schema,
+                &[Value::Str("B".into()), Value::Int(2)],
+            ))
+            .unwrap();
         heap.delete(r1).unwrap();
         assert!(heap.get(r1).is_none());
         assert!(heap.get(r2).is_some());
@@ -1211,19 +1396,19 @@ mod tests {
         // The age column is at schema position 1 (after the name str).
         let layout = crate::row::RowLayout::new(&schema);
         let mut deleted_keys: Vec<i64> = Vec::new();
-        let count = heap.scan_delete_matching(
-            |data| {
-                match crate::row::decode_column(&schema, &layout, data, 1) {
+        let count = heap
+            .scan_delete_matching(
+                |data| match crate::row::decode_column(&schema, &layout, data, 1) {
                     Value::Int(i) => i % 2 == 0,
                     _ => false,
-                }
-            },
-            |_rid, data| {
-                if let Value::Int(i) = crate::row::decode_column(&schema, &layout, data, 1) {
-                    deleted_keys.push(i);
-                }
-            },
-        ).unwrap();
+                },
+                |_rid, data| {
+                    if let Value::Int(i) = crate::row::decode_column(&schema, &layout, data, 1) {
+                        deleted_keys.push(i);
+                    }
+                },
+            )
+            .unwrap();
 
         assert_eq!(count, 250); // half the rows
         assert_eq!(deleted_keys.len(), 250);

@@ -21,8 +21,8 @@
 //! created_at = 1_700_000_000 + i
 //! ```
 
-pub mod powdb;
 pub mod postgres;
+pub mod powdb;
 pub mod sqlite;
 
 // MYSQL agent owns `engines/mysql.rs` in a separate worktree. Gate behind

@@ -134,7 +134,12 @@ impl BTree {
         }
     }
 
-    fn insert_recursive_int(&mut self, node_id: usize, key: i64, rid: RowId) -> Option<(i64, usize)> {
+    fn insert_recursive_int(
+        &mut self,
+        node_id: usize,
+        key: i64,
+        rid: RowId,
+    ) -> Option<(i64, usize)> {
         match &mut self.nodes[node_id] {
             Node::Leaf { keys, values, .. } => {
                 // Single-sided i64 comparison: since the leaf is all
@@ -235,7 +240,12 @@ impl BTree {
         }
     }
 
-    fn insert_recursive(&mut self, node_id: usize, key: Value, rid: RowId) -> Option<(Value, usize)> {
+    fn insert_recursive(
+        &mut self,
+        node_id: usize,
+        key: Value,
+        rid: RowId,
+    ) -> Option<(Value, usize)> {
         // Mission C Phase 6: in-place insert.
         //
         // The previous implementation did `let node = self.nodes[node_id].clone();`
@@ -517,7 +527,12 @@ impl BTree {
                 break;
             }
 
-            let next_leaf = if let Node::Leaf { keys, values, next_leaf } = &mut self.nodes[nid] {
+            let next_leaf = if let Node::Leaf {
+                keys,
+                values,
+                next_leaf,
+            } = &mut self.nodes[nid]
+            {
                 let mut write = 0usize;
                 for read in 0..keys.len() {
                     // Pull the int key out of the Value wrapper. Non-int
@@ -533,9 +548,7 @@ impl BTree {
                     // current leaf key. Those were either in a previous
                     // leaf or not present in the tree at all.
                     if let Some(k) = k_opt {
-                        while key_cursor < sorted_keys.len()
-                            && sorted_keys[key_cursor] < k
-                        {
+                        while key_cursor < sorted_keys.len() && sorted_keys[key_cursor] < k {
                             key_cursor += 1;
                         }
                         if key_cursor < sorted_keys.len() && sorted_keys[key_cursor] == k {
@@ -604,7 +617,11 @@ impl BTree {
     }
 
     /// Range scan: returns all (key, rid) pairs where start <= key <= end.
-    pub fn range<'a>(&'a self, start: &Value, end: &Value) -> impl Iterator<Item = (Value, RowId)> + 'a {
+    pub fn range<'a>(
+        &'a self,
+        start: &Value,
+        end: &Value,
+    ) -> impl Iterator<Item = (Value, RowId)> + 'a {
         // Find the leaf containing `start`
         let mut node_id = self.root;
         while let Node::Internal { keys, children } = &self.nodes[node_id] {
@@ -620,7 +637,11 @@ impl BTree {
         let mut current = Some(node_id);
         while let Some(nid) = current {
             match &self.nodes[nid] {
-                Node::Leaf { keys, values, next_leaf } => {
+                Node::Leaf {
+                    keys,
+                    values,
+                    next_leaf,
+                } => {
                     let mut done = false;
                     for (i, k) in keys.iter().enumerate() {
                         if k > &end {
@@ -654,7 +675,11 @@ impl BTree {
         let mut current = Some(node_id);
         while let Some(nid) = current {
             match &self.nodes[nid] {
-                Node::Leaf { keys, values, next_leaf } => {
+                Node::Leaf {
+                    keys,
+                    values,
+                    next_leaf,
+                } => {
                     for (i, k) in keys.iter().enumerate() {
                         if k >= &start {
                             results.push((k.clone(), values[i]));
@@ -680,7 +705,11 @@ impl BTree {
         let mut current = Some(node_id);
         while let Some(nid) = current {
             match &self.nodes[nid] {
-                Node::Leaf { keys, values, next_leaf } => {
+                Node::Leaf {
+                    keys,
+                    values,
+                    next_leaf,
+                } => {
                     let mut done = false;
                     for (i, k) in keys.iter().enumerate() {
                         if k > &end {
@@ -689,7 +718,9 @@ impl BTree {
                         }
                         results.push((k.clone(), values[i]));
                     }
-                    if done { break; }
+                    if done {
+                        break;
+                    }
                     current = *next_leaf;
                 }
                 _ => break,
@@ -710,7 +741,9 @@ impl BTree {
         let mut current = Some(node_id);
         while let Some(nid) = current {
             match &self.nodes[nid] {
-                Node::Leaf { keys, next_leaf, .. } => {
+                Node::Leaf {
+                    keys, next_leaf, ..
+                } => {
                     count += keys.len();
                     current = *next_leaf;
                 }
@@ -790,7 +823,11 @@ impl BTree {
                         buf.extend_from_slice(&(c as u32).to_le_bytes());
                     }
                 }
-                Node::Leaf { keys, values, next_leaf } => {
+                Node::Leaf {
+                    keys,
+                    values,
+                    next_leaf,
+                } => {
                     buf.push(NODE_TAG_LEAF);
                     buf.extend_from_slice(&(keys.len() as u32).to_le_bytes());
                     for k in keys {
@@ -825,7 +862,12 @@ impl BTree {
                 s.push(".tmp");
                 s
             }
-            None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "btree path has no file name")),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "btree path has no file name",
+                ))
+            }
         };
         tmp.set_file_name(tmp_name);
 
@@ -856,7 +898,10 @@ impl BTree {
 
         let mut pos = 0usize;
         if buf.len() < 14 || &buf[0..4] != BTREE_MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad btree magic"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad btree magic",
+            ));
         }
         pos += 4;
         let version = read_u16(&buf, &mut pos)?;
@@ -896,7 +941,10 @@ impl BTree {
                     for _ in 0..n_keys {
                         let page_id = read_u32(&buf, &mut pos)?;
                         let slot_index = read_u16(&buf, &mut pos)?;
-                        values.push(RowId { page_id, slot_index });
+                        values.push(RowId {
+                            page_id,
+                            slot_index,
+                        });
                     }
                     let has_next = read_u8(&buf, &mut pos)? != 0;
                     let next_leaf = if has_next {
@@ -904,7 +952,11 @@ impl BTree {
                     } else {
                         None
                     };
-                    nodes.push(Node::Leaf { keys, values, next_leaf });
+                    nodes.push(Node::Leaf {
+                        keys,
+                        values,
+                        next_leaf,
+                    });
                 }
                 other => {
                     return Err(io::Error::new(
@@ -974,7 +1026,10 @@ fn read_value(buf: &[u8], pos: &mut usize) -> io::Result<Value> {
         TypeId::Str => {
             let n = read_u32(buf, pos)? as usize;
             if *pos + n > buf.len() {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated btree str"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated btree str",
+                ));
             }
             let s = std::str::from_utf8(&buf[*pos..*pos + n])
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-utf8 in btree str"))?
@@ -988,7 +1043,10 @@ fn read_value(buf: &[u8], pos: &mut usize) -> io::Result<Value> {
         }
         TypeId::Uuid => {
             if *pos + 16 > buf.len() {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated btree uuid"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated btree uuid",
+                ));
             }
             let mut u = [0u8; 16];
             u.copy_from_slice(&buf[*pos..*pos + 16]);
@@ -998,7 +1056,10 @@ fn read_value(buf: &[u8], pos: &mut usize) -> io::Result<Value> {
         TypeId::Bytes => {
             let n = read_u32(buf, pos)? as usize;
             if *pos + n > buf.len() {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated btree bytes"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated btree bytes",
+                ));
             }
             let v = buf[*pos..*pos + n].to_vec();
             *pos += n;
@@ -1027,7 +1088,10 @@ fn type_id_from_u8(v: u8) -> io::Result<TypeId> {
 
 fn read_u8(buf: &[u8], pos: &mut usize) -> io::Result<u8> {
     if *pos >= buf.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated btree"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated btree",
+        ));
     }
     let v = buf[*pos];
     *pos += 1;
@@ -1035,7 +1099,10 @@ fn read_u8(buf: &[u8], pos: &mut usize) -> io::Result<u8> {
 }
 fn read_u16(buf: &[u8], pos: &mut usize) -> io::Result<u16> {
     if *pos + 2 > buf.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated btree"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated btree",
+        ));
     }
     let v = u16::from_le_bytes(buf[*pos..*pos + 2].try_into().unwrap());
     *pos += 2;
@@ -1043,7 +1110,10 @@ fn read_u16(buf: &[u8], pos: &mut usize) -> io::Result<u16> {
 }
 fn read_u32(buf: &[u8], pos: &mut usize) -> io::Result<u32> {
     if *pos + 4 > buf.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated btree"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated btree",
+        ));
     }
     let v = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap());
     *pos += 4;
@@ -1051,7 +1121,10 @@ fn read_u32(buf: &[u8], pos: &mut usize) -> io::Result<u32> {
 }
 fn read_u64(buf: &[u8], pos: &mut usize) -> io::Result<u64> {
     if *pos + 8 > buf.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated btree"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated btree",
+        ));
     }
     let v = u64::from_le_bytes(buf[*pos..*pos + 8].try_into().unwrap());
     *pos += 8;
@@ -1073,7 +1146,10 @@ mod tests {
     #[test]
     fn test_insert_and_lookup() {
         let mut bt = temp_btree("basic");
-        let rid = RowId { page_id: 1, slot_index: 0 };
+        let rid = RowId {
+            page_id: 1,
+            slot_index: 0,
+        };
         bt.insert(Value::Int(42), rid);
         assert_eq!(bt.lookup(&Value::Int(42)), Some(rid));
         assert_eq!(bt.lookup(&Value::Int(99)), None);
@@ -1083,14 +1159,19 @@ mod tests {
     fn test_many_inserts_and_lookups() {
         let mut bt = temp_btree("many");
         for i in 0..1000 {
-            bt.insert(Value::Int(i), RowId {
-                page_id: (i / 100) as u32,
-                slot_index: (i % 100) as u16,
-            });
+            bt.insert(
+                Value::Int(i),
+                RowId {
+                    page_id: (i / 100) as u32,
+                    slot_index: (i % 100) as u16,
+                },
+            );
         }
         assert_eq!(bt.len(), 1000);
         for i in 0..1000 {
-            let rid = bt.lookup(&Value::Int(i)).unwrap_or_else(|| panic!("key {i} missing"));
+            let rid = bt
+                .lookup(&Value::Int(i))
+                .unwrap_or_else(|| panic!("key {i} missing"));
             assert_eq!(rid.page_id, (i / 100) as u32);
             assert_eq!(rid.slot_index, (i % 100) as u16);
         }
@@ -1100,7 +1181,13 @@ mod tests {
     fn test_range_scan() {
         let mut bt = temp_btree("range");
         for i in 0..100 {
-            bt.insert(Value::Int(i), RowId { page_id: 0, slot_index: i as u16 });
+            bt.insert(
+                Value::Int(i),
+                RowId {
+                    page_id: 0,
+                    slot_index: i as u16,
+                },
+            );
         }
         let results: Vec<_> = bt.range(&Value::Int(10), &Value::Int(20)).collect();
         assert_eq!(results.len(), 11); // 10..=20 inclusive
@@ -1111,9 +1198,27 @@ mod tests {
     #[test]
     fn test_string_keys() {
         let mut bt = temp_btree("strings");
-        bt.insert(Value::Str("alice".into()), RowId { page_id: 0, slot_index: 0 });
-        bt.insert(Value::Str("bob".into()), RowId { page_id: 0, slot_index: 1 });
-        bt.insert(Value::Str("charlie".into()), RowId { page_id: 0, slot_index: 2 });
+        bt.insert(
+            Value::Str("alice".into()),
+            RowId {
+                page_id: 0,
+                slot_index: 0,
+            },
+        );
+        bt.insert(
+            Value::Str("bob".into()),
+            RowId {
+                page_id: 0,
+                slot_index: 1,
+            },
+        );
+        bt.insert(
+            Value::Str("charlie".into()),
+            RowId {
+                page_id: 0,
+                slot_index: 2,
+            },
+        );
         assert_eq!(bt.lookup(&Value::Str("bob".into())).unwrap().slot_index, 1);
         assert_eq!(bt.lookup(&Value::Str("dave".into())), None);
     }
@@ -1121,8 +1226,20 @@ mod tests {
     #[test]
     fn test_delete() {
         let mut bt = temp_btree("delete");
-        bt.insert(Value::Int(1), RowId { page_id: 0, slot_index: 0 });
-        bt.insert(Value::Int(2), RowId { page_id: 0, slot_index: 1 });
+        bt.insert(
+            Value::Int(1),
+            RowId {
+                page_id: 0,
+                slot_index: 0,
+            },
+        );
+        bt.insert(
+            Value::Int(2),
+            RowId {
+                page_id: 0,
+                slot_index: 1,
+            },
+        );
         assert!(bt.delete(&Value::Int(1)));
         assert_eq!(bt.lookup(&Value::Int(1)), None);
         assert_eq!(bt.lookup(&Value::Int(2)).unwrap().slot_index, 1);
@@ -1132,11 +1249,29 @@ mod tests {
     #[test]
     fn test_duplicate_key_updates() {
         let mut bt = temp_btree("dup");
-        bt.insert(Value::Int(42), RowId { page_id: 0, slot_index: 0 });
-        bt.insert(Value::Int(42), RowId { page_id: 1, slot_index: 5 });
+        bt.insert(
+            Value::Int(42),
+            RowId {
+                page_id: 0,
+                slot_index: 0,
+            },
+        );
+        bt.insert(
+            Value::Int(42),
+            RowId {
+                page_id: 1,
+                slot_index: 5,
+            },
+        );
         // Should update, not duplicate
         assert_eq!(bt.len(), 1);
-        assert_eq!(bt.lookup(&Value::Int(42)).unwrap(), RowId { page_id: 1, slot_index: 5 });
+        assert_eq!(
+            bt.lookup(&Value::Int(42)).unwrap(),
+            RowId {
+                page_id: 1,
+                slot_index: 5
+            }
+        );
     }
 
     #[test]
@@ -1144,12 +1279,21 @@ mod tests {
         let mut bt = temp_btree("large");
         // Insert enough to force multiple splits
         for i in 0..5000 {
-            bt.insert(Value::Int(i), RowId { page_id: (i / 256) as u32, slot_index: (i % 256) as u16 });
+            bt.insert(
+                Value::Int(i),
+                RowId {
+                    page_id: (i / 256) as u32,
+                    slot_index: (i % 256) as u16,
+                },
+            );
         }
         assert_eq!(bt.len(), 5000);
         // Verify all entries
         for i in 0..5000 {
-            assert!(bt.lookup(&Value::Int(i)).is_some(), "key {i} not found after splits");
+            assert!(
+                bt.lookup(&Value::Int(i)).is_some(),
+                "key {i} not found after splits"
+            );
         }
         // Range scan across splits
         let results: Vec<_> = bt.range(&Value::Int(2000), &Value::Int(3000)).collect();
@@ -1175,13 +1319,20 @@ mod tests {
         // Cross-check every key 0..5000 and a few missing ones on the
         // edges.
         for i in -5..5005 {
-            assert_eq!(bt_fast.lookup_int(i), bt_refn.lookup_int(i), "divergence at key {i}");
+            assert_eq!(
+                bt_fast.lookup_int(i),
+                bt_refn.lookup_int(i),
+                "divergence at key {i}"
+            );
         }
         assert_eq!(bt_fast.len(), bt_refn.len());
 
         // Duplicate-key update via the fast path should land on the same
         // slot as the generic insert.
-        let new_rid = RowId { page_id: 999, slot_index: 42 };
+        let new_rid = RowId {
+            page_id: 999,
+            slot_index: 42,
+        };
         bt_fast.insert_int(100, new_rid);
         bt_refn.insert(Value::Int(100), new_rid);
         assert_eq!(bt_fast.lookup_int(100), Some(new_rid));
@@ -1195,12 +1346,21 @@ mod tests {
         // split path because every insert lands at position 0.
         let mut bt = temp_btree("insert_int_reverse");
         for i in (0..1000i64).rev() {
-            bt.insert_int(i, RowId { page_id: 0, slot_index: i as u16 });
+            bt.insert_int(
+                i,
+                RowId {
+                    page_id: 0,
+                    slot_index: i as u16,
+                },
+            );
         }
         for i in 0..1000i64 {
             assert_eq!(
                 bt.lookup_int(i),
-                Some(RowId { page_id: 0, slot_index: i as u16 }),
+                Some(RowId {
+                    page_id: 0,
+                    slot_index: i as u16
+                }),
                 "missing key {i}",
             );
         }
@@ -1214,10 +1374,13 @@ mod tests {
         // a tree large enough to exercise multiple levels + splits.
         let mut bt = temp_btree("lookup_int");
         for i in 0..5000 {
-            bt.insert(Value::Int(i), RowId {
-                page_id: (i / 256) as u32,
-                slot_index: (i % 256) as u16,
-            });
+            bt.insert(
+                Value::Int(i),
+                RowId {
+                    page_id: (i / 256) as u32,
+                    slot_index: (i % 256) as u16,
+                },
+            );
         }
         for i in -5..5005 {
             let generic = bt.lookup(&Value::Int(i));
@@ -1271,7 +1434,13 @@ mod tests {
     fn test_delete_many_int_empty_slice() {
         let mut bt = temp_btree("delete_many_empty");
         for i in 0..100 {
-            bt.insert(Value::Int(i), RowId { page_id: 0, slot_index: i as u16 });
+            bt.insert(
+                Value::Int(i),
+                RowId {
+                    page_id: 0,
+                    slot_index: i as u16,
+                },
+            );
         }
         let removed = bt.delete_many_int(&[]);
         assert_eq!(removed, 0);
@@ -1282,7 +1451,13 @@ mod tests {
     fn test_delete_many_int_all_missing() {
         let mut bt = temp_btree("delete_many_missing");
         for i in 0..100 {
-            bt.insert(Value::Int(i), RowId { page_id: 0, slot_index: i as u16 });
+            bt.insert(
+                Value::Int(i),
+                RowId {
+                    page_id: 0,
+                    slot_index: i as u16,
+                },
+            );
         }
         let removed = bt.delete_many_int(&[1000, 2000, 3000]);
         assert_eq!(removed, 0);
@@ -1294,7 +1469,13 @@ mod tests {
         let mut bt = temp_btree("delete_many_all");
         let keys: Vec<i64> = (0..500).collect();
         for &i in &keys {
-            bt.insert(Value::Int(i), RowId { page_id: 0, slot_index: i as u16 });
+            bt.insert(
+                Value::Int(i),
+                RowId {
+                    page_id: 0,
+                    slot_index: i as u16,
+                },
+            );
         }
         let removed = bt.delete_many_int(&keys);
         assert_eq!(removed, 500);
@@ -1310,17 +1491,18 @@ mod tests {
         // both small (single-leaf) and large (multi-level) int-keyed
         // trees. "Equivalent" means every key looks up to the same
         // RowId, and the total length matches.
-        let tmp = std::env::temp_dir().join(format!(
-            "powdb_btree_save_int_{}.idx",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("powdb_btree_save_int_{}.idx", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
 
         let mut bt = BTree::create(&tmp).unwrap();
         for i in 0..2000i64 {
             bt.insert_int(
                 i,
-                RowId { page_id: (i / 256) as u32, slot_index: (i % 256) as u16 },
+                RowId {
+                    page_id: (i / 256) as u32,
+                    slot_index: (i % 256) as u16,
+                },
             );
         }
         bt.save().unwrap();
@@ -1338,8 +1520,7 @@ mod tests {
         assert_eq!(reloaded.lookup_int(9999), None);
         // Range scan across splits should match order.
         let orig_range: Vec<_> = bt.range(&Value::Int(500), &Value::Int(600)).collect();
-        let round_range: Vec<_> =
-            reloaded.range(&Value::Int(500), &Value::Int(600)).collect();
+        let round_range: Vec<_> = reloaded.range(&Value::Int(500), &Value::Int(600)).collect();
         assert_eq!(orig_range, round_range);
 
         std::fs::remove_file(&tmp).ok();
@@ -1348,20 +1529,54 @@ mod tests {
     #[test]
     fn test_save_load_roundtrip_mixed_value_types() {
         // String keys exercise the variable-length value encoder path.
-        let tmp = std::env::temp_dir().join(format!(
-            "powdb_btree_save_mixed_{}.idx",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("powdb_btree_save_mixed_{}.idx", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
 
         let mut bt = BTree::create(&tmp).unwrap();
         let keys = [
-            ("alice", RowId { page_id: 1, slot_index: 0 }),
-            ("bob", RowId { page_id: 2, slot_index: 1 }),
-            ("charlie", RowId { page_id: 3, slot_index: 2 }),
-            ("diana", RowId { page_id: 4, slot_index: 3 }),
-            ("", RowId { page_id: 5, slot_index: 4 }),
-            ("unicode ⚡", RowId { page_id: 6, slot_index: 5 }),
+            (
+                "alice",
+                RowId {
+                    page_id: 1,
+                    slot_index: 0,
+                },
+            ),
+            (
+                "bob",
+                RowId {
+                    page_id: 2,
+                    slot_index: 1,
+                },
+            ),
+            (
+                "charlie",
+                RowId {
+                    page_id: 3,
+                    slot_index: 2,
+                },
+            ),
+            (
+                "diana",
+                RowId {
+                    page_id: 4,
+                    slot_index: 3,
+                },
+            ),
+            (
+                "",
+                RowId {
+                    page_id: 5,
+                    slot_index: 4,
+                },
+            ),
+            (
+                "unicode ⚡",
+                RowId {
+                    page_id: 6,
+                    slot_index: 5,
+                },
+            ),
         ];
         for (k, rid) in keys.iter() {
             bt.insert(Value::Str((*k).into()), *rid);
@@ -1381,10 +1596,8 @@ mod tests {
     fn test_save_load_empty_tree() {
         // A freshly created empty tree must round-trip (one empty leaf,
         // root = 0).
-        let tmp = std::env::temp_dir().join(format!(
-            "powdb_btree_save_empty_{}.idx",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("powdb_btree_save_empty_{}.idx", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         let mut bt = BTree::create(&tmp).unwrap();
         bt.save().unwrap();
@@ -1399,7 +1612,13 @@ mod tests {
     fn test_reverse_insert_order() {
         let mut bt = temp_btree("reverse");
         for i in (0..500).rev() {
-            bt.insert(Value::Int(i), RowId { page_id: 0, slot_index: i as u16 });
+            bt.insert(
+                Value::Int(i),
+                RowId {
+                    page_id: 0,
+                    slot_index: i as u16,
+                },
+            );
         }
         assert_eq!(bt.len(), 500);
         // Range scan should return sorted order

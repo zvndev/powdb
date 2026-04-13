@@ -1,14 +1,14 @@
 use crate::protocol::Message;
-use powdb_query::executor::{Engine, is_read_only_statement, READONLY_NEEDS_WRITE};
+use powdb_query::executor::{is_read_only_statement, Engine, READONLY_NEEDS_WRITE};
 use powdb_query::parser;
 use powdb_query::result::QueryResult;
 use powdb_storage::types::Value;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tokio::net::TcpStream;
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
+use tokio::net::TcpStream;
 use tokio::sync::watch;
-use tracing::{info, debug, warn, error};
+use tracing::{debug, error, info, warn};
 
 /// Constant-time byte comparison to prevent timing side-channel attacks
 /// on password verification. Returns `true` iff `a` and `b` are identical.
@@ -89,47 +89,65 @@ pub async fn handle_connection(
     idle_timeout: Duration,
     query_timeout: Duration,
 ) {
-    let peer = stream.peer_addr().ok().map(|a| a.to_string()).unwrap_or_else(|| "unknown".into());
+    let peer = stream
+        .peer_addr()
+        .ok()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "unknown".into());
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut writer = BufWriter::new(writer);
 
     // Wait for Connect message (with idle timeout).
-    let connect_msg = match tokio::time::timeout(idle_timeout, Message::read_from(&mut reader)).await {
-        Ok(Ok(Some(msg))) => msg,
-        Ok(Ok(None)) => {
-            debug!(peer = %peer, "client closed before CONNECT");
-            return;
-        }
-        Ok(Err(e)) => {
-            error!(peer = %peer, error = %e, "error reading CONNECT");
-            return;
-        }
-        Err(_) => {
-            warn!(peer = %peer, "idle timeout waiting for CONNECT");
-            return;
-        }
-    };
+    let connect_msg =
+        match tokio::time::timeout(idle_timeout, Message::read_from(&mut reader)).await {
+            Ok(Ok(Some(msg))) => msg,
+            Ok(Ok(None)) => {
+                debug!(peer = %peer, "client closed before CONNECT");
+                return;
+            }
+            Ok(Err(e)) => {
+                error!(peer = %peer, error = %e, "error reading CONNECT");
+                return;
+            }
+            Err(_) => {
+                warn!(peer = %peer, "idle timeout waiting for CONNECT");
+                return;
+            }
+        };
 
     match connect_msg {
         Message::Connect { db_name, password } => {
             if let Some(expected) = &expected_password {
-                if !password.as_deref().is_some_and(|p| constant_time_eq(p.as_bytes(), expected.as_bytes())) {
+                if !password
+                    .as_deref()
+                    .is_some_and(|p| constant_time_eq(p.as_bytes(), expected.as_bytes()))
+                {
                     warn!(peer = %peer, db = %db_name, "auth rejected: bad password");
-                    let err = Message::Error { message: "authentication failed".into() };
+                    let err = Message::Error {
+                        message: "authentication failed".into(),
+                    };
                     err.write_to(&mut writer).await.ok();
                     writer.flush().await.ok();
                     return;
                 }
             }
             info!(peer = %peer, db = %db_name, "client connected");
-            let ok = Message::ConnectOk { version: "0.1.0".into() };
-            if ok.write_to(&mut writer).await.is_err() { return; }
-            if writer.flush().await.is_err() { return; }
+            let ok = Message::ConnectOk {
+                version: "0.1.0".into(),
+            };
+            if ok.write_to(&mut writer).await.is_err() {
+                return;
+            }
+            if writer.flush().await.is_err() {
+                return;
+            }
         }
         _ => {
             warn!(peer = %peer, "first message was not CONNECT");
-            let err = Message::Error { message: "expected CONNECT".into() };
+            let err = Message::Error {
+                message: "expected CONNECT".into(),
+            };
             err.write_to(&mut writer).await.ok();
             writer.flush().await.ok();
             return;
@@ -181,11 +199,17 @@ pub async fn handle_connection(
                 });
                 match tokio::time::timeout(query_timeout, result).await {
                     Ok(Ok(Ok(result))) => query_result_to_message(result),
-                    Ok(Ok(Err(e))) => Message::Error { message: sanitize_error(&e) },
-                    Ok(Err(e)) => Message::Error { message: format!("internal error: {e}") },
+                    Ok(Ok(Err(e))) => Message::Error {
+                        message: sanitize_error(&e),
+                    },
+                    Ok(Err(e)) => Message::Error {
+                        message: format!("internal error: {e}"),
+                    },
                     Err(_) => {
                         warn!(peer = %peer, query = %query, "query timeout exceeded");
-                        Message::Error { message: "query timeout exceeded".into() }
+                        Message::Error {
+                            message: "query timeout exceeded".into(),
+                        }
                     }
                 }
             }
@@ -193,11 +217,17 @@ pub async fn handle_connection(
                 debug!(peer = %peer, "received DISCONNECT");
                 break;
             }
-            _ => Message::Error { message: "unexpected message type".into() },
+            _ => Message::Error {
+                message: "unexpected message type".into(),
+            },
         };
 
-        if response.write_to(&mut writer).await.is_err() { break; }
-        if writer.flush().await.is_err() { break; }
+        if response.write_to(&mut writer).await.is_err() {
+            break;
+        }
+        if writer.flush().await.is_err() {
+            break;
+        }
     }
 
     info!(peer = %peer, "client disconnected");
@@ -206,23 +236,21 @@ pub async fn handle_connection(
 fn query_result_to_message(result: QueryResult) -> Message {
     match result {
         QueryResult::Rows { columns, rows } => {
-            let str_rows: Vec<Vec<String>> = rows.iter().map(|row| {
-                row.iter().map(value_to_display).collect()
-            }).collect();
-            Message::ResultRows { columns, rows: str_rows }
+            let str_rows: Vec<Vec<String>> = rows
+                .iter()
+                .map(|row| row.iter().map(value_to_display).collect())
+                .collect();
+            Message::ResultRows {
+                columns,
+                rows: str_rows,
+            }
         }
-        QueryResult::Scalar(val) => {
-            Message::ResultScalar { value: value_to_display(&val) }
-        }
-        QueryResult::Modified(n) => {
-            Message::ResultOk { affected: n }
-        }
-        QueryResult::Created(_name) => {
-            Message::ResultOk { affected: 0 }
-        }
-        QueryResult::Executed { .. } => {
-            Message::ResultOk { affected: 0 }
-        }
+        QueryResult::Scalar(val) => Message::ResultScalar {
+            value: value_to_display(&val),
+        },
+        QueryResult::Modified(n) => Message::ResultOk { affected: n },
+        QueryResult::Created(_name) => Message::ResultOk { affected: 0 },
+        QueryResult::Executed { .. } => Message::ResultOk { affected: 0 },
     }
 }
 

@@ -126,8 +126,7 @@ impl ViewRegistry {
     pub fn mark_dependents_dirty(&mut self, table: &str) {
         // Borrow the view names list first, then mutate views.
         // We need to collect to avoid double-borrow.
-        let names: Option<Vec<String>> = self.deps.get(table)
-            .cloned();
+        let names: Option<Vec<String>> = self.deps.get(table).cloned();
         if let Some(names) = names {
             for name in &names {
                 if let Some(def) = self.views.get_mut(name.as_str()) {
@@ -250,14 +249,22 @@ fn read_view_file(path: &Path) -> io::Result<Vec<ViewDef>> {
         }
 
         let dirty = read_u8(&buf, &mut pos)? != 0;
-        defs.push(ViewDef { name, query, depends_on, dirty });
+        defs.push(ViewDef {
+            name,
+            query,
+            depends_on,
+            dirty,
+        });
     }
     Ok(defs)
 }
 
 fn read_u8(buf: &[u8], pos: &mut usize) -> io::Result<u8> {
     if *pos >= buf.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated view file"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated view file",
+        ));
     }
     let v = buf[*pos];
     *pos += 1;
@@ -266,7 +273,10 @@ fn read_u8(buf: &[u8], pos: &mut usize) -> io::Result<u8> {
 
 fn read_u16(buf: &[u8], pos: &mut usize) -> io::Result<u16> {
     if *pos + 2 > buf.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated view file"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated view file",
+        ));
     }
     let v = u16::from_le_bytes(buf[*pos..*pos + 2].try_into().unwrap());
     *pos += 2;
@@ -275,12 +285,18 @@ fn read_u16(buf: &[u8], pos: &mut usize) -> io::Result<u16> {
 
 fn read_str(buf: &[u8], pos: &mut usize) -> io::Result<String> {
     if *pos + 4 > buf.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated view file"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated view file",
+        ));
     }
     let len = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap()) as usize;
     *pos += 4;
     if *pos + len > buf.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated view file"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated view file",
+        ));
     }
     let s = std::str::from_utf8(&buf[*pos..*pos + len])
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-utf8 in view file"))?
@@ -307,7 +323,8 @@ mod tests {
             query: "User filter .active = true".into(),
             depends_on: vec!["User".into()],
             dirty: false,
-        }).unwrap();
+        })
+        .unwrap();
         assert!(reg.is_view("ActiveUsers"));
         assert!(!reg.is_view("User"));
         let def = reg.get("ActiveUsers").unwrap();
@@ -322,7 +339,8 @@ mod tests {
             query: "T1".into(),
             depends_on: vec!["T1".into()],
             dirty: false,
-        }).unwrap();
+        })
+        .unwrap();
         assert!(!reg.is_dirty("V1"));
         reg.mark_dependents_dirty("T1");
         assert!(reg.is_dirty("V1"));
@@ -338,7 +356,8 @@ mod tests {
             query: "T1 inner join T2 on .id = .fk".into(),
             depends_on: vec!["T1".into(), "T2".into()],
             dirty: false,
-        }).unwrap();
+        })
+        .unwrap();
         // Mutating either dependency dirties the view
         reg.mark_dependents_dirty("T2");
         assert!(reg.is_dirty("V1"));
@@ -352,7 +371,8 @@ mod tests {
             query: "T1".into(),
             depends_on: vec!["T1".into()],
             dirty: false,
-        }).unwrap();
+        })
+        .unwrap();
         reg.unregister("V1").unwrap();
         assert!(!reg.is_view("V1"));
         // Dependency map is cleaned up — marking T1 dirty doesn't panic
@@ -370,7 +390,8 @@ mod tests {
                 query: "User filter .active = true".into(),
                 depends_on: vec!["User".into()],
                 dirty: true,
-            }).unwrap();
+            })
+            .unwrap();
         }
         // Reopen
         let reg = ViewRegistry::open(&dir).unwrap();

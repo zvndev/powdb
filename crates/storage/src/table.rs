@@ -123,10 +123,7 @@ impl Table {
                 None => continue,
             };
             let is_int = table.schema.columns[col_idx].type_id == TypeId::Int;
-            let idx_path = data_dir.join(format!(
-                "{}_{}.idx",
-                table.schema.table_name, col_name
-            ));
+            let idx_path = data_dir.join(format!("{}_{}.idx", table.schema.table_name, col_name));
 
             let btree = if idx_path.exists() {
                 BTree::load(&idx_path)?
@@ -158,7 +155,10 @@ impl Table {
     /// Mission 3: catalog uses this to snapshot the list of columns that
     /// currently have an index, so it can be persisted in `catalog.bin`.
     pub(crate) fn indexed_column_names(&self) -> Vec<String> {
-        self.indexed_cols.iter().map(|c| c.col_name.clone()).collect()
+        self.indexed_cols
+            .iter()
+            .map(|c| c.col_name.clone())
+            .collect()
     }
 
     /// Recalculate the cached row layout from the current schema. Must be
@@ -265,10 +265,8 @@ impl Table {
                 // restart loads the up-to-date tree instead of the stale
                 // pre-rewrite version (whose RowIds may now point at
                 // moved rows).
-                let idx_path = data_dir.join(format!(
-                    "{}_{}.idx",
-                    self.schema.table_name, col_name
-                ));
+                let idx_path =
+                    data_dir.join(format!("{}_{}.idx", self.schema.table_name, col_name));
                 let mut btree = crate::btree::BTree::create(&idx_path)?;
                 for (rid, row) in self.heap.scan() {
                     let row = decode_row(&self.schema, &row);
@@ -873,9 +871,9 @@ impl Table {
     }
 
     pub fn scan(&self) -> impl Iterator<Item = (RowId, Row)> + '_ {
-        self.heap.scan().map(|(rid, data)| {
-            (rid, decode_row(&self.schema, &data))
-        })
+        self.heap
+            .scan()
+            .map(|(rid, data)| (rid, decode_row(&self.schema, &data)))
     }
 
     /// Zero-copy scan that passes raw row bytes to the callback without
@@ -905,7 +903,9 @@ impl Table {
     }
 
     pub fn create_index(&mut self, col_name: &str, data_dir: &Path) -> io::Result<()> {
-        let col_idx = self.schema.column_index(col_name)
+        let col_idx = self
+            .schema
+            .column_index(col_name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "column not found"))?;
 
         // Mission C Phase 17: if this column already has an index,

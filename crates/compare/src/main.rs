@@ -192,14 +192,7 @@ fn bench_engine(
                 let start = Instant::now();
                 for i in 0..WRITE_OPS {
                     let id = start_id + i as i64;
-                    engine.insert_single(
-                        id,
-                        "new",
-                        30,
-                        "active",
-                        "new@ex.com",
-                        1_700_100_000 + id,
-                    );
+                    engine.insert_single(id, "new", 30, "active", "new@ex.com", 1_700_100_000 + id);
                 }
                 next_insert_id = start_id + WRITE_OPS as i64;
                 start.elapsed().as_nanos() as f64 / WRITE_OPS as f64

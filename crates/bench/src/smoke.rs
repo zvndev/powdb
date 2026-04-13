@@ -44,9 +44,7 @@ fn main() {
 fn bench_insert(engine: &mut Engine, data_dir: &Path) {
     // Create schema via the engine so the catalog persists it.
     engine
-        .execute_powql(
-            "type User { required id: int, required name: str, required age: int }",
-        )
+        .execute_powql("type User { required id: int, required name: str, required age: int }")
         .expect("create type");
 
     let table = engine.catalog_mut().get_table_mut("User").unwrap();
@@ -169,7 +167,11 @@ fn bench_powql_parsed(engine: &mut Engine) {
     let ops_per_sec = (N_POWQL as f64) / elapsed.as_secs_f64();
 
     println!("[4] full PowQL parse + plan + execute ({N_POWQL} queries, {hits} hits)");
-    println!("    per op:  {:>10} ns ({:.3} ms)", per_op, per_op as f64 / 1_000_000.0);
+    println!(
+        "    per op:  {:>10} ns ({:.3} ms)",
+        per_op,
+        per_op as f64 / 1_000_000.0
+    );
     println!("    ops/sec: {:>10.0}", ops_per_sec);
     println!();
 

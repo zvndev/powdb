@@ -22,15 +22,16 @@ pub struct DiskManager {
 impl DiskManager {
     pub fn create(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new()
-            .read(true).write(true).create(true).truncate(true)
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
             .open(path)?;
         Ok(DiskManager { file, num_pages: 0 })
     }
 
     pub fn open(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true).write(true)
-            .open(path)?;
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
         let len = file.metadata()?.len();
         let num_pages = (len / PAGE_SIZE as u64) as u32;
         Ok(DiskManager { file, num_pages })

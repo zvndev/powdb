@@ -1,13 +1,13 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const MSG_CONNECT: u8     = 0x01;
-const MSG_CONNECT_OK: u8  = 0x02;
-const MSG_QUERY: u8       = 0x03;
+const MSG_CONNECT: u8 = 0x01;
+const MSG_CONNECT_OK: u8 = 0x02;
+const MSG_QUERY: u8 = 0x03;
 const MSG_RESULT_ROWS: u8 = 0x07;
 const MSG_RESULT_SCALAR: u8 = 0x08;
-const MSG_RESULT_OK: u8   = 0x09;
-const MSG_ERROR: u8       = 0x0A;
-const MSG_DISCONNECT: u8  = 0x10;
+const MSG_RESULT_OK: u8 = 0x09;
+const MSG_ERROR: u8 = 0x0A;
+const MSG_DISCONNECT: u8 = 0x10;
 
 /// Maximum payload size accepted from the wire (64 MB).
 const MAX_PAYLOAD_SIZE: usize = 64 * 1024 * 1024;
@@ -20,16 +20,29 @@ const MAX_ROWS: usize = 10_000_000;
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Connect { db_name: String, password: Option<String> },
-    ConnectOk { version: String },
-    Query { query: String },
+    Connect {
+        db_name: String,
+        password: Option<String>,
+    },
+    ConnectOk {
+        version: String,
+    },
+    Query {
+        query: String,
+    },
     ResultRows {
         columns: Vec<String>,
         rows: Vec<Vec<String>>,
     },
-    ResultScalar { value: String },
-    ResultOk { affected: u64 },
-    Error { message: String },
+    ResultScalar {
+        value: String,
+    },
+    ResultOk {
+        affected: u64,
+    },
+    Error {
+        message: String,
+    },
     Disconnect,
 }
 
@@ -100,7 +113,11 @@ impl Message {
                 // (backwards compatible with old clients that don't send a password).
                 let password = if pos < payload.len() {
                     let p = decode_string(payload, &mut pos)?;
-                    if p.is_empty() { None } else { Some(p) }
+                    if p.is_empty() {
+                        None
+                    } else {
+                        Some(p)
+                    }
                 } else {
                     None
                 };
@@ -119,7 +136,7 @@ impl Message {
                 if pos + 2 > payload.len() {
                     return Err("truncated column count".into());
                 }
-                let col_bytes: [u8; 2] = payload[pos..pos+2]
+                let col_bytes: [u8; 2] = payload[pos..pos + 2]
                     .try_into()
                     .map_err(|_| "invalid column count bytes".to_string())?;
                 let col_count = u16::from_le_bytes(col_bytes) as usize;
@@ -134,7 +151,7 @@ impl Message {
                 if pos + 4 > payload.len() {
                     return Err("truncated row count".into());
                 }
-                let row_bytes: [u8; 4] = payload[pos..pos+4]
+                let row_bytes: [u8; 4] = payload[pos..pos + 4]
                     .try_into()
                     .map_err(|_| "invalid row count bytes".to_string())?;
                 let row_count = u32::from_le_bytes(row_bytes) as usize;
@@ -182,16 +199,21 @@ impl Message {
     }
 
     /// Read a message from an async reader.
-    pub async fn read_from<R: AsyncReadExt + Unpin>(reader: &mut R) -> std::io::Result<Option<Message>> {
+    pub async fn read_from<R: AsyncReadExt + Unpin>(
+        reader: &mut R,
+    ) -> std::io::Result<Option<Message>> {
         let mut header = [0u8; 6];
         match reader.read_exact(&mut header).await {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(e),
         }
-        let len_bytes: [u8; 4] = header[2..6]
-            .try_into()
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid header length field"))?;
+        let len_bytes: [u8; 4] = header[2..6].try_into().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid header length field",
+            )
+        })?;
         let payload_len = u32::from_le_bytes(len_bytes) as usize;
         if payload_len > MAX_PAYLOAD_SIZE {
             return Err(std::io::Error::new(
@@ -225,7 +247,7 @@ fn decode_string(data: &[u8], pos: &mut usize) -> Result<String, String> {
     if *pos + 4 > data.len() {
         return Err("truncated string length".into());
     }
-    let len_bytes: [u8; 4] = data[*pos..*pos+4]
+    let len_bytes: [u8; 4] = data[*pos..*pos + 4]
         .try_into()
         .map_err(|_| "invalid string length bytes".to_string())?;
     let len = u32::from_le_bytes(len_bytes) as usize;
@@ -233,7 +255,7 @@ fn decode_string(data: &[u8], pos: &mut usize) -> Result<String, String> {
     if *pos + len > data.len() {
         return Err("truncated string data".into());
     }
-    let s = String::from_utf8_lossy(&data[*pos..*pos+len]).into_owned();
+    let s = String::from_utf8_lossy(&data[*pos..*pos + len]).into_owned();
     *pos += len;
     Ok(s)
 }
@@ -277,7 +299,9 @@ mod tests {
 
     #[test]
     fn test_encode_decode_error() {
-        let msg = Message::Error { message: "table not found".into() };
+        let msg = Message::Error {
+            message: "table not found".into(),
+        };
         let bytes = msg.encode();
         let decoded = Message::decode(&bytes).unwrap();
         match decoded {
@@ -288,7 +312,9 @@ mod tests {
 
     #[test]
     fn test_frame_length() {
-        let msg = Message::Query { query: "User".into() };
+        let msg = Message::Query {
+            query: "User".into(),
+        };
         let bytes = msg.encode();
         assert!(bytes.len() >= 6);
         let payload_len = u32::from_le_bytes(bytes[2..6].try_into().unwrap()) as usize;

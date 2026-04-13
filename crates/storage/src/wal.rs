@@ -1,15 +1,15 @@
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write, BufWriter};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use tracing::debug;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum WalRecordType {
-    Insert   = 1,
-    Update   = 2,
-    Delete   = 3,
-    Commit   = 4,
+    Insert = 1,
+    Update = 2,
+    Delete = 3,
+    Commit = 4,
     Rollback = 5,
 }
 
@@ -73,7 +73,10 @@ pub struct Wal {
 impl Wal {
     pub fn create(path: &Path, batch_size: usize) -> io::Result<Self> {
         let file = OpenOptions::new()
-            .create(true).write(true).read(true).truncate(true)
+            .create(true)
+            .write(true)
+            .read(true)
+            .truncate(true)
             .open(path)?;
         Ok(Wal {
             path: path.to_path_buf(),
@@ -86,7 +89,9 @@ impl Wal {
 
     pub fn open(path: &Path, batch_size: usize) -> io::Result<Self> {
         let file = OpenOptions::new()
-            .create(true).read(true).append(true)
+            .create(true)
+            .read(true)
+            .append(true)
             .open(path)?;
         Ok(Wal {
             path: path.to_path_buf(),
@@ -125,7 +130,12 @@ impl Wal {
     ///
     /// In [`WalSyncMode::Off`] this is a zero-work no-op — see the enum's
     /// doc for the durability contract.
-    pub fn append(&mut self, tx_id: u64, record_type: WalRecordType, data: &[u8]) -> io::Result<()> {
+    pub fn append(
+        &mut self,
+        tx_id: u64,
+        record_type: WalRecordType,
+        data: &[u8],
+    ) -> io::Result<()> {
         if matches!(self.sync_mode, WalSyncMode::Off) {
             return Ok(());
         }
@@ -248,7 +258,11 @@ impl Wal {
                 break; // Corrupted record — stop here
             }
 
-            records.push(WalRecord { tx_id, record_type, data });
+            records.push(WalRecord {
+                tx_id,
+                record_type,
+                data,
+            });
             pos += total_len as u64;
         }
 
@@ -258,7 +272,9 @@ impl Wal {
     /// Truncate the WAL (after checkpoint).
     pub fn truncate(&mut self) -> io::Result<()> {
         let file = OpenOptions::new()
-            .write(true).read(true).truncate(true)
+            .write(true)
+            .read(true)
+            .truncate(true)
             .open(&self.path)?;
         self.writer = BufWriter::new(file);
         self.pending = 0;
@@ -297,7 +313,8 @@ mod tests {
         let (mut wal, path) = temp_wal("group");
         // Batch size is 4 — after 4 appends, should auto-flush
         for i in 0..4 {
-            wal.append(1, WalRecordType::Insert, format!("row {i}").as_bytes()).unwrap();
+            wal.append(1, WalRecordType::Insert, format!("row {i}").as_bytes())
+                .unwrap();
         }
         // Should have flushed automatically
         let records = wal.read_all().unwrap();
@@ -309,7 +326,8 @@ mod tests {
     #[test]
     fn test_crc_integrity() {
         let (mut wal, path) = temp_wal("crc");
-        wal.append(1, WalRecordType::Insert, b"important data").unwrap();
+        wal.append(1, WalRecordType::Insert, b"important data")
+            .unwrap();
         wal.flush().unwrap();
 
         let records = wal.read_all().unwrap();
@@ -341,7 +359,8 @@ mod tests {
     fn test_truncate() {
         let (mut wal, path) = temp_wal("trunc");
         for i in 0..8 {
-            wal.append(1, WalRecordType::Insert, format!("data {i}").as_bytes()).unwrap();
+            wal.append(1, WalRecordType::Insert, format!("data {i}").as_bytes())
+                .unwrap();
         }
         wal.flush().unwrap();
         assert_eq!(wal.read_all().unwrap().len(), 8);
