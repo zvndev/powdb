@@ -7794,9 +7794,7 @@ mod tests {
         // both columns (the right-table one under its explicit alias).
         let mut engine = join_engine();
         let result = engine
-            .execute_powql(
-                "User as u join Order as o on u.id = o.user_id { u.name, tot: o.total }",
-            )
+            .execute_powql("User as u join Order as o on u.id = o.user_id { u.name, tot: o.total }")
             .unwrap();
         match result {
             QueryResult::Rows { columns, rows } => {
@@ -7804,7 +7802,11 @@ mod tests {
                 assert_eq!(rows.len(), 3);
                 // Every row must have a populated `tot` value (not Empty).
                 for row in &rows {
-                    assert!(matches!(row[1], Value::Int(_)), "tot should be Int, got {:?}", row[1]);
+                    assert!(
+                        matches!(row[1], Value::Int(_)),
+                        "tot should be Int, got {:?}",
+                        row[1]
+                    );
                 }
             }
             _ => panic!("expected rows"),
@@ -8374,16 +8376,11 @@ mod tests {
         // referencing projection aliases) was silently dropped. This reproduces
         // the exact form the TS client used.
         let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "powdb_having_post_{}_{}",
-            std::process::id(),
-            id
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("powdb_having_post_{}_{}", std::process::id(), id));
         let mut engine = Engine::new(&dir).unwrap();
         engine
-            .execute_powql(
-                "type Person { required name: str, required age: int, city: str }",
-            )
+            .execute_powql("type Person { required name: str, required age: int, city: str }")
             .unwrap();
         for (name, age, city) in [
             ("Alice", 30, "NYC"),
@@ -8399,9 +8396,7 @@ mod tests {
                 .unwrap();
         }
         let result = engine
-            .execute_powql(
-                "Person group .city { .city, cnt: count(.name) } having cnt >= 2",
-            )
+            .execute_powql("Person group .city { .city, cnt: count(.name) } having cnt >= 2")
             .unwrap();
         match result {
             QueryResult::Rows { rows, .. } => {
@@ -8417,7 +8412,10 @@ mod tests {
     fn test_having_without_group_by_errors() {
         let mut engine = test_engine();
         let err = engine.execute_powql("User { .name } having count(.name) > 1");
-        assert!(err.is_err(), "HAVING without GROUP BY should be a parse error");
+        assert!(
+            err.is_err(),
+            "HAVING without GROUP BY should be a parse error"
+        );
     }
 
     #[test]
@@ -8425,16 +8423,11 @@ mod tests {
         // Exact reproduction of the TS client test that surfaced the bug:
         // 5 people across 4 cities, HAVING count >= 2 should keep only NYC.
         let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "powdb_having_ts_{}_{}",
-            std::process::id(),
-            id
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("powdb_having_ts_{}_{}", std::process::id(), id));
         let mut engine = Engine::new(&dir).unwrap();
         engine
-            .execute_powql(
-                "type Person { required name: str, required age: int, city: str }",
-            )
+            .execute_powql("type Person { required name: str, required age: int, city: str }")
             .unwrap();
         for (name, age, city) in [
             ("Alice", 30, "NYC"),
@@ -8477,9 +8470,7 @@ mod tests {
             .unwrap();
         // Now: Alice ×3, Bob ×1, Charlie ×1. HAVING count >= 2 → only Alice.
         let result = engine
-            .execute_powql(
-                "User group .name having count(.name) >= 2 { .name, cnt: count(.name) }",
-            )
+            .execute_powql("User group .name having count(.name) >= 2 { .name, cnt: count(.name) }")
             .unwrap();
         match result {
             QueryResult::Rows { rows, .. } => {
@@ -9076,9 +9067,7 @@ mod tests {
     #[test]
     fn test_alter_add_index_creates_index() {
         let mut engine = test_engine();
-        let result = engine
-            .execute_powql("alter User add index .email")
-            .unwrap();
+        let result = engine.execute_powql("alter User add index .email").unwrap();
         match result {
             QueryResult::Executed { message } => {
                 assert!(message.contains("User.email"), "message: {message}");

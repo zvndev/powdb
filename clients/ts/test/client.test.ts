@@ -201,6 +201,25 @@ async function main() {
     }
   });
 
+  await test("filter with = null and != null", async () => {
+    // Ivy was inserted without an age — her row has a null age.
+    const withNull = await client.query(`${users} filter .age = null { .name }`);
+    assert.equal(withNull.kind, "rows");
+    if (withNull.kind === "rows") {
+      const names = withNull.rows.map((r) => r[0]);
+      assert.ok(names.includes("Ivy"), "Ivy (null age) should match `= null`");
+      assert.equal(names.length, 1);
+    }
+
+    const withoutNull = await client.query(`${users} filter .age != null { .name }`);
+    assert.equal(withoutNull.kind, "rows");
+    if (withoutNull.kind === "rows") {
+      const names = withoutNull.rows.map((r) => r[0]);
+      assert.ok(!names.includes("Ivy"), "Ivy should not match `!= null`");
+      assert.ok(names.length > 0);
+    }
+  });
+
   await test("filter with AND", async () => {
     const r = await client.query(
       `${users} filter .age > 25 and .city = "NYC" { .name, .age, .city }`
@@ -228,8 +247,7 @@ async function main() {
   // ──────────────────────────────────────────────────────────
 
   await test("order ascending", async () => {
-    // Filter out null-age rows with .age > 0 since PowQL doesn't support != null
-    const r = await client.query(`${users} filter .age > 0 order .age asc { .name, .age }`);
+    const r = await client.query(`${users} filter .age != null order .age asc { .name, .age }`);
     assert.equal(r.kind, "rows");
     if (r.kind === "rows") {
       for (let i = 1; i < r.rows.length; i++) {
@@ -242,7 +260,7 @@ async function main() {
   });
 
   await test("order descending", async () => {
-    const r = await client.query(`${users} filter .age > 0 order .age desc { .name, .age }`);
+    const r = await client.query(`${users} filter .age != null order .age desc { .name, .age }`);
     assert.equal(r.kind, "rows");
     if (r.kind === "rows") {
       for (let i = 1; i < r.rows.length; i++) {
@@ -302,7 +320,7 @@ async function main() {
   });
 
   await test("sum", async () => {
-    // PowQL doesn't support != null; sum() skips nulls automatically
+    // sum() skips nulls automatically — Ivy's age is null
     const r = await client.query(`sum(${users} { .age })`);
     // 30+25+35+28+22+40+33+45 = 258
     assertScalar(r, "258");
@@ -380,9 +398,8 @@ async function main() {
   // ──────────────────────────────────────────────────────────
 
   await test("create index", async () => {
-    // create_index returns the table contents as rows (not ok)
-    const r = await client.query(`${users} create_index .email`);
-    assert.equal(r.kind, "rows");
+    const r = await client.query(`alter ${users} add index .email`);
+    assertOk(r);
   });
 
   await test("query still works with index (point lookup)", async () => {
@@ -397,8 +414,8 @@ async function main() {
   });
 
   await test("create index on age for range scans", async () => {
-    const r = await client.query(`${users} create_index .age`);
-    assert.equal(r.kind, "rows");
+    const r = await client.query(`alter ${users} add index .age`);
+    assertOk(r);
   });
 
   await test("range scan with index", async () => {
@@ -441,10 +458,9 @@ async function main() {
   console.log("\nDDL — add/drop column");
   // ──────────────────────────────────────────────────────────
 
-  await test("add_column", async () => {
-    // add_column returns the table contents as rows (not ok)
-    const r = await client.query(`${users} add_column score: int`);
-    assert.equal(r.kind, "rows");
+  await test("add column", async () => {
+    const r = await client.query(`alter ${users} add column score: int`);
+    assertOk(r);
 
     // Verify column exists by selecting it
     const check = await client.query(`${users} limit 1 { .name, .score }`);
@@ -454,9 +470,9 @@ async function main() {
     }
   });
 
-  await test("drop_column", async () => {
-    const r = await client.query(`${users} drop_column score`);
-    assert.equal(r.kind, "rows");
+  await test("drop column", async () => {
+    const r = await client.query(`alter ${users} drop column score`);
+    assertOk(r);
 
     // Verify column is gone
     const check = await client.query(`${users} limit 1`);
@@ -483,18 +499,18 @@ async function main() {
     await client.query(`insert ${teams} { team_name := "Marketing", team_city := "LA" }`);
   });
 
-  await test("join (match) on field", async () => {
-    // NOTE: PowQL join currently only returns left-table columns in projection.
-    // Right-table column aliases (e.g., team: Teams.team_name) are silently dropped.
-    // Test that the join itself works and returns matching rows.
+  await test("inner join on field with right-table projection", async () => {
     const r = await client.query(
-      `${users} match ${teams} on .city = ${teams}.team_city { .name, .city }`
+      `${users} as u inner join ${teams} as t on u.city = t.team_city { u.name, u.city, team: t.team_name }`
     );
     assert.equal(r.kind, "rows");
     if (r.kind === "rows") {
       assert.ok(r.rows.length > 0, "should have joined rows");
-      assert.ok(r.columns.includes("name"), "should have name column");
-      assert.ok(r.columns.includes("city"), "should have city column");
+      assert.deepStrictEqual(r.columns, ["u.name", "u.city", "team"]);
+      // Every row must have all three populated (right-table column included).
+      for (const row of r.rows) {
+        assert.ok(row[2] !== "" && row[2] != null, `team should be populated, got ${row[2]}`);
+      }
     }
   });
 
@@ -524,9 +540,7 @@ async function main() {
     }
   });
 
-  await test("group by with having (parses and runs)", async () => {
-    // NOTE: PowQL having clause parses but doesn't currently filter groups.
-    // This test verifies the query runs without error through the client.
+  await test("group by with having filters groups", async () => {
     const r = await client.query(
       `${users} group .city { .city, cnt: count(.name) } having cnt >= 2`
     );
@@ -534,6 +548,11 @@ async function main() {
     if (r.kind === "rows") {
       assert.ok(r.columns.includes("cnt"));
       assert.ok(r.rows.length > 0, "should return groups");
+      // Every surviving group must satisfy the HAVING predicate.
+      for (const row of r.rows) {
+        const cnt = parseInt(row[r.columns.indexOf("cnt")]!);
+        assert.ok(cnt >= 2, `cnt ${cnt} should be >= 2 after HAVING filter`);
+      }
     }
   });
 

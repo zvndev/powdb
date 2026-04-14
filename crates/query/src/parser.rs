@@ -277,11 +277,9 @@ impl Parser {
                         None => having_expr,
                     };
                     group.having = Some(match group.having.take() {
-                        Some(existing) => Expr::BinaryOp(
-                            Box::new(existing),
-                            BinOp::And,
-                            Box::new(rewritten),
-                        ),
+                        Some(existing) => {
+                            Expr::BinaryOp(Box::new(existing), BinOp::And, Box::new(rewritten))
+                        }
                         None => rewritten,
                     });
                 }
@@ -388,11 +386,9 @@ impl Parser {
                         None => having_expr,
                     };
                     group.having = Some(match group.having.take() {
-                        Some(existing) => Expr::BinaryOp(
-                            Box::new(existing),
-                            BinOp::And,
-                            Box::new(rewritten),
-                        ),
+                        Some(existing) => {
+                            Expr::BinaryOp(Box::new(existing), BinOp::And, Box::new(rewritten))
+                        }
                         None => rewritten,
                     });
                 }
@@ -2521,19 +2517,16 @@ mod tests {
 
     #[test]
     fn test_parse_neq_null_desugars_to_is_not_null() {
-        for query in ["User filter .age != null"] {
-            let stmt = parse(query).unwrap();
-            match stmt {
-                Statement::Query(q) => {
-                    let filter = q.filter.unwrap();
-                    assert_eq!(
-                        filter,
-                        Expr::UnaryOp(UnaryOp::IsNotNull, Box::new(Expr::Field("age".into()))),
-                        "query: {query}"
-                    );
-                }
-                _ => panic!("expected query for {query}"),
+        let stmt = parse("User filter .age != null").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let filter = q.filter.unwrap();
+                assert_eq!(
+                    filter,
+                    Expr::UnaryOp(UnaryOp::IsNotNull, Box::new(Expr::Field("age".into())))
+                );
             }
+            _ => panic!("expected query"),
         }
     }
 
@@ -3237,4 +3230,3 @@ mod tests {
         assert!(parse(&query).is_ok());
     }
 }
-
