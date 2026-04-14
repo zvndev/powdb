@@ -8401,6 +8401,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_eq_null_matches_is_null() {
+        let mut engine = test_engine();
+        engine
+            .execute_powql(r#"insert User { name := "Diana", email := "diana@ex.com" }"#)
+            .unwrap();
+        let result = engine
+            .execute_powql("User filter .age = null { .name }")
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Str("Diana".into()));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_neq_null_matches_is_not_null() {
+        let mut engine = test_engine();
+        engine
+            .execute_powql(r#"insert User { name := "Diana", email := "diana@ex.com" }"#)
+            .unwrap();
+        let result = engine
+            .execute_powql("User filter .age != null { .name }")
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
     // ─── String function tests ─────────────────────────────────────────────
 
     #[test]

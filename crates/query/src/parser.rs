@@ -955,6 +955,22 @@ impl Parser {
             _ => return Ok(left),
         };
         self.advance();
+        // `expr = null` / `expr != null` desugar to the same UnaryOp as
+        // `expr is null` / `expr is not null`. Ordering comparisons against
+        // null (`< null`, `>= null`, etc.) remain parse errors.
+        if *self.peek() == Token::Null {
+            match op {
+                BinOp::Eq => {
+                    self.advance();
+                    return Ok(Expr::UnaryOp(UnaryOp::IsNull, Box::new(left)));
+                }
+                BinOp::Neq => {
+                    self.advance();
+                    return Ok(Expr::UnaryOp(UnaryOp::IsNotNull, Box::new(left)));
+                }
+                _ => {}
+            }
+        }
         let right = self.parse_additive()?;
         Ok(Expr::BinaryOp(Box::new(left), op, Box::new(right)))
     }
@@ -2366,6 +2382,46 @@ mod tests {
             }
             _ => panic!("expected query"),
         }
+    }
+
+    #[test]
+    fn test_parse_eq_null_desugars_to_is_null() {
+        let stmt = parse("User filter .age = null").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let filter = q.filter.unwrap();
+                assert_eq!(
+                    filter,
+                    Expr::UnaryOp(UnaryOp::IsNull, Box::new(Expr::Field("age".into())))
+                );
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_neq_null_desugars_to_is_not_null() {
+        for query in ["User filter .age != null"] {
+            let stmt = parse(query).unwrap();
+            match stmt {
+                Statement::Query(q) => {
+                    let filter = q.filter.unwrap();
+                    assert_eq!(
+                        filter,
+                        Expr::UnaryOp(UnaryOp::IsNotNull, Box::new(Expr::Field("age".into()))),
+                        "query: {query}"
+                    );
+                }
+                _ => panic!("expected query for {query}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_ordering_null_still_errors() {
+        // `< null`, `>= null` etc. are nonsensical — leave them as errors.
+        assert!(parse("User filter .age < null").is_err());
+        assert!(parse("User filter .age >= null").is_err());
     }
 
     #[test]
