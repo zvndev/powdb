@@ -85,7 +85,18 @@ pub fn parse(input: &str) -> Result<Statement, ParseError> {
         pos: 0,
         depth: 0,
     };
-    parser.parse_statement()
+    let stmt = parser.parse_statement()?;
+    // Reject trailing tokens. Without this, unrecognized tails like
+    // `User create_index .email` silently succeed as `User` — which
+    // misled the TS client into thinking those non-existent DDL forms
+    // returned rows. A parse error here tells users that the syntax
+    // they wrote isn't recognized.
+    if !matches!(parser.peek(), Token::Eof) {
+        return Err(ParseError::Syntax {
+            message: format!("unexpected trailing token: {:?}", parser.peek()),
+        });
+    }
+    Ok(stmt)
 }
 
 /// Rewrite `Field(alias)` references inside `expr` to the underlying
@@ -1479,6 +1490,23 @@ impl Parser {
         match self.peek() {
             Token::Add => {
                 self.advance();
+                // `alter <Table> add index .<column>`
+                if *self.peek() == Token::Index {
+                    self.advance();
+                    let column = match self.advance() {
+                        Token::DotIdent(n) => n,
+                        t => {
+                            return Err(ParseError::UnexpectedToken {
+                                expected: ".<column> after add index".into(),
+                                got: format!("{t:?}"),
+                            })
+                        }
+                    };
+                    return Ok(Statement::AlterTable(AlterTableExpr {
+                        table,
+                        action: AlterAction::AddIndex { column },
+                    }));
+                }
                 // optional `column` keyword
                 if *self.peek() == Token::Column {
                     self.advance();

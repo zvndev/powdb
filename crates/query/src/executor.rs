@@ -3554,6 +3554,14 @@ impl Engine {
                         message: format!("column '{name}' dropped from '{table}'"),
                     })
                 }
+                AlterAction::AddIndex { column } => {
+                    self.catalog
+                        .create_index(table, column)
+                        .map_err(|e| e.to_string())?;
+                    Ok(QueryResult::Executed {
+                        message: format!("index on '{table}.{column}' created"),
+                    })
+                }
             },
 
             PlanNode::DropTable { name } => {
@@ -9021,6 +9029,42 @@ mod tests {
         assert!(engine
             .execute_powql("alter User drop column nonexistent")
             .is_err());
+    }
+
+    #[test]
+    fn test_alter_add_index_creates_index() {
+        let mut engine = test_engine();
+        let result = engine
+            .execute_powql("alter User add index .email")
+            .unwrap();
+        match result {
+            QueryResult::Executed { message } => {
+                assert!(message.contains("User.email"), "message: {message}");
+            }
+            other => panic!("expected Executed, got {other:?}"),
+        }
+        // Equality lookup on the indexed column should still return results.
+        let result = engine
+            .execute_powql(r#"User filter .email = "alice@ex.com" { .name }"#)
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Str("Alice".into()));
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rejects_trailing_tokens() {
+        // Previously `User create_index .email` silently succeeded as
+        // `User` (ignoring the trailing unknown tokens). Now it's a
+        // parse error so users know the syntax isn't recognized.
+        let mut engine = test_engine();
+        assert!(engine.execute_powql("User create_index .email").is_err());
+        assert!(engine.execute_powql("User add_column score: int").is_err());
+        assert!(engine.execute_powql("User drop_column email").is_err());
     }
 
     // ─── IN subquery tests (E2h) ─────────────────────────────────────

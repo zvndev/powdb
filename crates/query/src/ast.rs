@@ -34,6 +34,11 @@ pub enum AlterAction {
     DropColumn {
         name: String,
     },
+    /// `alter <Table> add index .<column>` — creates a B+Tree index on
+    /// `column`. No-op if the index already exists.
+    AddIndex {
+        column: String,
+    },
 }
 
 /// `drop User`
