@@ -11,7 +11,14 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist", "src"],
+  "files": ["dist", "src", "README.md"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zvndev/powdb",
+    "directory": "clients/ts"
+  },
+  "keywords": ["powdb", "database", "client", "powql"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "demo": "tsx demo/demo.ts",
