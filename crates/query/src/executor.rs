@@ -3554,6 +3554,14 @@ impl Engine {
                         message: format!("column '{name}' dropped from '{table}'"),
                     })
                 }
+                AlterAction::AddIndex { column } => {
+                    self.catalog
+                        .create_index(table, column)
+                        .map_err(|e| e.to_string())?;
+                    Ok(QueryResult::Executed {
+                        message: format!("index on '{table}.{column}' created"),
+                    })
+                }
             },
 
             PlanNode::DropTable { name } => {
@@ -7780,6 +7788,50 @@ mod tests {
     }
 
     #[test]
+    fn test_join_projection_with_aliased_right_table_column() {
+        // Regression: the TS client reported right-table projections being
+        // silently dropped. Confirm that `{ u.name, tot: o.total }` emits
+        // both columns (the right-table one under its explicit alias).
+        let mut engine = join_engine();
+        let result = engine
+            .execute_powql("User as u join Order as o on u.id = o.user_id { u.name, tot: o.total }")
+            .unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["u.name", "tot"]);
+                assert_eq!(rows.len(), 3);
+                // Every row must have a populated `tot` value (not Empty).
+                for row in &rows {
+                    assert!(
+                        matches!(row[1], Value::Int(_)),
+                        "tot should be Int, got {:?}",
+                        row[1]
+                    );
+                }
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_match_keyword_rejected_as_invalid_join() {
+        // `match` is not a join keyword in PowQL — only `join`, `inner join`,
+        // `left join`, `right join`, and `cross join` are recognised. With
+        // the parser's EOF check in place, writing `match` produces a clean
+        // error instead of silently dropping the rest of the query.
+        let mut engine = join_engine();
+        let err = engine
+            .execute_powql("User match Order on u.id = o.user_id { u.name }")
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("match")
+                || err.to_string().to_lowercase().contains("trailing")
+                || err.to_string().to_lowercase().contains("unexpected"),
+            "expected parse error mentioning trailing/unexpected token, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_left_outer_join_emits_orphan_left_rows() {
         let mut engine = join_engine();
         let result = engine
@@ -8283,6 +8335,154 @@ mod tests {
     }
 
     #[test]
+    fn test_group_by_having_with_aliased_projection_agg() {
+        // Regression: TS client found that when the projection duplicates
+        // the aggregate used by HAVING (with an alias), HAVING silently
+        // failed to filter. This asserts the dedup path produces correct
+        // filtering.
+        let mut engine = mission_a_engine(30);
+        // 3 statuses, 10 rows each. HAVING >= 11 should exclude all.
+        let result = engine
+            .execute_powql(
+                "User group .status having count(.name) >= 11 { .status, cnt: count(.name) }",
+            )
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 0, "HAVING >= 11 should filter all groups");
+            }
+            _ => panic!("expected rows"),
+        }
+        // HAVING >= 10 should include all three.
+        let result = engine
+            .execute_powql(
+                "User group .status having count(.name) >= 10 { .status, cnt: count(.name) }",
+            )
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3);
+                for row in &rows {
+                    assert_eq!(row[1], Value::Int(10));
+                }
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_group_by_having_post_projection() {
+        // Regression: HAVING placed after the projection (`{ ... } having cnt >= N`,
+        // referencing projection aliases) was silently dropped. This reproduces
+        // the exact form the TS client used.
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("powdb_having_post_{}_{}", std::process::id(), id));
+        let mut engine = Engine::new(&dir).unwrap();
+        engine
+            .execute_powql("type Person { required name: str, required age: int, city: str }")
+            .unwrap();
+        for (name, age, city) in [
+            ("Alice", 30, "NYC"),
+            ("Bob", 24, "SF"),
+            ("Carol", 41, "LA"),
+            ("Dave", 28, "NYC"),
+            ("Eve", 35, "Austin"),
+        ] {
+            engine
+                .execute_powql(&format!(
+                    r#"insert Person {{ name := "{name}", age := {age}, city := "{city}" }}"#
+                ))
+                .unwrap();
+        }
+        let result = engine
+            .execute_powql("Person group .city { .city, cnt: count(.name) } having cnt >= 2")
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1, "only NYC has >= 2 people, got: {rows:?}");
+                assert_eq!(rows[0][0], Value::Str("NYC".into()));
+                assert_eq!(rows[0][1], Value::Int(2));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_having_without_group_by_errors() {
+        let mut engine = test_engine();
+        let err = engine.execute_powql("User { .name } having count(.name) > 1");
+        assert!(
+            err.is_err(),
+            "HAVING without GROUP BY should be a parse error"
+        );
+    }
+
+    #[test]
+    fn test_group_by_having_reproduces_ts_client_case() {
+        // Exact reproduction of the TS client test that surfaced the bug:
+        // 5 people across 4 cities, HAVING count >= 2 should keep only NYC.
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("powdb_having_ts_{}_{}", std::process::id(), id));
+        let mut engine = Engine::new(&dir).unwrap();
+        engine
+            .execute_powql("type Person { required name: str, required age: int, city: str }")
+            .unwrap();
+        for (name, age, city) in [
+            ("Alice", 30, "NYC"),
+            ("Bob", 24, "SF"),
+            ("Carol", 41, "LA"),
+            ("Dave", 28, "NYC"),
+            ("Eve", 35, "Austin"),
+        ] {
+            engine
+                .execute_powql(&format!(
+                    r#"insert Person {{ name := "{name}", age := {age}, city := "{city}" }}"#
+                ))
+                .unwrap();
+        }
+        let result = engine
+            .execute_powql(
+                "Person group .city having count(.name) >= 2 { .city, cnt: count(.name) }",
+            )
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1, "only NYC has >= 2 people, got: {rows:?}");
+                assert_eq!(rows[0][0], Value::Str("NYC".into()));
+                assert_eq!(rows[0][1], Value::Int(2));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_group_by_having_filters_some_groups() {
+        // Skewed distribution — some groups pass HAVING, some don't.
+        let mut engine = test_engine();
+        // test_engine has 3 rows, all distinct names. Add duplicates for Alice.
+        engine
+            .execute_powql(r#"insert User { name := "Alice", email := "a2@ex.com", age := 31 }"#)
+            .unwrap();
+        engine
+            .execute_powql(r#"insert User { name := "Alice", email := "a3@ex.com", age := 32 }"#)
+            .unwrap();
+        // Now: Alice ×3, Bob ×1, Charlie ×1. HAVING count >= 2 → only Alice.
+        let result = engine
+            .execute_powql("User group .name having count(.name) >= 2 { .name, cnt: count(.name) }")
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Str("Alice".into()));
+                assert_eq!(rows[0][1], Value::Int(3));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
     fn test_group_by_min_max() {
         let mut engine = mission_a_engine(30);
         // 30 rows, ages = 18 + (i % 60) for i in 0..30, so ages 18..47.
@@ -8396,6 +8596,41 @@ mod tests {
             QueryResult::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0][0], Value::Str("Diana".into()));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_eq_null_matches_is_null() {
+        let mut engine = test_engine();
+        engine
+            .execute_powql(r#"insert User { name := "Diana", email := "diana@ex.com" }"#)
+            .unwrap();
+        let result = engine
+            .execute_powql("User filter .age = null { .name }")
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Str("Diana".into()));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_neq_null_matches_is_not_null() {
+        let mut engine = test_engine();
+        engine
+            .execute_powql(r#"insert User { name := "Diana", email := "diana@ex.com" }"#)
+            .unwrap();
+        let result = engine
+            .execute_powql("User filter .age != null { .name }")
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3);
             }
             _ => panic!("expected rows"),
         }
@@ -8827,6 +9062,40 @@ mod tests {
         assert!(engine
             .execute_powql("alter User drop column nonexistent")
             .is_err());
+    }
+
+    #[test]
+    fn test_alter_add_index_creates_index() {
+        let mut engine = test_engine();
+        let result = engine.execute_powql("alter User add index .email").unwrap();
+        match result {
+            QueryResult::Executed { message } => {
+                assert!(message.contains("User.email"), "message: {message}");
+            }
+            other => panic!("expected Executed, got {other:?}"),
+        }
+        // Equality lookup on the indexed column should still return results.
+        let result = engine
+            .execute_powql(r#"User filter .email = "alice@ex.com" { .name }"#)
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Str("Alice".into()));
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rejects_trailing_tokens() {
+        // Previously `User create_index .email` silently succeeded as
+        // `User` (ignoring the trailing unknown tokens). Now it's a
+        // parse error so users know the syntax isn't recognized.
+        let mut engine = test_engine();
+        assert!(engine.execute_powql("User create_index .email").is_err());
+        assert!(engine.execute_powql("User add_column score: int").is_err());
+        assert!(engine.execute_powql("User drop_column email").is_err());
     }
 
     // ─── IN subquery tests (E2h) ─────────────────────────────────────

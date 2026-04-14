@@ -85,7 +85,66 @@ pub fn parse(input: &str) -> Result<Statement, ParseError> {
         pos: 0,
         depth: 0,
     };
-    parser.parse_statement()
+    let stmt = parser.parse_statement()?;
+    // Reject trailing tokens. Without this, unrecognized tails like
+    // `User create_index .email` silently succeed as `User` — which
+    // misled the TS client into thinking those non-existent DDL forms
+    // returned rows. A parse error here tells users that the syntax
+    // they wrote isn't recognized.
+    if !matches!(parser.peek(), Token::Eof) {
+        return Err(ParseError::Syntax {
+            message: format!("unexpected trailing token: {:?}", parser.peek()),
+        });
+    }
+    Ok(stmt)
+}
+
+/// Rewrite `Field(alias)` references inside `expr` to the underlying
+/// projection expression they alias. Used to desugar post-projection HAVING
+/// (`{ ..., cnt: count(.name) } having cnt >= 2`) into a form the planner's
+/// aggregate extraction can handle.
+fn substitute_projection_aliases(expr: Expr, fields: &[ProjectionField]) -> Expr {
+    match expr {
+        Expr::Field(ref name) => {
+            for f in fields {
+                if f.alias.as_deref() == Some(name.as_str()) {
+                    return f.expr.clone();
+                }
+            }
+            expr
+        }
+        Expr::BinaryOp(l, op, r) => Expr::BinaryOp(
+            Box::new(substitute_projection_aliases(*l, fields)),
+            op,
+            Box::new(substitute_projection_aliases(*r, fields)),
+        ),
+        Expr::UnaryOp(op, inner) => {
+            Expr::UnaryOp(op, Box::new(substitute_projection_aliases(*inner, fields)))
+        }
+        Expr::Coalesce(l, r) => Expr::Coalesce(
+            Box::new(substitute_projection_aliases(*l, fields)),
+            Box::new(substitute_projection_aliases(*r, fields)),
+        ),
+        Expr::InList {
+            expr: e,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(substitute_projection_aliases(*e, fields)),
+            list: list
+                .into_iter()
+                .map(|i| substitute_projection_aliases(i, fields))
+                .collect(),
+            negated,
+        },
+        Expr::ScalarFunc(f, args) => Expr::ScalarFunc(
+            f,
+            args.into_iter()
+                .map(|a| substitute_projection_aliases(a, fields))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 impl Parser {
@@ -206,6 +265,24 @@ impl Parser {
                 Token::LBrace => {
                     projection = Some(self.parse_projection()?);
                 }
+                Token::Having => {
+                    // Post-projection HAVING — see parse_query_tail for details.
+                    self.advance();
+                    let having_expr = self.parse_expr()?;
+                    let group = group_by.as_mut().ok_or_else(|| ParseError::Syntax {
+                        message: "having without group by".into(),
+                    })?;
+                    let rewritten = match projection.as_ref() {
+                        Some(fields) => substitute_projection_aliases(having_expr, fields),
+                        None => having_expr,
+                    };
+                    group.having = Some(match group.having.take() {
+                        Some(existing) => {
+                            Expr::BinaryOp(Box::new(existing), BinOp::And, Box::new(rewritten))
+                        }
+                        None => rewritten,
+                    });
+                }
                 Token::Update => {
                     if !joins.is_empty() {
                         return Err(ParseError::Unsupported {
@@ -292,6 +369,28 @@ impl Parser {
                 }
                 Token::LBrace => {
                     projection = Some(self.parse_projection()?);
+                }
+                Token::Having => {
+                    // Post-projection HAVING — `... group .k { .k, cnt: count(.name) } having cnt >= 2`.
+                    // Only meaningful when a GROUP BY is present. We desugar
+                    // to a regular HAVING on the GroupByClause, rewriting
+                    // projection aliases back into their underlying expressions
+                    // so the planner's extract_aggregates can dedup them.
+                    self.advance();
+                    let having_expr = self.parse_expr()?;
+                    let group = group_by.as_mut().ok_or_else(|| ParseError::Syntax {
+                        message: "having without group by".into(),
+                    })?;
+                    let rewritten = match projection.as_ref() {
+                        Some(fields) => substitute_projection_aliases(having_expr, fields),
+                        None => having_expr,
+                    };
+                    group.having = Some(match group.having.take() {
+                        Some(existing) => {
+                            Expr::BinaryOp(Box::new(existing), BinOp::And, Box::new(rewritten))
+                        }
+                        None => rewritten,
+                    });
                 }
                 _ => break,
             }
@@ -955,6 +1054,22 @@ impl Parser {
             _ => return Ok(left),
         };
         self.advance();
+        // `expr = null` / `expr != null` desugar to the same UnaryOp as
+        // `expr is null` / `expr is not null`. Ordering comparisons against
+        // null (`< null`, `>= null`, etc.) remain parse errors.
+        if *self.peek() == Token::Null {
+            match op {
+                BinOp::Eq => {
+                    self.advance();
+                    return Ok(Expr::UnaryOp(UnaryOp::IsNull, Box::new(left)));
+                }
+                BinOp::Neq => {
+                    self.advance();
+                    return Ok(Expr::UnaryOp(UnaryOp::IsNotNull, Box::new(left)));
+                }
+                _ => {}
+            }
+        }
         let right = self.parse_additive()?;
         Ok(Expr::BinaryOp(Box::new(left), op, Box::new(right)))
     }
@@ -1371,6 +1486,23 @@ impl Parser {
         match self.peek() {
             Token::Add => {
                 self.advance();
+                // `alter <Table> add index .<column>`
+                if *self.peek() == Token::Index {
+                    self.advance();
+                    let column = match self.advance() {
+                        Token::DotIdent(n) => n,
+                        t => {
+                            return Err(ParseError::UnexpectedToken {
+                                expected: ".<column> after add index".into(),
+                                got: format!("{t:?}"),
+                            })
+                        }
+                    };
+                    return Ok(Statement::AlterTable(AlterTableExpr {
+                        table,
+                        action: AlterAction::AddIndex { column },
+                    }));
+                }
                 // optional `column` keyword
                 if *self.peek() == Token::Column {
                     self.advance();
@@ -2366,6 +2498,43 @@ mod tests {
             }
             _ => panic!("expected query"),
         }
+    }
+
+    #[test]
+    fn test_parse_eq_null_desugars_to_is_null() {
+        let stmt = parse("User filter .age = null").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let filter = q.filter.unwrap();
+                assert_eq!(
+                    filter,
+                    Expr::UnaryOp(UnaryOp::IsNull, Box::new(Expr::Field("age".into())))
+                );
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_neq_null_desugars_to_is_not_null() {
+        let stmt = parse("User filter .age != null").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let filter = q.filter.unwrap();
+                assert_eq!(
+                    filter,
+                    Expr::UnaryOp(UnaryOp::IsNotNull, Box::new(Expr::Field("age".into())))
+                );
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ordering_null_still_errors() {
+        // `< null`, `>= null` etc. are nonsensical — leave them as errors.
+        assert!(parse("User filter .age < null").is_err());
+        assert!(parse("User filter .age >= null").is_err());
     }
 
     #[test]
