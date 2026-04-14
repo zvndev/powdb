@@ -104,7 +104,14 @@ fn threshold_for(workload: &str) -> f64 {
         | "agg_min"
         | "agg_max"
         | "powql_aggregation"
-        | "point_lookup_nonindexed" => VERY_NOISY_ABSOLUTE_THRESHOLD,
+        | "point_lookup_nonindexed"
+        // powql_point is a microsecond-scale parse+plan+exec workload where
+        // shared GHA runner CPU jitter produces >10% spread on identical
+        // code. PR #21 back-to-back runs: +12.39% vs 0.65% with no code
+        // change. Promoted from DEFAULT (7%) to VERY_NOISY (20%). The
+        // thesis ratio powql_point_over_btree_lookup (ceiling 7.0x) still
+        // guards against structural overhead growth.
+        | "powql_point" => VERY_NOISY_ABSOLUTE_THRESHOLD,
 
         // GHA-variance-dominated workloads: back-to-back same-commit PR #9
         // runs showed scan_filter_sort_limit10 +11.9%, update_by_pk +86%,
@@ -119,8 +126,11 @@ fn threshold_for(workload: &str) -> f64 {
         // btree splits — naturally more variance than point reads, but not
         // as extreme as the above. multi_col_and_filter promoted in PR #15
         // after +10.14% variance on identical code (four same-code runs
-        // showed 2.89%–10.14% spread).
-        "insert_single" | "insert_batch_1k" | "multi_col_and_filter" => NOISY_ABSOLUTE_THRESHOLD,
+        // showed 2.89%–10.14% spread). seq_scan_filter promoted in PR #21
+        // after +7.58% on identical code (other runs: +2.40%).
+        "insert_single" | "insert_batch_1k" | "multi_col_and_filter" | "seq_scan_filter" => {
+            NOISY_ABSOLUTE_THRESHOLD
+        }
         _ => DEFAULT_ABSOLUTE_THRESHOLD,
     }
 }

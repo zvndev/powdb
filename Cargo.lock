@@ -1677,7 +1677,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-bench"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "criterion",
  "powdb-query",
@@ -1688,7 +1688,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "powdb-query",
  "powdb-server",
@@ -1701,7 +1701,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-compare"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "mysql",
  "postgres",
@@ -1713,7 +1713,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-query"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "powdb-storage",
  "rustc-hash",
@@ -1723,7 +1723,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "powdb-query",
@@ -1736,7 +1736,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-storage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "crc32fast",

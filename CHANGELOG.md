@@ -5,6 +5,39 @@ All notable changes to PowDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-04-14
+
+Post-launch polish: TS client test coverage, engine bug fixes surfaced by
+end-to-end testing, and documentation sync.
+
+### Added
+
+- **TS client**: 53 end-to-end tests covering DDL, insert, filter, projection,
+  aggregates, joins, GROUP BY/HAVING, subqueries, updates, deletes, and error
+  paths (#18)
+- **AGENTS.md**: user-facing primer with PowQL-vs-SQL cheat sheet, footgun
+  table, and performance notes for AI assistants and new users (#20)
+
+### Fixed
+
+- **Parser**: `= null` and `!= null` now desugar to `IS NULL` / `IS NOT NULL`
+  instead of being rejected (#19)
+- **Executor**: `HAVING` on post-projection group queries now filters groups
+  correctly (#19)
+- **Parser**: statements with trailing tokens (e.g. `User match T on ...`,
+  `User create_index .col`) now error cleanly instead of silently parsing as a
+  bare-source query and dropping the rest (#19)
+- **Executor**: DDL statements (`alter ... add index`, `alter ... add column`,
+  `alter ... drop column`) now return an affected-count result instead of an
+  empty row set (#19)
+
+### Changed
+
+- **Docs**: `README.md`, `docs/getting-started.md`, and `docs/POWQL.md` updated
+  to use current syntax everywhere — `alter T add index .col` (not
+  `create_index`), `alter T add column` (not `add_column`), `sum(T { .x })`
+  (not `sum(T | .x)`), and `T1 as a inner join T2 as b on ...` (not `match`) (#20)
+
 ## [0.1.0] - 2026-04-12
 
 Initial release of PowDB — a from-scratch database engine with PowQL query language.
