@@ -57,3 +57,19 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+      - name: Run doc tests
+        run: cargo test --workspace --doc
+
+  audit:
+    name: cargo audit (advisories)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run cargo audit
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

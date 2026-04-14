@@ -2,7 +2,9 @@
 .DS_Store
 *.swp
 *.swo
-batadb_data/
+# Default server data dir (POWDB_DATA) — also matches nested copies
+# such as clients/ts/powdb_data/ created by client integration runs.
+**/powdb_data/
 node_modules/
 clients/ts/dist/
 
