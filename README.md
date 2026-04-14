@@ -66,7 +66,7 @@ User create_index .email
 drop User
 ```
 
-Full reference: [docs/POWQL.md](docs/POWQL.md)
+Full reference: [docs/POWQL.md](docs/POWQL.md) | Getting started: [docs/getting-started.md](docs/getting-started.md)
 
 ## Build from source
 
@@ -186,8 +186,8 @@ cargo run --release -p powdb-compare    # prints table + writes results.csv
 cargo test --workspace
 ```
 
-102 tests across storage (91 unit + 4 index persistence + 7 WAL recovery), query, server, and compare crates.
+444 tests across storage, query, server, bench, and compare crates.
 
 ## License
 
-Private. (c) ZVN DEV.
+MIT License. See [LICENSE](LICENSE) for details.

@@ -344,7 +344,7 @@ impl Engine {
                 let cached = self
                     .plan_cache
                     .lock()
-                    .unwrap()
+                    .map_err(|e| format!("plan cache lock poisoned: {e}"))?
                     .get_with_substitution(hash, &literals);
                 if let Some(plan) = cached {
                     let plan = lower_unindexed_range_scans(&self.catalog, &plan);
@@ -360,7 +360,10 @@ impl Engine {
                 // Miss — plan, insert, execute.
                 return match planner::plan(input) {
                     Ok(plan) => {
-                        self.plan_cache.lock().unwrap().insert(hash, plan.clone());
+                        self.plan_cache
+                            .lock()
+                            .map_err(|e| format!("plan cache lock poisoned: {e}"))?
+                            .insert(hash, plan.clone());
                         let plan = lower_unindexed_range_scans(&self.catalog, &plan);
                         let result = self.execute_plan(&plan);
                         self.catalog.sync_wal().map_err(|e| e.to_string())?;
@@ -460,7 +463,7 @@ impl Engine {
             let cached = self
                 .plan_cache
                 .lock()
-                .unwrap()
+                .map_err(|e| format!("plan cache lock poisoned: {e}"))?
                 .get_with_substitution(hash, &literals);
             if let Some(plan) = cached {
                 let plan = lower_unindexed_range_scans(&self.catalog, &plan);
@@ -469,7 +472,10 @@ impl Engine {
             // Miss: plan + insert + execute. The planner is pure, so this
             // is safe from `&self`.
             let plan = crate::planner::plan_statement(stmt).map_err(|e| e.to_string())?;
-            self.plan_cache.lock().unwrap().insert(hash, plan.clone());
+            self.plan_cache
+                .lock()
+                .map_err(|e| format!("plan cache lock poisoned: {e}"))?
+                .insert(hash, plan.clone());
             let plan = lower_unindexed_range_scans(&self.catalog, &plan);
             return self.execute_plan_readonly(&plan);
         }

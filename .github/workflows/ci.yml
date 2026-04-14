@@ -12,17 +12,26 @@ concurrency:
 
 jobs:
   lint-test:
-    name: clippy + fmt + test
-    runs-on: ubuntu-24.04
+    name: clippy + fmt + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
-      RUSTFLAGS: "-C target-cpu=x86-64-v2"
+      # x86-64-v2 is only valid on Linux x86_64 runners; ARM Macs need the
+      # default target-cpu. The conditional step below sets RUSTFLAGS for
+      # ubuntu only.
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set RUSTFLAGS (Linux)
+        if: runner.os == 'Linux'
+        run: echo "RUSTFLAGS=-C target-cpu=x86-64-v2" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable

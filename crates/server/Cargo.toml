@@ -1,7 +1,10 @@
 [package]
 name = "powdb-server"
+description = "Async TCP server for PowDB with binary wire protocol"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 powdb-storage = { path = "../storage" }
