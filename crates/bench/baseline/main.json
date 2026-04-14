@@ -2,8 +2,8 @@
   "schema": 1,
   "runner": "ubuntu-24.04",
   "rustc": "1.89.0",
-  "updated": "2026-04-14",
-  "commit": "1006088",
+  "updated": "2026-04-13",
+  "commit": "1d0eada",
   "workloads": {
     "insert_10k": {
       "ns_per_iter": 2879532,
@@ -82,8 +82,8 @@
       "ops_per_sec": 632
     },
     "delete_by_filter": {
-      "ns_per_iter": 272626,
-      "ops_per_sec": 3668
+      "ns_per_iter": 160609,
+      "ops_per_sec": 6226
     }
   }
 }
