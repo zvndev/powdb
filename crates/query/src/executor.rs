@@ -992,13 +992,13 @@ impl Engine {
                         let key_indices: Vec<(usize, bool)> = keys
                             .iter()
                             .map(|k| {
-                                let idx = columns
+                                columns
                                     .iter()
                                     .position(|c| c == &k.field)
-                                    .unwrap_or_else(|| panic!("column '{}' not found", k.field));
-                                (idx, k.descending)
+                                    .map(|idx| (idx, k.descending))
+                                    .ok_or_else(|| format!("column '{}' not found", k.field))
                             })
-                            .collect();
+                            .collect::<Result<_, String>>()?;
                         rows.sort_by(|a, b| {
                             for &(col_idx, descending) in &key_indices {
                                 let cmp = a[col_idx].cmp(&b[col_idx]);
@@ -2554,13 +2554,13 @@ impl Engine {
                         let key_indices: Vec<(usize, bool)> = keys
                             .iter()
                             .map(|k| {
-                                let idx = columns
+                                columns
                                     .iter()
                                     .position(|c| c == &k.field)
-                                    .unwrap_or_else(|| panic!("column '{}' not found", k.field));
-                                (idx, k.descending)
+                                    .map(|idx| (idx, k.descending))
+                                    .ok_or_else(|| format!("column '{}' not found", k.field))
                             })
-                            .collect();
+                            .collect::<Result<_, String>>()?;
                         rows.sort_by(|a, b| {
                             for &(col_idx, descending) in &key_indices {
                                 let cmp = a[col_idx].cmp(&b[col_idx]);
@@ -7145,6 +7145,22 @@ mod tests {
             }
             _ => panic!("expected rows"),
         }
+    }
+
+    /// `order` by a non-existent column must surface an error, not panic.
+    /// Regression for executor.rs:998 / :2560 where the Sort node called
+    /// `unwrap_or_else(|| panic!(...))` — a malformed ORDER BY would crash
+    /// the server thread instead of returning an error to the client.
+    #[test]
+    fn test_order_by_missing_column_errors() {
+        let mut engine = test_engine();
+        let err = engine
+            .execute_powql("User order .nonexistent desc")
+            .expect_err("sort on missing column must error, not panic");
+        assert!(
+            err.contains("nonexistent"),
+            "error should name the missing column, got: {err}"
+        );
     }
 
     // ─── LIMIT / OFFSET combined semantics ──────────────────────────────────
