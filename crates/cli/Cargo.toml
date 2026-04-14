@@ -1,7 +1,10 @@
 [package]
 name = "powdb-cli"
+description = "Interactive REPL and CLI for PowDB"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 powdb-storage = { path = "../storage" }
