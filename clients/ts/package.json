@@ -21,6 +21,7 @@
   "keywords": ["powdb", "database", "client", "powql"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "test": "tsx test/client.test.ts",
     "demo": "tsx demo/demo.ts",
     "clean": "rm -rf dist"
   },
