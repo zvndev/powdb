@@ -335,16 +335,16 @@ Output:
 
 ## 9. Create an Index
 
-Indexes speed up lookups on frequently queried columns. Use `create_index` to build a B+tree index:
+Indexes speed up lookups on frequently queried columns. Use `alter ... add index` to build a B+tree index:
 
 ```
-powql> User create_index .email
+powql> alter User add index .email
 ```
 
 Output:
 
 ```
-index created on User.email
+index on 'User.email' created
 ```
 
 Indexed columns are used automatically for point lookups and range scans -- no query hints needed.
