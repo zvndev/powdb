@@ -88,6 +88,54 @@ pub fn parse(input: &str) -> Result<Statement, ParseError> {
     parser.parse_statement()
 }
 
+/// Rewrite `Field(alias)` references inside `expr` to the underlying
+/// projection expression they alias. Used to desugar post-projection HAVING
+/// (`{ ..., cnt: count(.name) } having cnt >= 2`) into a form the planner's
+/// aggregate extraction can handle.
+fn substitute_projection_aliases(expr: Expr, fields: &[ProjectionField]) -> Expr {
+    match expr {
+        Expr::Field(ref name) => {
+            for f in fields {
+                if f.alias.as_deref() == Some(name.as_str()) {
+                    return f.expr.clone();
+                }
+            }
+            expr
+        }
+        Expr::BinaryOp(l, op, r) => Expr::BinaryOp(
+            Box::new(substitute_projection_aliases(*l, fields)),
+            op,
+            Box::new(substitute_projection_aliases(*r, fields)),
+        ),
+        Expr::UnaryOp(op, inner) => {
+            Expr::UnaryOp(op, Box::new(substitute_projection_aliases(*inner, fields)))
+        }
+        Expr::Coalesce(l, r) => Expr::Coalesce(
+            Box::new(substitute_projection_aliases(*l, fields)),
+            Box::new(substitute_projection_aliases(*r, fields)),
+        ),
+        Expr::InList {
+            expr: e,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(substitute_projection_aliases(*e, fields)),
+            list: list
+                .into_iter()
+                .map(|i| substitute_projection_aliases(i, fields))
+                .collect(),
+            negated,
+        },
+        Expr::ScalarFunc(f, args) => Expr::ScalarFunc(
+            f,
+            args.into_iter()
+                .map(|a| substitute_projection_aliases(a, fields))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 impl Parser {
     fn peek(&self) -> &Token {
         &self.tokens[self.pos]
@@ -206,6 +254,26 @@ impl Parser {
                 Token::LBrace => {
                     projection = Some(self.parse_projection()?);
                 }
+                Token::Having => {
+                    // Post-projection HAVING — see parse_query_tail for details.
+                    self.advance();
+                    let having_expr = self.parse_expr()?;
+                    let group = group_by.as_mut().ok_or_else(|| ParseError::Syntax {
+                        message: "having without group by".into(),
+                    })?;
+                    let rewritten = match projection.as_ref() {
+                        Some(fields) => substitute_projection_aliases(having_expr, fields),
+                        None => having_expr,
+                    };
+                    group.having = Some(match group.having.take() {
+                        Some(existing) => Expr::BinaryOp(
+                            Box::new(existing),
+                            BinOp::And,
+                            Box::new(rewritten),
+                        ),
+                        None => rewritten,
+                    });
+                }
                 Token::Update => {
                     if !joins.is_empty() {
                         return Err(ParseError::Unsupported {
@@ -292,6 +360,30 @@ impl Parser {
                 }
                 Token::LBrace => {
                     projection = Some(self.parse_projection()?);
+                }
+                Token::Having => {
+                    // Post-projection HAVING — `... group .k { .k, cnt: count(.name) } having cnt >= 2`.
+                    // Only meaningful when a GROUP BY is present. We desugar
+                    // to a regular HAVING on the GroupByClause, rewriting
+                    // projection aliases back into their underlying expressions
+                    // so the planner's extract_aggregates can dedup them.
+                    self.advance();
+                    let having_expr = self.parse_expr()?;
+                    let group = group_by.as_mut().ok_or_else(|| ParseError::Syntax {
+                        message: "having without group by".into(),
+                    })?;
+                    let rewritten = match projection.as_ref() {
+                        Some(fields) => substitute_projection_aliases(having_expr, fields),
+                        None => having_expr,
+                    };
+                    group.having = Some(match group.having.take() {
+                        Some(existing) => Expr::BinaryOp(
+                            Box::new(existing),
+                            BinOp::And,
+                            Box::new(rewritten),
+                        ),
+                        None => rewritten,
+                    });
                 }
                 _ => break,
             }
@@ -3117,3 +3209,4 @@ mod tests {
         assert!(parse(&query).is_ok());
     }
 }
+

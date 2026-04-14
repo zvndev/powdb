@@ -8283,6 +8283,165 @@ mod tests {
     }
 
     #[test]
+    fn test_group_by_having_with_aliased_projection_agg() {
+        // Regression: TS client found that when the projection duplicates
+        // the aggregate used by HAVING (with an alias), HAVING silently
+        // failed to filter. This asserts the dedup path produces correct
+        // filtering.
+        let mut engine = mission_a_engine(30);
+        // 3 statuses, 10 rows each. HAVING >= 11 should exclude all.
+        let result = engine
+            .execute_powql(
+                "User group .status having count(.name) >= 11 { .status, cnt: count(.name) }",
+            )
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 0, "HAVING >= 11 should filter all groups");
+            }
+            _ => panic!("expected rows"),
+        }
+        // HAVING >= 10 should include all three.
+        let result = engine
+            .execute_powql(
+                "User group .status having count(.name) >= 10 { .status, cnt: count(.name) }",
+            )
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3);
+                for row in &rows {
+                    assert_eq!(row[1], Value::Int(10));
+                }
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_group_by_having_post_projection() {
+        // Regression: HAVING placed after the projection (`{ ... } having cnt >= N`,
+        // referencing projection aliases) was silently dropped. This reproduces
+        // the exact form the TS client used.
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "powdb_having_post_{}_{}",
+            std::process::id(),
+            id
+        ));
+        let mut engine = Engine::new(&dir).unwrap();
+        engine
+            .execute_powql(
+                "type Person { required name: str, required age: int, city: str }",
+            )
+            .unwrap();
+        for (name, age, city) in [
+            ("Alice", 30, "NYC"),
+            ("Bob", 24, "SF"),
+            ("Carol", 41, "LA"),
+            ("Dave", 28, "NYC"),
+            ("Eve", 35, "Austin"),
+        ] {
+            engine
+                .execute_powql(&format!(
+                    r#"insert Person {{ name := "{name}", age := {age}, city := "{city}" }}"#
+                ))
+                .unwrap();
+        }
+        let result = engine
+            .execute_powql(
+                "Person group .city { .city, cnt: count(.name) } having cnt >= 2",
+            )
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1, "only NYC has >= 2 people, got: {rows:?}");
+                assert_eq!(rows[0][0], Value::Str("NYC".into()));
+                assert_eq!(rows[0][1], Value::Int(2));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_having_without_group_by_errors() {
+        let mut engine = test_engine();
+        let err = engine.execute_powql("User { .name } having count(.name) > 1");
+        assert!(err.is_err(), "HAVING without GROUP BY should be a parse error");
+    }
+
+    #[test]
+    fn test_group_by_having_reproduces_ts_client_case() {
+        // Exact reproduction of the TS client test that surfaced the bug:
+        // 5 people across 4 cities, HAVING count >= 2 should keep only NYC.
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "powdb_having_ts_{}_{}",
+            std::process::id(),
+            id
+        ));
+        let mut engine = Engine::new(&dir).unwrap();
+        engine
+            .execute_powql(
+                "type Person { required name: str, required age: int, city: str }",
+            )
+            .unwrap();
+        for (name, age, city) in [
+            ("Alice", 30, "NYC"),
+            ("Bob", 24, "SF"),
+            ("Carol", 41, "LA"),
+            ("Dave", 28, "NYC"),
+            ("Eve", 35, "Austin"),
+        ] {
+            engine
+                .execute_powql(&format!(
+                    r#"insert Person {{ name := "{name}", age := {age}, city := "{city}" }}"#
+                ))
+                .unwrap();
+        }
+        let result = engine
+            .execute_powql(
+                "Person group .city having count(.name) >= 2 { .city, cnt: count(.name) }",
+            )
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1, "only NYC has >= 2 people, got: {rows:?}");
+                assert_eq!(rows[0][0], Value::Str("NYC".into()));
+                assert_eq!(rows[0][1], Value::Int(2));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_group_by_having_filters_some_groups() {
+        // Skewed distribution — some groups pass HAVING, some don't.
+        let mut engine = test_engine();
+        // test_engine has 3 rows, all distinct names. Add duplicates for Alice.
+        engine
+            .execute_powql(r#"insert User { name := "Alice", email := "a2@ex.com", age := 31 }"#)
+            .unwrap();
+        engine
+            .execute_powql(r#"insert User { name := "Alice", email := "a3@ex.com", age := 32 }"#)
+            .unwrap();
+        // Now: Alice ×3, Bob ×1, Charlie ×1. HAVING count >= 2 → only Alice.
+        let result = engine
+            .execute_powql(
+                "User group .name having count(.name) >= 2 { .name, cnt: count(.name) }",
+            )
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Str("Alice".into()));
+                assert_eq!(rows[0][1], Value::Int(3));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
     fn test_group_by_min_max() {
         let mut engine = mission_a_engine(30);
         // 30 rows, ages = 18 + (i % 60) for i in 0..30, so ages 18..47.
