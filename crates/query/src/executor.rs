@@ -7788,6 +7788,48 @@ mod tests {
     }
 
     #[test]
+    fn test_join_projection_with_aliased_right_table_column() {
+        // Regression: the TS client reported right-table projections being
+        // silently dropped. Confirm that `{ u.name, tot: o.total }` emits
+        // both columns (the right-table one under its explicit alias).
+        let mut engine = join_engine();
+        let result = engine
+            .execute_powql(
+                "User as u join Order as o on u.id = o.user_id { u.name, tot: o.total }",
+            )
+            .unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["u.name", "tot"]);
+                assert_eq!(rows.len(), 3);
+                // Every row must have a populated `tot` value (not Empty).
+                for row in &rows {
+                    assert!(matches!(row[1], Value::Int(_)), "tot should be Int, got {:?}", row[1]);
+                }
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_match_keyword_rejected_as_invalid_join() {
+        // `match` is not a join keyword in PowQL — only `join`, `inner join`,
+        // `left join`, `right join`, and `cross join` are recognised. With
+        // the parser's EOF check in place, writing `match` produces a clean
+        // error instead of silently dropping the rest of the query.
+        let mut engine = join_engine();
+        let err = engine
+            .execute_powql("User match Order on u.id = o.user_id { u.name }")
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("match")
+                || err.to_string().to_lowercase().contains("trailing")
+                || err.to_string().to_lowercase().contains("unexpected"),
+            "expected parse error mentioning trailing/unexpected token, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_left_outer_join_emits_orphan_left_rows() {
         let mut engine = join_engine();
         let result = engine
