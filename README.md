@@ -40,11 +40,11 @@ User filter .age > 25 order .age desc limit 10 { .name, .age }
 
 -- Aggregates
 count(User filter .age > 25)
-sum(User | .age)
-avg(User filter .city = "NYC" | .age)
+sum(User { .age })
+avg(User filter .city = "NYC" { .age })
 
 -- Joins
-User match Team on .team_id = Team.id { .name, team_name: Team.name }
+User as u inner join Team as t on u.team_id = t.id { u.name, team_name: t.name }
 
 -- GROUP BY + HAVING
 User group .city { .city, avg_age: avg(.age) } having avg_age > 30
@@ -60,9 +60,9 @@ User filter .age < 18 delete
 User filter .id = 1 update { age := 31 }
 
 -- DDL
-User add_column score: int
-User drop_column score
-User create_index .email
+alter User add column score: int
+alter User drop column score
+alter User add index .email
 drop User
 ```
 
@@ -143,8 +143,8 @@ console.table(result.rows);
 
 **DDL**
 - `type` (create table), `drop` (drop table)
-- `add_column`, `drop_column` (with full heap rewrite)
-- `create_index` (B+tree, persisted)
+- `alter <T> add column`, `alter <T> drop column` (with full heap rewrite)
+- `alter <T> add index` (B+tree, persisted)
 
 **Server**
 - Tokio async TCP with `Arc<RwLock<Engine>>` for parallel readers

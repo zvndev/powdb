@@ -828,6 +828,17 @@ alter User drop column email
 alter User drop email                      -- "column" keyword is optional
 ```
 
+#### Add Index
+
+Create a B+tree index on a column. Point lookups and range scans use indexes automatically — no query hints:
+
+```
+alter User add index .email
+alter User add index .age
+```
+
+Indexes are persistent (BIDX format in the data directory) and survive restart. Re-running `add index` on an existing index is a no-op.
+
 ### DROP TABLE
 
 Remove a table entirely:
@@ -1012,6 +1023,7 @@ PowQL has seven data types plus a null representation.
 | **Drop table** | `drop User` | `DROP TABLE User` |
 | **Alter add** | `alter User add column status: str` | `ALTER TABLE User ADD COLUMN status TEXT` |
 | **Alter drop** | `alter User drop column status` | `ALTER TABLE User DROP COLUMN status` |
+| **Create index** | `alter User add index .email` | `CREATE INDEX ON User (email)` |
 | **Create view** | `materialize V as User filter .active = true` | `CREATE MATERIALIZED VIEW V AS SELECT * FROM User WHERE active` |
 | **Refresh view** | `refresh V` | `REFRESH MATERIALIZED VIEW V` |
 | **Drop view** | `drop view V` | `DROP MATERIALIZED VIEW V` |
