@@ -1,6 +1,6 @@
 {
   "name": "@zvndev/powdb-client",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "TypeScript client for PowDB (PowQL wire protocol)",
   "type": "module",
   "main": "dist/index.js",
