@@ -23,10 +23,6 @@ jobs:
     name: fuzz ${{ matrix.target }} (${{ matrix.budget }}s)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    # Informational for now: fuzz surfaces findings but does not block merges
-    # until we've triaged the existing baseline crashes (tracked in issues).
-    # Flip to blocking once the targets run clean for a week on main.
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:

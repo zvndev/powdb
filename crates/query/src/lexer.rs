@@ -126,10 +126,18 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                     pos += 1;
                 }
                 let s: String = chars[start..pos].iter().collect();
-                tokens.push(Token::FloatLit(s.parse().unwrap()));
+                let value = s.parse::<f64>().map_err(|_| LexError {
+                    message: format!("float literal out of range: {s}"),
+                    position: start,
+                })?;
+                tokens.push(Token::FloatLit(value));
             } else {
                 let s: String = chars[start..pos].iter().collect();
-                tokens.push(Token::IntLit(s.parse().unwrap()));
+                let value = s.parse::<i64>().map_err(|_| LexError {
+                    message: format!("integer literal out of range for i64: {s}"),
+                    position: start,
+                })?;
+                tokens.push(Token::IntLit(value));
             }
             continue;
         }
@@ -400,5 +408,30 @@ mod tests {
                 Token::Eof,
             ]
         );
+    }
+
+    /// Regression for issue #24: an integer literal with more digits than
+    /// i64 can hold previously reached `s.parse::<i64>().unwrap()` and
+    /// panicked. It must return a `LexError` instead.
+    #[test]
+    fn test_lex_intlit_overflow_returns_err() {
+        // 22 digits — well past i64::MAX (19 digits).
+        let err = lex("4444444441111111144444").expect_err("must error, not panic");
+        assert!(
+            err.message.contains("integer literal out of range"),
+            "unexpected message: {}",
+            err.message
+        );
+        assert_eq!(err.position, 0);
+    }
+
+    /// Same bug, reached via the exact fuzzer reproducer from the
+    /// libFuzzer artifact attached to issue #24 (base64
+    /// `YXMJCQkJCQkJCQkJCQkJNDQ0NDQ0NDQ0MTExMTExMTQ0NDQJCQkJCQk=`).
+    #[test]
+    fn test_lex_fuzz_repro_issue_24() {
+        let input = "as\t\t\t\t\t\t\t\t\t\t\t\t\t44444444411111114444\t\t\t\t\t\t";
+        let err = lex(input).expect_err("fuzz reproducer must now error, not panic");
+        assert!(err.message.contains("integer literal"));
     }
 }
