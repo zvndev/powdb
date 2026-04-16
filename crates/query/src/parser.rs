@@ -149,14 +149,12 @@ fn substitute_projection_aliases(expr: Expr, fields: &[ProjectionField]) -> Expr
 
 impl Parser {
     fn peek(&self) -> &Token {
-        self.tokens.get(self.pos).unwrap_or(&Token::Eof)
+        &self.tokens[self.pos]
     }
 
     fn advance(&mut self) -> Token {
-        let t = self.tokens.get(self.pos).cloned().unwrap_or(Token::Eof);
-        if self.pos < self.tokens.len() {
-            self.pos += 1;
-        }
+        let t = self.tokens[self.pos].clone();
+        self.pos += 1;
         t
     }
 
