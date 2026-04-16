@@ -5,6 +5,34 @@ All notable changes to PowDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-04-16
+
+Hardening release: all known fuzz-reachable panics in the query layer are now
+errors, and the CI gate has been tightened with cargo-audit and blocking fuzz
+smoke runs.
+
+### Fixed
+
+- **Lexer**: integer literals wider than `i64::MAX` now return `LexError`
+  instead of panicking (#25, closes #24)
+- **Parser**: unterminated projection/assignment/argument/type-decl bodies at
+  EOF (`nn{`, `z{`, etc.) now return `ParseError` instead of panicking via
+  out-of-bounds indexing (#25, closes #26)
+- **Executor**: `ORDER BY` on an unknown column now returns an error instead
+  of panicking (#22)
+
+### Security
+
+- Bumped `rustls-webpki` 0.103.10 → 0.103.12 to pick up fixes for
+  RUSTSEC-2026-0098 / RUSTSEC-2026-0099 (name-constraint bypass) (#25)
+
+### CI
+
+- New `cargo audit` job on every PR — blocks merges on known advisories (#23)
+- New fuzz smoke workflow: `fuzz_lexer`, `fuzz_parser`, `fuzz_roundtrip` each
+  run 60s on PRs that touch the query front-end, and nightly at 07:00 UTC.
+  Blocking on failure (#23, #25)
+
 ## [0.1.1] - 2026-04-14
 
 Post-launch polish: TS client test coverage, engine bug fixes surfaced by
