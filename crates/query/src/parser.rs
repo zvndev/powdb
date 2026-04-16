@@ -558,7 +558,7 @@ impl Parser {
     fn parse_assignments(&mut self) -> Result<Vec<Assignment>, ParseError> {
         self.expect(&Token::LBrace)?;
         let mut assignments = Vec::new();
-        while *self.peek() != Token::RBrace {
+        while !matches!(self.peek(), Token::RBrace | Token::Eof) {
             let field = match self.advance() {
                 Token::Ident(name) => name,
                 t => {
@@ -582,7 +582,7 @@ impl Parser {
     fn parse_projection(&mut self) -> Result<Vec<ProjectionField>, ParseError> {
         self.expect(&Token::LBrace)?;
         let mut fields = Vec::new();
-        while *self.peek() != Token::RBrace {
+        while !matches!(self.peek(), Token::RBrace | Token::Eof) {
             let first = self.advance();
             if *self.peek() == Token::Colon {
                 // alias: expr
@@ -725,7 +725,7 @@ impl Parser {
                         let func = token_to_scalar_fn(&first);
                         self.expect(&Token::LParen)?;
                         let mut args = Vec::new();
-                        while *self.peek() != Token::RParen {
+                        while !matches!(self.peek(), Token::RParen | Token::Eof) {
                             args.push(self.parse_expr()?);
                             if *self.peek() == Token::Comma {
                                 self.advance();
@@ -1101,7 +1101,7 @@ impl Parser {
             }
         }
         let mut list = Vec::new();
-        while *self.peek() != Token::RParen {
+        while !matches!(self.peek(), Token::RParen | Token::Eof) {
             list.push(self.parse_expr()?);
             if *self.peek() == Token::Comma {
                 self.advance();
@@ -1427,7 +1427,7 @@ impl Parser {
                 let func = token_to_scalar_fn(&tok);
                 self.expect(&Token::LParen)?;
                 let mut args = Vec::new();
-                while *self.peek() != Token::RParen {
+                while !matches!(self.peek(), Token::RParen | Token::Eof) {
                     args.push(self.parse_expr()?);
                     if *self.peek() == Token::Comma {
                         self.advance();
@@ -1707,7 +1707,7 @@ impl Parser {
         };
         self.expect(&Token::LBrace)?;
         let mut fields = Vec::new();
-        while *self.peek() != Token::RBrace {
+        while !matches!(self.peek(), Token::RBrace | Token::Eof) {
             let required = if *self.peek() == Token::Required {
                 self.advance();
                 true
@@ -3228,5 +3228,22 @@ mod tests {
             query.push(')');
         }
         assert!(parse(&query).is_ok());
+    }
+
+    /// Regression for issue #26: `fuzz_parser` crashed on the 3-byte input
+    /// `nn{` — the projection loop consumed the Eof token and then indexed
+    /// past the end of `tokens`. Must return an error instead.
+    #[test]
+    fn test_parse_fuzz_repro_projection_eof() {
+        let err = parse("nn{").expect_err("unterminated projection must error, not panic");
+        let _ = err.message();
+    }
+
+    /// Regression for issue #26: `fuzz_roundtrip` tripped the same bug with
+    /// the 2-byte input `z{`.
+    #[test]
+    fn test_parse_fuzz_repro_short_projection_eof() {
+        let err = parse("z{").expect_err("unterminated projection must error, not panic");
+        let _ = err.message();
     }
 }
