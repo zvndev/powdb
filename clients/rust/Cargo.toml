@@ -1,0 +1,18 @@
+[package]
+name = "powdb-client"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Rust client for PowDB (PowQL wire protocol)"
+repository = "https://github.com/zvndev/powdb"
+keywords = ["powdb", "database", "client", "powql"]
+categories = ["database"]
+readme = "README.md"
+
+# Kept out of the top-level workspace so external users can depend on the
+# crate without inheriting the engine's workspace profile and deps.
+[workspace]
+
+[dependencies]
+
+[dev-dependencies]

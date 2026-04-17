@@ -99,14 +99,32 @@ Listens on TCP with a binary wire protocol. Connect via the CLI:
 cargo run --release -p powdb-cli --release -- --remote localhost:5433
 ```
 
-Or the TypeScript client:
+### Client libraries
+
+Official drivers live in [`clients/`](./clients) and all speak the same wire
+protocol:
+
+| Language   | Package                       | Path                |
+|------------|-------------------------------|---------------------|
+| TypeScript | `@zvndev/powdb-client`        | [`clients/ts`](./clients/ts)       |
+| Python     | `powdb`                       | [`clients/python`](./clients/python) |
+| Go         | `github.com/zvndev/powdb/clients/go` | [`clients/go`](./clients/go) |
+| Rust       | `powdb-client`                | [`clients/rust`](./clients/rust)   |
+| Java       | `dev.zvn:powdb-client`        | [`clients/java`](./clients/java)   |
 
 ```typescript
+// TypeScript
 import { Client } from "@zvndev/powdb-client";
-
 const client = await Client.connect({ host: "localhost", port: 5433 });
 const result = await client.query("User filter .age > 25 { .name, .age }");
 console.table(result.rows);
+```
+
+```python
+# Python
+from powdb import Client
+with Client.connect(host="localhost", port=5433) as c:
+    print(c.query("User filter .age > 25 { .name, .age }").rows)
 ```
 
 ### Environment variables
